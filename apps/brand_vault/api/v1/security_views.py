@@ -523,3 +523,93 @@ class BrandSecurityPromptDetailView(TenantScopedAPIView):
         self.get_website(prompt.website_id)
         prompt.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+# ── Security perception ─────────────────────────────────────────────────
+
+
+class BrandSecurityPerceptionView(TenantScopedAPIView):
+    """What AI assistants say about the brand's security posture.
+
+    ``?days=`` sets the window (default 90, max 365, 0 = all time). Every
+    number is perception: what the models said, checked against the
+    brand's own uploaded material, never a statement about the product's
+    actual security.
+    """
+
+    def get(self, request, website_id):
+        from apps.brand_vault.services.security.perception import (
+            DEFAULT_WINDOW_DAYS,
+            build_security_perception,
+        )
+
+        website = self.get_website(website_id)
+        try:
+            days = int(request.query_params.get("days", DEFAULT_WINDOW_DAYS))
+        except (TypeError, ValueError):
+            days = DEFAULT_WINDOW_DAYS
+        days = max(0, min(365, days))
+        return Response(build_security_perception(website, days=days))
+
+
+class BrandSecurityProbeView(TenantScopedAPIView):
+    """Start a security-perception probe: a cold audit over the security
+    prompt pack (or the saved prompts tagged "security")."""
+
+    MAX_CUSTOM_PROMPTS = 10
+
+    def post(self, request, website_id):
+        from apps.llm_ranking.providers import PROVIDERS
+        from apps.llm_ranking.services.security_probe import start_security_probe
+        from core.ai_tracking import effective_ai_cap, month_to_date_cost
+
+        website = self.get_website(website_id)
+
+        cap = effective_ai_cap(request.user)
+        if cap > 0:
+            spent = month_to_date_cost(request.user)
+            if spent >= cap:
+                return Response(
+                    {
+                        "error": "monthly_ai_cost_cap_exceeded",
+                        "detail": (
+                            f"Month-to-date AI spend ${spent:.2f} has reached "
+                            f"this account's monthly allowance of ${cap:.2f}."
+                        ),
+                        "cap_status": {"spent_usd": round(spent, 4), "cap_usd": cap},
+                    },
+                    status=402,
+                )
+
+        raw_providers = request.data.get("providers") or []
+        if not isinstance(raw_providers, list):
+            return Response({"error": "providers must be a list."}, status=400)
+        providers = [p for p in raw_providers if isinstance(p, str) and p in PROVIDERS]
+
+        raw_prompts = request.data.get("custom_prompts") or []
+        if not isinstance(raw_prompts, list):
+            return Response({"error": "custom_prompts must be a list."}, status=400)
+        custom_prompts = [
+            str(p).strip()[:500] for p in raw_prompts if isinstance(p, str) and p.strip()
+        ][: self.MAX_CUSTOM_PROMPTS]
+
+        try:
+            audit = start_security_probe(
+                website, request.user,
+                providers=providers or None,
+                custom_prompts=custom_prompts or None,
+            )
+        except ValueError as exc:
+            return Response(
+                {"error": str(exc), "code": "no_security_prompts"}, status=400,
+            )
+        return Response(
+            {
+                "audit_id": str(audit.id),
+                "status": audit.status,
+                "probe_kind": audit.probe_kind,
+                "prompt_count": len(audit.prompts or []),
+                "providers": audit.providers_queried,
+            },
+            status=status.HTTP_202_ACCEPTED,
+        )

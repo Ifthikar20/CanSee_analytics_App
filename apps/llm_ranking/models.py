@@ -111,6 +111,23 @@ class LLMRankingAudit(TimestampMixin):
     prompt_source = models.CharField(
         max_length=16, choices=PROMPT_SOURCE_CHOICES, default=PROMPT_SOURCE_VAULT
     )
+    # What the audit measures:
+    #   visibility — does the brand surface unprompted (the default; prompts
+    #                never name the brand, providers get crawled context)
+    #   security   — what models SAY about the brand's security posture.
+    #                Prompts name the brand and run COLD: no crawled
+    #                context, no RAG block, so the answer is what a real
+    #                user would get. Extraction adds security_claims.
+    PROBE_KIND_VISIBILITY = "visibility"
+    PROBE_KIND_SECURITY = "security"
+    PROBE_KIND_CHOICES = [
+        (PROBE_KIND_VISIBILITY, "Visibility"),
+        (PROBE_KIND_SECURITY, "Security perception"),
+    ]
+    probe_kind = models.CharField(
+        max_length=16, choices=PROBE_KIND_CHOICES, default=PROBE_KIND_VISIBILITY,
+        db_index=True,
+    )
     # Aggregated citation footprint by country (ISO-2 code -> count).
     # Built in finalise_audit from each result's citation URLs.
     citation_countries = models.JSONField(default=dict, blank=True)
@@ -269,6 +286,17 @@ class LLMRankingResult(TimestampMixin):
     # from this row's citations during aggregation; rolled up into the
     # audit-level ``citation_countries`` field for the dashboard.
     citation_countries = models.JSONField(default=dict, blank=True)
+    # Security-perception extraction (probe_kind == "security" audits and
+    # prompts tagged "security"). Shape, written by
+    # SecurityClaimExtractionService and enriched by the claim-support
+    # scorer:
+    #   {"version": "sec-v1", "model": "...",
+    #    "claims": [{"claim", "kind", "polarity", "cited_url",
+    #                "support", "similarity"}],
+    #    "fud_language": bool, "recommends_against": bool,
+    #    "support_version": "..."}
+    # Empty dict on rows that were never security-extracted.
+    security_claims = models.JSONField(default=dict, blank=True)
     # The intent type of the prompt (recommendation, comparison, persona, etc.)
     # NOTE: computed at runtime from prompt text — no database column needed.
     PROMPT_TYPE_CHOICES = [

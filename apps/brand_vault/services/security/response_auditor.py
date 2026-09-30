@@ -62,6 +62,9 @@ MAX_JUDGE_CALLS_PER_SCAN = 10
 _GROUND_TRUTH_TOP_K = 5
 _JUDGEABLE_SEVERITIES = ("high", "medium", "low")
 _FACT_ISSUES = ("hallucination", "unverified", "outdated")
+# Verdicts that mean "the model asserted something false": high severity
+# whenever the judge does not grade explicitly.
+_HIGH_ON_CONFIRM = ("hallucination", "hallucinated_compliance", "false_incident")
 
 
 class _JudgeGate:
@@ -168,22 +171,23 @@ def _escalate(
         return False, []
     if not gate.take():
         return False, []
+    allowed_issues = tuple(finding.detector.judge_issues) or _FACT_ISSUES
     verdict = judge_finding(
         question=finding.detector.judge_question,
         brand=brand,
         title=finding.title,
         snippet=finding.snippet,
-        allowed_issues=_FACT_ISSUES,
+        allowed_issues=allowed_issues,
         ground_truth=ground_truth,
         user=website.user,
         website=website,
     )
-    if verdict.issue not in _FACT_ISSUES:
+    if verdict.issue not in allowed_issues:
         return False, []
     finding.issue = verdict.issue
     if verdict.severity in _JUDGEABLE_SEVERITIES:
         finding.severity = verdict.severity
-    elif verdict.issue == "hallucination":
+    elif verdict.issue in _HIGH_ON_CONFIRM:
         finding.severity = "high"
     if verdict.sentiment_score is not None:
         finding.sentiment_score = max(-1.0, min(1.0, float(verdict.sentiment_score)))

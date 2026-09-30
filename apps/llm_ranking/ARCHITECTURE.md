@@ -405,3 +405,49 @@ UI ──poll (2s)──> GET /audits/<aid>/logs/?after=<ts>
 - **Internal:** `websites`, `accounts`, `core` (ai_tracking, permissions, tenant scoping), `rag` (per-user knowledge base for grounded prompt generation and per-prompt retrieval)
 - **External APIs:** Anthropic, OpenAI, Google Generative AI, Perplexity, Google Custom Search
 - **Frontend:** Vue 3, Chart.js + vue-chartjs, axios
+
+## Security Perception Probes
+
+An audit with `probe_kind == "security"` measures what the models SAY about
+the brand's security posture instead of whether the brand surfaces unprompted.
+Three things differ from a visibility audit:
+
+| | Visibility audit | Security probe |
+|---|---|---|
+| Prompts | Never name the brand (`prompt_packs/{default,saas,...}.json`, saved prompts) | Name the brand on purpose (`prompt_packs/security.json`, or saved prompts tagged `security`) |
+| Context sent to providers | Crawled site + Google + RAG block in the system prompt | None. `COLD_PROBE_SYSTEM` only, so the answer is what a real user gets |
+| Extraction | Brand-mention pass (`HaikuExtractionService`) | Brand-mention pass plus `SecurityClaimExtractionService` -> `LLMRankingResult.security_claims` |
+
+Entry points: `POST /llm-ranking/<wid>/audits/` with `{"probe_kind": "security"}`, or
+`POST /brand-security/websites/<wid>/perception/probe/`. Both go through
+`services/security_probe.py`. Any saved prompt tagged `security` also runs cold,
+even inside a visibility audit (`ranking_service.is_cold_probe`).
+
+Security pack intents (`compliance`, `incident_history`, `data_handling`,
+`trust_comparison`, `vulnerability`, `privacy`) are sampled only for security
+probes and never leak into visibility audits; they group under the
+`trust` funnel stage in the UI.
+
+`security_claims` shape (version `sec-v1`):
+
+```json
+{
+  "version": "sec-v1", "model": "claude-haiku-4-5",
+  "claims": [{"claim": "Acme is SOC 2 Type II certified", "kind": "certification",
+              "polarity": "affirms", "cited_url": "", "support": "unsupported", "similarity": 0.31}],
+  "fud_language": false, "recommends_against": false,
+  "support_version": "v1", "support_status": "scored"
+}
+```
+
+Claim `kind` and `polarity` vocabularies, and the lexicons the heuristic
+fallback and the Brand Security detectors share, live in
+`services/security_lexicon.py`. `support` is written by
+`apps.brand_vault.services.security.perception.score_claim_support` (embedding
+match against the brand's security/privacy facts and knowledge chunks, no LLM
+call). `manage.py backfill_security_claims` replays extraction and scoring over
+stored probe answers.
+
+The numbers this produces are perception. A model claiming a certification does
+not make it real, and "unsupported" means the brand's material does not back the
+claim, not that the claim is false. Dashboard copy must keep that distinction.

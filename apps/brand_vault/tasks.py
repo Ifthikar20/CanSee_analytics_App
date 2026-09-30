@@ -266,3 +266,33 @@ def refresh_fact_embeddings() -> int:
         except Exception as exc:  # pragma: no cover
             logger.warning("refresh_fact_embeddings(%s) failed: %s", fact.id, exc)
     return count
+
+
+@shared_task(name="apps.brand_vault.tasks.score_security_claims_for_result")
+def score_security_claims_for_result(result_id: str) -> None:
+    """Embedding-match the security claims extracted from one probe answer
+    against the brand's security and privacy facts (and knowledge chunks).
+
+    Same posture as ``analyze_alignment_for_result``: gated on
+    ``CLAIM_VERIFICATION_ENABLED``, never raises, and a missing row is a
+    no-op so a replayed task cannot fail the audit.
+    """
+    from django.conf import settings
+
+    if not getattr(settings, "CLAIM_VERIFICATION_ENABLED", True):
+        return
+    from apps.brand_vault.services.security.perception import score_claim_support
+    from apps.llm_ranking.models import LLMRankingResult
+
+    try:
+        result = LLMRankingResult.objects.select_related(
+            "audit__website", "audit__created_by",
+        ).get(id=result_id)
+    except LLMRankingResult.DoesNotExist:
+        return
+    try:
+        score_claim_support(result)
+    except Exception as exc:  # pragma: no cover - logged, never raised
+        logger.exception(
+            "brand_vault.score_security_claims_for_result(%s) failed: %s", result_id, exc,
+        )

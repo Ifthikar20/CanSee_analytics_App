@@ -150,6 +150,25 @@ def build_enriched_system_prompt(
     )
 
 
+# Cold probes (security perception) send NO business context: the answer
+# must be what a real user would get from the model. Providers substitute
+# their listing-style DEFAULT_SYSTEM when the system prompt is empty, so a
+# neutral instruction is passed instead of "".
+COLD_PROBE_SYSTEM = "Answer the question directly and completely, as you would for any user."
+
+
+def is_cold_probe(audit, prompt_entry=None) -> bool:
+    """True when this audit (or this prompt within it) must run without
+    enrichment or RAG context: security probes, and any saved prompt the
+    customer tagged "security"."""
+    if getattr(audit, "probe_kind", "") == "security":
+        return True
+    if isinstance(prompt_entry, dict):
+        tags = prompt_entry.get("tags") or []
+        return any(str(t).strip().lower() == "security" for t in tags)
+    return False
+
+
 class LLMRankingService:
 
     # ── Prompt generation ──────────────────────────────────────────────────
@@ -688,36 +707,42 @@ class LLMRankingService:
         _audit_log(f"Starting prompt run for {audit.business_name} ({audit.industry})")
         _audit_log(f"Selected LLM providers: {', '.join(provider_keys)}")
 
-        # Enrichment — same as the legacy path.
+        # Enrichment — same as the legacy path. Skipped entirely for cold
+        # probes: a security audit measures what the model says without our
+        # help, so crawling the site would only contaminate the answer.
         enriched_context = ""
-        try:
-            from apps.llm_ranking.services.content_enricher import ContentEnricher
+        cold = is_cold_probe(audit)
+        if cold:
+            _audit_log("Cold probe: no business context is sent to the models")
+        else:
+            try:
+                from apps.llm_ranking.services.content_enricher import ContentEnricher
 
-            extra_urls = []
-            for entry in (getattr(audit, "context_urls", None) or []):
-                if isinstance(entry, dict):
-                    extra_urls.append(entry.get("url", ""))
-                elif isinstance(entry, str):
-                    extra_urls.append(entry)
-            extra_urls = [u for u in extra_urls if u]
+                extra_urls = []
+                for entry in (getattr(audit, "context_urls", None) or []):
+                    if isinstance(entry, dict):
+                        extra_urls.append(entry.get("url", ""))
+                    elif isinstance(entry, str):
+                        extra_urls.append(entry)
+                extra_urls = [u for u in extra_urls if u]
 
-            _audit_log(f"🔍 Scanning main website: {audit.website.url}")
-            enrichment = ContentEnricher.enrich(
-                main_url=audit.website.url,
-                extra_urls=extra_urls,
-                business_name=audit.business_name,
-                industry=audit.industry,
-                include_google=True,
-            )
-            enriched_context = enrichment.get("llm_context", "")
-            if enriched_context:
-                _audit_log(
-                    f"📦 Context assembled — {len(enriched_context):,} chars of business intelligence",
-                    "success",
+                _audit_log(f"🔍 Scanning main website: {audit.website.url}")
+                enrichment = ContentEnricher.enrich(
+                    main_url=audit.website.url,
+                    extra_urls=extra_urls,
+                    business_name=audit.business_name,
+                    industry=audit.industry,
+                    include_google=True,
                 )
-        except Exception as exc:
-            logger.warning("Content enrichment failed for audit %s: %s", audit_id, exc)
-            _audit_log(f"⚠️ Content enrichment failed: {str(exc)[:100]}", "warn")
+                enriched_context = enrichment.get("llm_context", "")
+                if enriched_context:
+                    _audit_log(
+                        f"📦 Context assembled — {len(enriched_context):,} chars of business intelligence",
+                        "success",
+                    )
+            except Exception as exc:
+                logger.warning("Content enrichment failed for audit %s: %s", audit_id, exc)
+                _audit_log(f"⚠️ Content enrichment failed: {str(exc)[:100]}", "warn")
 
         total = len(prompt_items) * len(provider_keys)
         _audit_log(
@@ -759,24 +784,25 @@ class LLMRankingService:
             except Exception as exc:
                 logger.debug("Audit-context RAG ingest skipped: %s", exc)
 
-        # Deep DOM scan: structured data (JSON-LD, OG, FAQ, Reviews, pricing,
-        # social) rendered as a markdown business story and pushed into RAG
-        # so per-cell prompts can retrieve grounded facts.
-        try:
-            from apps.llm_ranking.services import business_story
-            result = business_story.gather_and_ingest(
-                url=audit.website.url, audit=audit,
-                user=audit.created_by, website=audit.website,
-            )
-            rendered_len = len(result.get("rendered") or "")
-            if rendered_len:
-                _audit_log(
-                    f"📖 Business story assembled — {rendered_len:,} chars ingested into RAG",
-                    "success",
+        if not cold:
+            # Deep DOM scan: structured data (JSON-LD, OG, FAQ, Reviews, pricing,
+            # social) rendered as a markdown business story and pushed into RAG
+            # so per-cell prompts can retrieve grounded facts.
+            try:
+                from apps.llm_ranking.services import business_story
+                result = business_story.gather_and_ingest(
+                    url=audit.website.url, audit=audit,
+                    user=audit.created_by, website=audit.website,
                 )
-        except Exception as exc:
-            logger.debug("Business-story scan skipped: %s", exc)
-            _audit_log(f"⚠️ Business story scan skipped: {str(exc)[:100]}", "warn")
+                rendered_len = len(result.get("rendered") or "")
+                if rendered_len:
+                    _audit_log(
+                        f"📖 Business story assembled — {rendered_len:,} chars ingested into RAG",
+                        "success",
+                    )
+            except Exception as exc:
+                logger.debug("Business-story scan skipped: %s", exc)
+                _audit_log(f"⚠️ Business story scan skipped: {str(exc)[:100]}", "warn")
 
         audit.save(update_fields=["audit_logs", "updated_at"])
         return {"prompts": prompt_items, "providers": provider_keys}
@@ -803,32 +829,40 @@ class LLMRankingService:
         if not prompt_text:
             return {"skipped": True, "reason": "empty prompt"}
 
-        # Restore enriched context snapshot.
+        # Cold cells (security probes, prompts tagged "security") get no
+        # enrichment snapshot and no RAG block: the model answers as it
+        # would for a stranger, which is the thing being measured.
+        cold = is_cold_probe(audit, prompt_entry)
         enriched_context = ""
-        for c in (audit.context_urls or []):
-            if isinstance(c, dict) and c.get("kind") == "_enriched":
-                enriched_context = c.get("text", "")
-                break
-
-        # Per-prompt RAG retrieval — pulls the chunks most relevant to
-        # this specific prompt out of the user's knowledge base and
-        # appends them under the static enrichment context. Falls back
-        # silently when the KB is empty.
         rag_block = ""
-        try:
-            from apps.rag.services.retriever import retrieve_context_block
-            rag_block = retrieve_context_block(
-                user=audit.created_by, website=audit.website,
-                query=prompt_text, top_k=4, max_chars=2000,
-            )
-        except Exception as exc:
-            logger.debug("RAG retrieval skipped for cell: %s", exc)
+        if not cold:
+            # Restore enriched context snapshot.
+            for c in (audit.context_urls or []):
+                if isinstance(c, dict) and c.get("kind") == "_enriched":
+                    enriched_context = c.get("text", "")
+                    break
+
+            # Per-prompt RAG retrieval — pulls the chunks most relevant to
+            # this specific prompt out of the user's knowledge base and
+            # appends them under the static enrichment context. Falls back
+            # silently when the KB is empty.
+            try:
+                from apps.rag.services.retriever import retrieve_context_block
+                rag_block = retrieve_context_block(
+                    user=audit.created_by, website=audit.website,
+                    query=prompt_text, top_k=4, max_chars=2000,
+                )
+            except Exception as exc:
+                logger.debug("RAG retrieval skipped for cell: %s", exc)
 
         full_context = "\n\n".join(c for c in [enriched_context, rag_block] if c)
-        sys_prompt = (
-            build_enriched_system_prompt(SYSTEM_INSTRUCTION, full_context)
-            if full_context else ""
-        )
+        if cold:
+            sys_prompt = COLD_PROBE_SYSTEM
+        else:
+            sys_prompt = (
+                build_enriched_system_prompt(SYSTEM_INSTRUCTION, full_context)
+                if full_context else ""
+            )
 
         provider_inst = get_provider(provider)
         if provider_inst is None:
@@ -875,6 +909,30 @@ class LLMRankingService:
                     audit_id, prompt_index, provider, exc,
                 )
 
+        # Second pass for cold cells: the security claims the model made.
+        security_claims: dict = {}
+        if cold and result.succeeded:
+            from apps.llm_ranking.services.extraction_service import (
+                SecurityClaimExtractionService,
+            )
+            try:
+                security_claims = SecurityClaimExtractionService.extract(
+                    response_text=result.text,
+                    brand_name=audit.business_name,
+                    keywords=audit.keywords,
+                    user=audit.created_by,
+                    website=audit.website,
+                    audit_id=str(audit.id),
+                    idempotency_key=(
+                        f"audit:{audit.id}:cell:{prompt_index}:{provider}:security"
+                    ),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Security extraction failed for audit %s cell (%d/%s): %s",
+                    audit_id, prompt_index, provider, exc,
+                )
+
         from apps.llm_ranking.services.source_prompt_resolver import (
             resolve_source_prompt_id,
         )
@@ -910,9 +968,12 @@ class LLMRankingService:
                 ),
                 "extraction_model": analysis.get("extraction_model", ""),
                 "extraction_version": analysis.get("extraction_version", ""),
+                "security_claims": security_claims,
             },
         )
         LLMRankingService._dispatch_citation_extraction(result_obj.id)
+        if cold and result.succeeded and security_claims.get("claims"):
+            LLMRankingService._dispatch_security_claim_support(result_obj.id)
         # Alignment only makes sense for answers that exist — failed cells
         # write rows too (unlike citations, which no-op on empty text).
         if result.succeeded:
@@ -980,6 +1041,20 @@ class LLMRankingService:
             extract_citations_for_result.delay(str(result_id))
         except Exception as exc:  # pragma: no cover
             logger.debug("citation extraction dispatch failed for %s: %s", result_id, exc)
+
+    @staticmethod
+    def _dispatch_security_claim_support(result_id) -> None:
+        """Fan out claim-support scoring (embedding match against the
+        brand's security facts) for a security-probe result. Same gate and
+        failure policy as alignment: downstream analytic, never blocking."""
+        from django.conf import settings as _settings
+        if not getattr(_settings, "CLAIM_VERIFICATION_ENABLED", True):
+            return
+        try:
+            from apps.brand_vault.tasks import score_security_claims_for_result
+            score_security_claims_for_result.delay(str(result_id))
+        except Exception as exc:  # pragma: no cover
+            logger.debug("security claim support dispatch failed for %s: %s", result_id, exc)
 
     @staticmethod
     def _dispatch_alignment(result_id) -> None:
@@ -1227,62 +1302,66 @@ class LLMRankingService:
         # ── Content enrichment: scan URLs + Google ────────────────────────
         # Build rich context from the website, user-provided URLs, and Google
         enriched_context = ""
-        try:
-            from apps.llm_ranking.services.content_enricher import ContentEnricher
+        cold = is_cold_probe(audit)
+        if cold:
+            _audit_log(audit, "Cold probe: no business context is sent to the models")
+        else:
+            try:
+                from apps.llm_ranking.services.content_enricher import ContentEnricher
 
-            # Get extra URLs from the audit (stored at creation time)
-            extra_urls = []
-            context_urls_raw = getattr(audit, 'context_urls', None) or []
-            for entry in context_urls_raw:
-                if isinstance(entry, dict):
-                    extra_urls.append(entry.get("url", ""))
-                elif isinstance(entry, str):
-                    extra_urls.append(entry)
-            extra_urls = [u for u in extra_urls if u]
+                # Get extra URLs from the audit (stored at creation time)
+                extra_urls = []
+                context_urls_raw = getattr(audit, 'context_urls', None) or []
+                for entry in context_urls_raw:
+                    if isinstance(entry, dict):
+                        extra_urls.append(entry.get("url", ""))
+                    elif isinstance(entry, str):
+                        extra_urls.append(entry)
+                extra_urls = [u for u in extra_urls if u]
 
-            _audit_log(audit, f"🔍 Scanning main website: {audit.website.url}")
-            if extra_urls:
-                _audit_log(audit, f"🔍 Scanning {len(extra_urls)} extra URL(s): {', '.join(u[:50] for u in extra_urls)}")
+                _audit_log(audit, f"🔍 Scanning main website: {audit.website.url}")
+                if extra_urls:
+                    _audit_log(audit, f"🔍 Scanning {len(extra_urls)} extra URL(s): {', '.join(u[:50] for u in extra_urls)}")
 
-            enrichment = ContentEnricher.enrich(
-                main_url=audit.website.url,
-                extra_urls=extra_urls,
-                business_name=audit.business_name,
-                industry=audit.industry,
-                include_google=True,
-            )
-            enriched_context = enrichment.get("llm_context", "")
+                enrichment = ContentEnricher.enrich(
+                    main_url=audit.website.url,
+                    extra_urls=extra_urls,
+                    business_name=audit.business_name,
+                    industry=audit.industry,
+                    include_google=True,
+                )
+                enriched_context = enrichment.get("llm_context", "")
 
-            # Log what was found
-            main_scan = enrichment.get("main_scan", {})
-            if main_scan.get("success"):
-                products = main_scan.get("products", [])
-                _audit_log(audit, f"✅ Website scanned — found {len(products)} product(s)/service(s)", "success")
-            else:
-                _audit_log(audit, "⚠️ Website scan returned no data", "warn")
-
-            extra_scans = enrichment.get("extra_scans", [])
-            for scan in extra_scans:
-                url_short = scan.get("url", "")[:60]
-                if scan.get("success"):
-                    _audit_log(audit, f"✅ Scanned: {url_short}", "success")
+                # Log what was found
+                main_scan = enrichment.get("main_scan", {})
+                if main_scan.get("success"):
+                    products = main_scan.get("products", [])
+                    _audit_log(audit, f"✅ Website scanned — found {len(products)} product(s)/service(s)", "success")
                 else:
-                    _audit_log(audit, f"⚠️ Failed to scan: {url_short}", "warn")
+                    _audit_log(audit, "⚠️ Website scan returned no data", "warn")
 
-            google_snippets = enrichment.get("google_snippets", [])
-            if google_snippets:
-                _audit_log(audit, f"🌐 Google Search: found {len(google_snippets)} competitive snippet(s)", "success")
+                extra_scans = enrichment.get("extra_scans", [])
+                for scan in extra_scans:
+                    url_short = scan.get("url", "")[:60]
+                    if scan.get("success"):
+                        _audit_log(audit, f"✅ Scanned: {url_short}", "success")
+                    else:
+                        _audit_log(audit, f"⚠️ Failed to scan: {url_short}", "warn")
 
-            _audit_log(audit, f"📦 Context assembled — {len(enriched_context):,} chars of business intelligence")
+                google_snippets = enrichment.get("google_snippets", [])
+                if google_snippets:
+                    _audit_log(audit, f"🌐 Google Search: found {len(google_snippets)} competitive snippet(s)", "success")
 
-            logger.info(
-                "Content enrichment complete for audit %s — %d extra URLs, context length: %d",
-                audit_id, len(extra_urls), len(enriched_context),
-            )
-        except Exception as exc:
-            logger.warning("Content enrichment failed for audit %s: %s", audit_id, exc)
-            _audit_log(audit, f"⚠️ Content enrichment failed: {str(exc)[:100]}", "warn")
-            # Non-fatal — audit continues with basic prompts
+                _audit_log(audit, f"📦 Context assembled — {len(enriched_context):,} chars of business intelligence")
+
+                logger.info(
+                    "Content enrichment complete for audit %s — %d extra URLs, context length: %d",
+                    audit_id, len(extra_urls), len(enriched_context),
+                )
+            except Exception as exc:
+                logger.warning("Content enrichment failed for audit %s: %s", audit_id, exc)
+                _audit_log(audit, f"⚠️ Content enrichment failed: {str(exc)[:100]}", "warn")
+                # Non-fatal — audit continues with basic prompts
 
         # Build the enriched system prompt for Claude
         enriched_system = build_enriched_system_prompt(SYSTEM_INSTRUCTION, enriched_context)
@@ -1302,25 +1381,26 @@ class LLMRankingService:
             except Exception as exc:
                 logger.debug("Audit-context RAG ingest skipped: %s", exc)
 
-        # Deep DOM scan: pull JSON-LD, OG, FAQ, pricing, and social signals
-        # off the homepage, render them as a markdown business story, and
-        # ingest into RAG so per-cell prompts can retrieve grounded facts.
-        try:
-            from apps.llm_ranking.services import business_story
-            story_result = business_story.gather_and_ingest(
-                url=audit.website.url, audit=audit,
-                user=audit.created_by, website=audit.website,
-            )
-            rendered_len = len(story_result.get("rendered") or "")
-            if rendered_len:
-                _audit_log(
-                    audit,
-                    f"📖 Business story assembled — {rendered_len:,} chars ingested into RAG",
-                    "success",
+        if not cold:
+            # Deep DOM scan: pull JSON-LD, OG, FAQ, pricing, and social signals
+            # off the homepage, render them as a markdown business story, and
+            # ingest into RAG so per-cell prompts can retrieve grounded facts.
+            try:
+                from apps.llm_ranking.services import business_story
+                story_result = business_story.gather_and_ingest(
+                    url=audit.website.url, audit=audit,
+                    user=audit.created_by, website=audit.website,
                 )
-        except Exception as exc:
-            logger.debug("Business-story scan skipped: %s", exc)
-            _audit_log(audit, f"⚠️ Business story scan skipped: {str(exc)[:100]}", "warn")
+                rendered_len = len(story_result.get("rendered") or "")
+                if rendered_len:
+                    _audit_log(
+                        audit,
+                        f"📖 Business story assembled — {rendered_len:,} chars ingested into RAG",
+                        "success",
+                    )
+            except Exception as exc:
+                logger.debug("Business-story scan skipped: %s", exc)
+                _audit_log(audit, f"⚠️ Business story scan skipped: {str(exc)[:100]}", "warn")
 
         # Calculate total queries and set progress tracking
         # Prompts may be structured [{"text": ..., "type": ...}] or flat ["..."]
@@ -1333,6 +1413,7 @@ class LLMRankingService:
                     "text": p.get("text", ""),
                     "type": p.get("type", "custom"),
                     "prompt_id": p.get("prompt_id"),
+                    "tags": list(p.get("tags") or []),
                 })
             else:
                 prompt_items.append({"text": str(p), "type": "custom", "prompt_id": None})
@@ -1378,15 +1459,19 @@ class LLMRankingService:
                     # Per-prompt RAG retrieval — appends knowledge-base
                     # chunks most relevant to this specific prompt.
                     rag_block = ""
-                    try:
-                        from apps.rag.services.retriever import retrieve_context_block
-                        rag_block = retrieve_context_block(
-                            user=audit.created_by, website=audit.website,
-                            query=prompt_text, top_k=4, max_chars=2000,
-                        )
-                    except Exception as _rag_exc:
-                        logger.debug("RAG retrieval skipped: %s", _rag_exc)
-                    if rag_block:
+                    cell_cold = cold or is_cold_probe(audit, prompt_item)
+                    if not cell_cold:
+                        try:
+                            from apps.rag.services.retriever import retrieve_context_block
+                            rag_block = retrieve_context_block(
+                                user=audit.created_by, website=audit.website,
+                                query=prompt_text, top_k=4, max_chars=2000,
+                            )
+                        except Exception as _rag_exc:
+                            logger.debug("RAG retrieval skipped: %s", _rag_exc)
+                    if cell_cold:
+                        sys_prompt = COLD_PROBE_SYSTEM
+                    elif rag_block:
                         sys_prompt = build_enriched_system_prompt(
                             SYSTEM_INSTRUCTION,
                             "\n\n".join(c for c in [enriched_context, rag_block] if c),
@@ -1447,6 +1532,25 @@ class LLMRankingService:
                         "extraction_version": "",
                     }
 
+                security_claims: dict = {}
+                if succeeded and cell_cold:
+                    from apps.llm_ranking.services.extraction_service import (
+                        SecurityClaimExtractionService,
+                    )
+                    try:
+                        security_claims = SecurityClaimExtractionService.extract(
+                            response_text=response_text,
+                            brand_name=audit.business_name,
+                            keywords=audit.keywords,
+                            user=audit.created_by,
+                            website=audit.website,
+                            audit_id=str(audit.id),
+                        )
+                    except Exception as exc:
+                        logger.warning("Security extraction failed for audit %s: %s", audit_id, exc)
+                    n_claims = len(security_claims.get("claims") or [])
+                    _audit_log(audit, f"🔐 {n_claims} security claim(s) extracted")
+
                 # Idempotent write keyed on the same unique tuple the
                 # chord-based path uses — (audit, prompt_index, provider,
                 # run_id=0). Switching from objects.create to
@@ -1489,9 +1593,12 @@ class LLMRankingService:
                         ),
                         "extraction_model": analysis.get("extraction_model", ""),
                         "extraction_version": analysis.get("extraction_version", ""),
+                        "security_claims": security_claims,
                     },
                 )
                 LLMRankingService._dispatch_citation_extraction(result.id)
+                if succeeded and cell_cold and security_claims.get("claims"):
+                    LLMRankingService._dispatch_security_claim_support(result.id)
                 if succeeded:
                     LLMRankingService._dispatch_alignment(result.id)
                 all_results.append(result)

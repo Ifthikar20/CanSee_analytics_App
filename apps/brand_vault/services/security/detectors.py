@@ -30,6 +30,18 @@ import re
 from dataclasses import dataclass, field
 
 from apps.brand_vault.models import SafetyAlert
+from apps.llm_ranking.services.security_lexicon import (
+    AVOID_RE,
+    CERTIFICATION_RE,
+    FUD_RE,
+    INCIDENT_RE,
+    KIND_CERTIFICATION,
+    KIND_INCIDENT,
+    POLARITY_AFFIRMS,
+    POLARITY_UNCERTAIN,
+    SECURITY_TOPIC_RE,
+    SUPPORT_SUPPORTED,
+)
 
 logger = logging.getLogger("apps")
 
@@ -78,6 +90,10 @@ class Detector:
     recommended_action: str
     judge_mode: str = "never"      # never | confirm | require
     judge_question: str = ""
+    # Issue codes a "require" judge may return for this detector. Empty
+    # means the factual-misrepresentation trio (hallucination, unverified,
+    # outdated), the historical default.
+    judge_issues: tuple[str, ...] = ()
 
 
 @dataclass
@@ -679,6 +695,196 @@ def _detect_distrust(ctx: DetectionContext, det: Detector) -> list[DetectedFindi
     )]
 
 
+# ── Security perception ─────────────────────────────────────────────────
+#
+# These read the second extraction pass (``LLMRankingResult.security_claims``)
+# when a security probe produced one, so the flagged text is the claim
+# the model actually made. Answers without that pass (visibility audits,
+# older rows) fall back to the shared lexicon inside the brand's sentence.
+
+def _security_payload(ctx: DetectionContext) -> dict:
+    payload = getattr(ctx.result, "security_claims", None)
+    return payload if isinstance(payload, dict) else {}
+
+
+def _has_extraction(ctx: DetectionContext) -> bool:
+    """True when the security extraction pass ran for this answer. Its
+    verdict then stands: the lexicon fallback exists for answers that
+    never had one (visibility audits, rows older than the feature)."""
+    return "claims" in _security_payload(ctx)
+
+
+def _security_claims(ctx: DetectionContext, kind: str, polarities: tuple[str, ...]) -> list[dict]:
+    return [
+        c for c in (_security_payload(ctx).get("claims") or [])
+        if isinstance(c, dict)
+        and c.get("kind") == kind
+        and c.get("polarity") in polarities
+        # The brand's own material backs it: nothing to raise.
+        and c.get("support") != SUPPORT_SUPPORTED
+    ]
+
+
+def _locate_claim(text: str, claim: str) -> tuple[int, int] | None:
+    """Find the claim's wording in the answer: the whole claim first, then
+    its opening 60 characters (extractors keep the opening words even when
+    they trim the tail). None when the extractor paraphrased it away."""
+    haystack = text.lower()
+    for probe in (claim, claim[:60]):
+        needle = (probe or "").strip().lower()
+        if len(needle) < 12:
+            continue
+        idx = haystack.find(needle)
+        if idx >= 0:
+            return idx, idx + len(needle)
+    return None
+
+
+def _claim_spans(
+    ctx: DetectionContext, claims: list[dict], label: str, limit: int = 5,
+) -> tuple[list[Span], tuple[int, int] | None]:
+    """Spans for extracted claims that can be located verbatim, plus the
+    window bounding them. A finding never quotes text that is not there."""
+    spans: list[Span] = []
+    lo = hi = None
+    for c in claims:
+        found = _locate_claim(ctx.text, c.get("claim") or "")
+        if not found:
+            continue
+        start, end = found
+        spans.append(Span(start, end, ctx.text[start:end], label))
+        lo = start if lo is None else min(lo, start)
+        hi = end if hi is None else max(hi, end)
+        if len(spans) >= limit:
+            break
+    if not spans:
+        return [], None
+    return spans, (lo, hi)
+
+
+def _brand_unit_spans(
+    ctx: DetectionContext, pattern: re.Pattern, label: str,
+) -> tuple[list[Span], tuple[int, int] | None]:
+    """Lexicon hits inside the sentence that names the brand."""
+    if not ctx.result.is_mentioned:
+        return [], None
+    window = unit_containing_any(ctx.text, ctx.brand_terms)
+    if not window:
+        return [], None
+    lo, hi = window
+    if _BENIGN_CONTEXT.search(ctx.text[lo:hi]):
+        return [], None
+    spans = find_pattern_spans(ctx.text, pattern, label, lo, hi, limit=5)
+    if not spans:
+        return [], None
+    return spans, window
+
+
+def _detect_compliance_claim(ctx: DetectionContext, det: Detector) -> list[DetectedFinding]:
+    """Proposal only (judge_mode 'require'): the RAG-grounded judge keeps
+    it when the brand's material does not support the compliance claim."""
+    if _has_extraction(ctx):
+        claims = _security_claims(ctx, KIND_CERTIFICATION, (POLARITY_AFFIRMS,))
+        spans, window = _claim_spans(ctx, claims, "Compliance claim") if claims else ([], None)
+    else:
+        spans, window = _brand_unit_spans(ctx, CERTIFICATION_RE, "Compliance claim")
+    if not window:
+        return []
+    lo, hi = window
+    spans = spans + find_term_spans(ctx.text, ctx.brand_terms, "Brand mention", lo, hi, limit=2)
+    snippet, rebased = build_snippet(ctx.text, lo, hi, spans)
+    return [DetectedFinding(
+        detector=det, issue=det.issue, severity=det.default_severity,
+        title=f"Compliance claim about {ctx.brand}",
+        detail=(
+            f"This answer states a certification, compliance status or security "
+            f"control for {ctx.brand}. Checked against your Brand Input material: "
+            f"a certification the model invents is one a buyer will later find "
+            f"you cannot show."
+        ),
+        snippet=snippet, spans=rebased, sentiment_score=None,
+    )]
+
+
+def _detect_incident_claim(ctx: DetectionContext, det: Detector) -> list[DetectedFinding]:
+    """Proposal only (judge_mode 'require'): kept when the ground truth
+    does not confirm the breach, hack or vulnerability the answer describes."""
+    severity = det.default_severity
+    if _has_extraction(ctx):
+        claims = _security_claims(ctx, KIND_INCIDENT, (POLARITY_AFFIRMS, POLARITY_UNCERTAIN))
+        spans, window = _claim_spans(ctx, claims, "Incident claim") if claims else ([], None)
+        if window and all(c.get("polarity") == POLARITY_UNCERTAIN for c in claims):
+            severity = "medium"  # hedged ("reportedly") is damaging, not damning
+    else:
+        spans, window = _brand_unit_spans(ctx, INCIDENT_RE, "Incident claim")
+    if not window:
+        return []
+    lo, hi = window
+    spans = spans + find_term_spans(ctx.text, ctx.brand_terms, "Brand mention", lo, hi, limit=2)
+    snippet, rebased = build_snippet(ctx.text, lo, hi, spans)
+    return [DetectedFinding(
+        detector=det, issue=det.issue, severity=severity,
+        title=f"Security incident attributed to {ctx.brand}",
+        detail=(
+            f"This answer attributes a breach, hack, leak or vulnerability to "
+            f"{ctx.brand}. Checked against your Brand Input material: an incident "
+            f"that never happened, or one long since resolved, keeps costing "
+            f"deals for as long as models repeat it."
+        ),
+        snippet=snippet, spans=rebased, sentiment_score=-0.6,
+    )]
+
+
+def _detect_security_advisory(ctx: DetectionContext, det: Detector) -> list[DetectedFinding]:
+    payload = _security_payload(ctx)
+    if _has_extraction(ctx) and not payload.get("recommends_against"):
+        return []
+    extracted = bool(payload.get("recommends_against"))
+    if extracted:
+        spans = (
+            find_pattern_spans(ctx.text, AVOID_RE, "Advice against", limit=3)
+            + find_pattern_spans(ctx.text, FUD_RE, "Fear framing", limit=3)
+        )
+        if spans:
+            lo = min(s.start for s in spans)
+            hi = max(s.end for s in spans)
+        else:
+            window = _brand_window(ctx)
+            if not window:
+                return []
+            lo, hi = window
+        severity = "high"
+    else:
+        if not ctx.result.is_mentioned:
+            return []
+        window = unit_containing_any(ctx.text, ctx.brand_terms)
+        if not window:
+            return []
+        lo, hi = window
+        unit = ctx.text[lo:hi]
+        if _BENIGN_CONTEXT.search(unit) or not AVOID_RE.search(unit):
+            return []
+        if not (SECURITY_TOPIC_RE.search(unit) or FUD_RE.search(unit)):
+            return []
+        spans = (
+            find_pattern_spans(ctx.text, AVOID_RE, "Advice against", lo, hi, limit=2)
+            + find_pattern_spans(ctx.text, FUD_RE, "Fear framing", lo, hi, limit=2)
+        )
+        severity = det.default_severity
+    spans = spans + find_term_spans(ctx.text, ctx.brand_terms, "Brand mention", lo, hi, limit=2)
+    snippet, rebased = build_snippet(ctx.text, lo, hi, spans)
+    return [DetectedFinding(
+        detector=det, issue=det.issue, severity=severity,
+        title=f"{ctx.brand} advised against on security grounds",
+        detail=(
+            f"This answer steers the reader away from {ctx.brand} for security or "
+            f"privacy reasons. A security-conscious buyer reading it will not "
+            f"shortlist you."
+        ),
+        snippet=snippet, spans=rebased, sentiment_score=-0.8,
+    )]
+
+
 # ── Registry ────────────────────────────────────────────────────────────
 
 CATEGORIES: tuple[tuple[str, str], ...] = (
@@ -690,6 +896,7 @@ CATEGORIES: tuple[tuple[str, str], ...] = (
     ("identity", "Identity"),
     ("trust", "Trust"),
     ("privacy", "Privacy"),
+    ("security", "Security"),
 )
 
 DETECTORS: tuple[Detector, ...] = (
@@ -847,6 +1054,82 @@ DETECTORS: tuple[Detector, ...] = (
             "removal from caches and training sources."
         ),
     ),
+    Detector(
+        code="BS-SEC-001", slug="hallucinated_compliance",
+        display_name="Unsupported compliance claim", category="security",
+        issue=SafetyAlert.ISSUE_HALLUCINATED_COMPLIANCE, default_severity="high",
+        judge_mode="require",
+        judge_issues=(
+            SafetyAlert.ISSUE_HALLUCINATED_COMPLIANCE,
+            SafetyAlert.ISSUE_OUTDATED,
+            SafetyAlert.ISSUE_UNVERIFIED,
+        ),
+        judge_question=(
+            "Does this answer assert a certification, compliance status or "
+            "security control for the brand that the ground truth contradicts "
+            "or does not support (hallucinated_compliance), describes as no "
+            "longer current (outdated), or does not mention at all (unverified)?"
+        ),
+        description=(
+            "A certification, compliance status or security control stated "
+            "for the brand (SOC 2, ISO 27001, HIPAA, encryption at rest) that "
+            "the Brand Input ground truth does not back. Only raised when the "
+            "judge confirms the discrepancy."
+        ),
+        recommended_action=(
+            "Publish a trust page that lists exactly what you hold and what "
+            "you do not, add it to Brand Input, and make it citable so answer "
+            "engines stop inferring."
+        ),
+    ),
+    Detector(
+        code="BS-SEC-002", slug="unconfirmed_incident",
+        display_name="Unconfirmed security incident", category="security",
+        issue=SafetyAlert.ISSUE_FALSE_INCIDENT, default_severity="high",
+        judge_mode="require",
+        judge_issues=(
+            SafetyAlert.ISSUE_FALSE_INCIDENT,
+            SafetyAlert.ISSUE_OUTDATED,
+            SafetyAlert.ISSUE_UNVERIFIED,
+        ),
+        judge_question=(
+            "Does this answer attribute a data breach, hack, leak or "
+            "vulnerability to the brand that the ground truth does not confirm "
+            "(false_incident), that was resolved and is presented as current "
+            "(outdated), or that the ground truth does not mention (unverified)?"
+        ),
+        description=(
+            "A breach, hack, leak or vulnerability attributed to the brand "
+            "that the Brand Input ground truth does not confirm. Only raised "
+            "when the judge confirms the discrepancy."
+        ),
+        recommended_action=(
+            "If the incident never happened, document that in Brand Input and "
+            "trace the source the answer cites; if it did, publish the "
+            "post-incident report and remediation so answers can say it was "
+            "resolved."
+        ),
+    ),
+    Detector(
+        code="BS-SEC-003", slug="security_advisory",
+        display_name="Advised against on security grounds", category="security",
+        issue=SafetyAlert.ISSUE_SECURITY_ADVISORY, default_severity="medium",
+        judge_mode="confirm",
+        judge_question=(
+            "Does this answer advise the reader against using the brand on "
+            "security or privacy grounds, as opposed to a neutral description?"
+        ),
+        description=(
+            "The answer steers the reader away from the brand for security or "
+            "privacy reasons: avoidance advice, fear framing, or a competitor "
+            "recommended as the safer choice."
+        ),
+        recommended_action=(
+            "Find the source of the framing (a review, a forum thread, an old "
+            "incident) and answer it with verifiable security documentation "
+            "answer engines can cite."
+        ),
+    ),
 )
 
 DETECTOR_INDEX: dict[str, Detector] = {d.code: d for d in DETECTORS}
@@ -861,6 +1144,9 @@ _DETECT_FN = {
     "BS-IMP-001": _detect_impersonation,
     "BS-TRST-001": _detect_distrust,
     "BS-PRIV-001": _detect_private_data,
+    "BS-SEC-001": _detect_compliance_claim,
+    "BS-SEC-002": _detect_incident_claim,
+    "BS-SEC-003": _detect_security_advisory,
 }
 
 # Legacy issue code -> detector code, for rows written before detector
@@ -878,6 +1164,9 @@ ISSUE_FALLBACK: dict[str, str] = {
     SafetyAlert.ISSUE_IMPERSONATION: "BS-IMP-001",
     SafetyAlert.ISSUE_DISTRUST: "BS-TRST-001",
     SafetyAlert.ISSUE_PRIVATE_DATA: "BS-PRIV-001",
+    SafetyAlert.ISSUE_HALLUCINATED_COMPLIANCE: "BS-SEC-001",
+    SafetyAlert.ISSUE_FALSE_INCIDENT: "BS-SEC-002",
+    SafetyAlert.ISSUE_SECURITY_ADVISORY: "BS-SEC-003",
 }
 
 

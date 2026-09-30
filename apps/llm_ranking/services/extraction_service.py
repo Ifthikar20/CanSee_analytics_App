@@ -272,3 +272,203 @@ class HaikuExtractionService:
             "extraction_version": cls.VERSION,
         })
         return heuristic
+
+
+# ── Security-perception extraction ──────────────────────────────────────
+#
+# A second, independent pass over the same raw answer for security probes
+# (audits with probe_kind == "security" or prompts tagged "security"). It
+# does not replace the brand-mention extraction above — mention rate,
+# sentiment and competitors are still read from that — it adds the
+# claim-level view the perception metrics need: which security statements
+# the model made about the brand, with what confidence, and whether the
+# answer steers the reader away.
+
+SECURITY_EXTRACTION_VERSION = "sec-v1"
+MAX_SECURITY_CLAIMS = 20
+MAX_CLAIM_CHARS = 300
+
+SECURITY_EXTRACTION_SYSTEM = (
+    "You extract the security, compliance, incident, data-handling and privacy "
+    "claims an AI assistant makes about one specific brand. Return strict JSON "
+    "only, no prose. Follow the schema exactly."
+)
+
+SECURITY_EXTRACTION_TEMPLATE = """Target brand: "{brand}"
+Keywords that identify the brand: {keywords}
+
+Response to analyse:
+---
+{response}
+---
+
+Return JSON only, matching this schema exactly:
+{{
+  "claims": [                              // every statement about the TARGET brand's security, compliance,
+                                           // incidents, data handling or privacy. Skip statements about other brands.
+    {{"claim": str,                        // the statement in one sentence (max 300 chars), keeping the response's wording
+      "kind": "certification" | "incident" | "encryption" | "access_control" | "privacy" | "vulnerability" | "other",
+      "polarity": "affirms" | "denies" | "uncertain",
+                                           // affirms = stated as fact ("is SOC 2 certified", "had a breach in 2023")
+                                           // denies = states the opposite ("has never had a breach")
+                                           // uncertain = hedged ("may", "reportedly", "I could not verify")
+      "cited_url": str or null}}           // a URL the response cites for THIS claim, else null
+  ],
+  "fud_language": bool,                    // fear, uncertainty or doubt framing about the target
+                                           // ("risky", "be careful", "cannot be trusted")
+  "recommends_against": bool               // advises against using the target on security or privacy grounds
+}}"""
+
+
+def _normalise_security(raw: dict) -> dict:
+    """Coerce a security-extraction payload into the persisted shape."""
+    from apps.llm_ranking.services.security_lexicon import (
+        CLAIM_KINDS,
+        KIND_OTHER,
+        POLARITIES,
+        POLARITY_UNCERTAIN,
+    )
+
+    claims = []
+    for c in (raw.get("claims") or []):
+        if len(claims) >= MAX_SECURITY_CLAIMS:
+            break
+        if not isinstance(c, dict):
+            continue
+        text = (c.get("claim") or "").strip()
+        if not text:
+            continue
+        kind = c.get("kind")
+        if kind not in CLAIM_KINDS:
+            kind = KIND_OTHER
+        polarity = c.get("polarity")
+        if polarity not in POLARITIES:
+            polarity = POLARITY_UNCERTAIN
+        url = c.get("cited_url")
+        url = str(url).strip()[:500] if url else ""
+        if url and not url.startswith(("http://", "https://")):
+            url = ""
+        claims.append({
+            "claim": text[:MAX_CLAIM_CHARS],
+            "kind": kind,
+            "polarity": polarity,
+            "cited_url": url,
+        })
+    return {
+        "claims": claims,
+        "fud_language": bool(raw.get("fud_language")),
+        "recommends_against": bool(raw.get("recommends_against")),
+    }
+
+
+_SENTENCE_SPLIT = re.compile(r"(?:\r?\n)+|(?<=[.!?])\s+")
+
+
+def _heuristic_security(response_text: str, brand_name: str, keywords: list) -> dict:
+    """Regex fallback when the Haiku call fails.
+
+    Every sentence that names the brand and touches a security topic
+    becomes one claim, classified by the shared lexicon. Deliberately
+    conservative: a sentence that names no brand term is ignored even if
+    it is about security, because it may describe a competitor.
+    """
+    from apps.llm_ranking.services.security_lexicon import (
+        AVOID_RE,
+        FUD_RE,
+        SECURITY_TOPIC_RE,
+        kind_for,
+        polarity_for,
+    )
+
+    terms = [t for t in [brand_name, *(keywords or [])] if t and str(t).strip()]
+    patterns = [
+        re.compile(r"(?<!\w)" + re.escape(str(t).strip()) + r"(?!\w)", re.IGNORECASE)
+        for t in terms
+    ]
+    claims: list[dict] = []
+    fud = False
+    against = False
+    for sentence in _SENTENCE_SPLIT.split(response_text or ""):
+        unit = sentence.strip()
+        if len(unit) < 12 or not any(p.search(unit) for p in patterns):
+            continue
+        if FUD_RE.search(unit):
+            fud = True
+        if AVOID_RE.search(unit):
+            against = True
+        if not SECURITY_TOPIC_RE.search(unit):
+            continue
+        claims.append({
+            "claim": unit[:MAX_CLAIM_CHARS],
+            "kind": kind_for(unit),
+            "polarity": polarity_for(unit),
+            "cited_url": "",
+        })
+        if len(claims) >= MAX_SECURITY_CLAIMS:
+            break
+    return {"claims": claims, "fud_language": fud, "recommends_against": against}
+
+
+class SecurityClaimExtractionService:
+    """Turn a raw security-probe answer into structured security claims.
+
+    Always returns the same dict shape; on a failed model call it falls
+    back to the lexicon heuristic and labels the row accordingly, so the
+    perception aggregator can report how much of its data is heuristic.
+    """
+
+    MODEL = EXTRACTION_MODEL
+    VERSION = SECURITY_EXTRACTION_VERSION
+
+    @classmethod
+    def extract(
+        cls,
+        *,
+        response_text: str,
+        brand_name: str,
+        keywords: list,
+        user=None,
+        website=None,
+        audit_id=None,
+        idempotency_key=None,
+    ) -> dict:
+        """Returns ``{version, model, claims, fud_language, recommends_against}``."""
+        if not response_text or not brand_name:
+            return cls._empty()
+
+        prompt = SECURITY_EXTRACTION_TEMPLATE.format(
+            brand=brand_name,
+            keywords=json.dumps(list(keywords or [])),
+            response=response_text[:6000],
+        )
+        try:
+            result = ClaudeUtility(model=cls.MODEL, max_tokens=1024).query(
+                prompt,
+                system_prompt=SECURITY_EXTRACTION_SYSTEM,
+                user=user,
+                website=website,
+                audit_id=audit_id,
+                role="security_extraction",
+                module="llm_ranking",
+                idempotency_key=idempotency_key,
+            )
+            if not result.succeeded:
+                raise ValueError(f"security extraction call failed: {result.error}")
+            parsed = _normalise_security(_parse_json_object(result.text))
+            parsed["model"] = cls.MODEL
+        except Exception as exc:
+            logger.warning("Security extraction failed; falling back to heuristic: %s", exc)
+            parsed = _heuristic_security(response_text, brand_name, keywords)
+            parsed["model"] = "heuristic"
+        parsed["version"] = cls.VERSION
+        return parsed
+
+    @staticmethod
+    def _empty() -> dict:
+        return {
+            "version": SECURITY_EXTRACTION_VERSION,
+            "model": "",
+            "claims": [],
+            "fud_language": False,
+            "recommends_against": False,
+        }

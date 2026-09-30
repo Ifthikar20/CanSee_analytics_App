@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -45,6 +46,7 @@ from pathlib import Path
 logger = logging.getLogger("apps")
 
 PACK_DIR = Path(__file__).resolve().parent.parent / "prompt_packs"
+_PLACEHOLDER_RE = re.compile(r"\{[a-zA-Z_][a-zA-Z0-9_]*\}")
 DEFAULT_PACK = "default"
 
 # Intent weighting. Controls how many prompts from each intent bucket the
@@ -61,7 +63,28 @@ INTENT_PRIORITY: tuple[tuple[str, int], ...] = (
     ("local",          1),
 )
 
-VALID_INTENTS: frozenset = frozenset(i for i, _ in INTENT_PRIORITY)
+VISIBILITY_INTENTS: frozenset = frozenset(i for i, _ in INTENT_PRIORITY)
+
+# Security perception probes. These prompts NAME the brand on purpose: the
+# question is what the model says about the brand's security, compliance
+# and data handling, not whether the brand surfaces unprompted. They live
+# in their own pack (security.json) and are only sampled for audits with
+# probe_kind == "security", so a visibility audit never mixes them in.
+SECURITY_PACK = "security"
+SECURITY_INTENT_PRIORITY: tuple[tuple[str, int], ...] = (
+    ("compliance",       2),
+    ("incident_history", 2),
+    ("data_handling",    2),
+    ("trust_comparison", 2),
+    ("vulnerability",    1),
+    ("privacy",          1),
+)
+SECURITY_INTENTS: frozenset = frozenset(i for i, _ in SECURITY_INTENT_PRIORITY)
+
+PROBE_KIND_VISIBILITY = "visibility"
+PROBE_KIND_SECURITY = "security"
+
+VALID_INTENTS: frozenset = VISIBILITY_INTENTS | SECURITY_INTENTS
 
 
 # Funnel stages for grouping prompts in the UI. Same idea as marketing
@@ -73,6 +96,7 @@ FUNNEL_BOTTOM = "bottom"   # user is ready to pick — high-stakes prompts
 FUNNEL_MID = "mid"          # solution-aware — comparison and price intent
 FUNNEL_TOP = "top"          # awareness / editorial / thought leadership
 FUNNEL_NICHE = "niche"      # long-tail, persona-specific, custom
+FUNNEL_TRUST = "trust"      # security / compliance / privacy due diligence
 
 INTENT_FUNNEL_STAGE: dict[str, str] = {
     "recommendation": FUNNEL_BOTTOM,
@@ -84,6 +108,12 @@ INTENT_FUNNEL_STAGE: dict[str, str] = {
     "persona":        FUNNEL_TOP,
     "local":          FUNNEL_NICHE,
     "custom":         FUNNEL_NICHE,
+    "compliance":       FUNNEL_TRUST,
+    "incident_history": FUNNEL_TRUST,
+    "data_handling":    FUNNEL_TRUST,
+    "trust_comparison": FUNNEL_TRUST,
+    "vulnerability":    FUNNEL_TRUST,
+    "privacy":          FUNNEL_TRUST,
 }
 
 FUNNEL_STAGE_LABELS: dict[str, str] = {
@@ -91,6 +121,7 @@ FUNNEL_STAGE_LABELS: dict[str, str] = {
     FUNNEL_MID:    "Mid Funnel — Category & Comparison",
     FUNNEL_TOP:    "Top of Funnel — Awareness",
     FUNNEL_NICHE:  "Niche / Long-Tail",
+    FUNNEL_TRUST:  "Trust and Security Due Diligence",
 }
 
 # Per-intent rationale templates. {business_name}, {industry} and
@@ -135,6 +166,31 @@ INTENT_RATIONALE: dict[str, str] = {
     ),
     "custom": (
         "Custom prompt — tests a specific phrasing or persona you supplied."
+    ),
+    "compliance": (
+        "Compliance question. Tests whether AI states {business_name}'s "
+        "certifications and regulatory status accurately, or invents them."
+    ),
+    "incident_history": (
+        "Incident-history question. Tests whether AI attributes breaches, "
+        "hacks or vulnerabilities to {business_name} that never happened, "
+        "or keeps repeating ones that were resolved."
+    ),
+    "data_handling": (
+        "Data-handling question. Tests what AI says about how "
+        "{business_name} stores, encrypts and controls access to customer data."
+    ),
+    "trust_comparison": (
+        "Trust comparison. Tests whether AI would steer a security-conscious "
+        "buyer toward or away from {business_name} against {industry} peers."
+    ),
+    "vulnerability": (
+        "Weakness probe. Tests what AI volunteers as {business_name}'s "
+        "security weaknesses and whether that is grounded in fact."
+    ),
+    "privacy": (
+        "Privacy question. Tests what AI says about the personal data "
+        "{business_name} collects, retains and shares."
     ),
 }
 
@@ -224,12 +280,19 @@ def _industry_packs() -> list[PromptPack]:
     """Every pack except the default, loaded and cached."""
     packs: list[PromptPack] = []
     for name in list_available_packs():
-        if name == DEFAULT_PACK:
+        # The security pack is probe-kind scoped, never industry-matched.
+        if name in (DEFAULT_PACK, SECURITY_PACK):
             continue
         pack = load_pack(name)
         if pack is not None:
             packs.append(pack)
     return packs
+
+
+def security_templates() -> tuple[PromptTemplate, ...]:
+    """Templates of the security pack (empty tuple if the file is missing)."""
+    pack = load_pack(SECURITY_PACK)
+    return pack.templates if pack else ()
 
 
 def match_industry_pack(industry: str) -> PromptPack | None:
@@ -293,13 +356,29 @@ class PromptLibrary:
         max_prompts: int = DEFAULT_MAX,
         themes: list | None = None,
         business_name: str = "",
+        probe_kind: str = PROBE_KIND_VISIBILITY,
+        competitor: str = "",
     ) -> list[dict]:
         """Return a list of dicts:
             {"text": str, "intent": str, "funnel_stage": str, "rationale": str}
 
         `themes` (optional) restricts sampling to a subset of intents.
         Empty / None means use the default INTENT_PRIORITY mix.
+
+        ``probe_kind="security"`` switches to the security pack: prompts
+        that name the brand and ask about compliance, incidents, data
+        handling, trust, weaknesses and privacy. ``competitor`` fills the
+        ``{competitor}`` slot; templates that need it are skipped when it
+        is empty, the same way ``local`` is skipped without a location.
         """
+        if probe_kind == PROBE_KIND_SECURITY:
+            return cls._generate_security(
+                industry=industry,
+                business_name=business_name,
+                competitor=competitor,
+                max_prompts=max_prompts,
+                themes=themes,
+            )
         # No hardcoded "software" default: a blank industry used to turn a
         # car / finance / agency site into a generic SaaS prompt list. A
         # neutral noun keeps templates grammatical without mislabelling the
@@ -364,6 +443,67 @@ class PromptLibrary:
         return picked
 
     @classmethod
+    def _generate_security(
+        cls,
+        *,
+        industry: str,
+        business_name: str,
+        competitor: str = "",
+        max_prompts: int = DEFAULT_MAX,
+        themes: list | None = None,
+    ) -> list[dict]:
+        """Intent-balanced sample from the security pack.
+
+        Every template names the brand, so an empty ``business_name``
+        yields nothing: there is no honest way to ask "has X had a breach"
+        without X. Callers turn an empty list into a refusal.
+        """
+        brand = (business_name or "").strip()
+        if not brand:
+            logger.warning("security probe requested without a business name")
+            return []
+        industry_norm = (industry or "this category").strip()
+        competitor_norm = (competitor or "").strip()
+        allowed = {t for t in (themes or []) if t in SECURITY_INTENTS} or None
+
+        buckets = _bucket_by_intent(security_templates())
+        picked: list[dict] = []
+        seen_texts: set = set()
+        for intent, take_n in SECURITY_INTENT_PRIORITY:
+            if allowed is not None and intent not in allowed:
+                continue
+            taken = 0
+            for template in buckets.get(intent, []):
+                if taken >= take_n:
+                    break
+                if "competitor" in template.placeholders and not competitor_norm:
+                    continue
+                try:
+                    text = template.fill(
+                        brand=brand,
+                        industry=industry_norm,
+                        competitor=competitor_norm,
+                    )
+                except KeyError:
+                    continue
+                key = text.strip().lower()
+                if not text or key in seen_texts:
+                    continue
+                seen_texts.add(key)
+                picked.append({
+                    "text": text,
+                    "intent": intent,
+                    "funnel_stage": funnel_stage_for(intent),
+                    "rationale": rationale_for(
+                        intent, business_name=brand, industry=industry_norm,
+                    ),
+                })
+                taken += 1
+                if len(picked) >= max_prompts:
+                    return picked
+        return picked
+
+    @classmethod
     def generate_texts(
         cls,
         *,
@@ -391,21 +531,32 @@ class PromptLibrary:
         placeholders stripped) so a generated-and-filled prompt still maps
         back to its source intent.
         """
-        index: dict[str, str] = {}
-        for t in cls._resolved_templates(industry=""):
-            normalised = t.text.lower()
-            for ph in t.placeholders:
-                normalised = normalised.replace("{" + ph + "}", "")
-            key = " ".join(normalised.split())
-            if key:
-                index[key] = t.intent
+        # Each template becomes its ordered literal fragments (the text
+        # between placeholders). A prompt matches when every fragment of
+        # at least four characters appears in order, so "Is {brand} SOC 2
+        # compliant?" still maps once the brand is filled in mid-sentence.
+        index: list[tuple[tuple[str, ...], str]] = []
+        for t in (*cls._resolved_templates(industry=""), *security_templates()):
+            fragments = tuple(
+                " ".join(frag.split())
+                for frag in _PLACEHOLDER_RE.split(t.text.lower())
+                if len(" ".join(frag.split())) >= 4
+            )
+            if fragments:
+                index.append((fragments, t.intent))
 
         out: list[str] = []
         for text in prompt_texts:
             lower = " ".join(text.lower().split())
             matched = "custom"
-            for key, intent in index.items():
-                if key and key in lower:
+            for fragments, intent in index:
+                pos = 0
+                for frag in fragments:
+                    found = lower.find(frag, pos)
+                    if found < 0:
+                        break
+                    pos = found + len(frag)
+                else:
                     matched = intent
                     break
             out.append(matched)

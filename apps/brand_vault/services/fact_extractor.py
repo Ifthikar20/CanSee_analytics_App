@@ -30,11 +30,24 @@ from core.llm import ClaudeUtility
 logger = logging.getLogger("apps")
 
 
+# Topic tags let downstream consumers filter the fact base. "security"
+# and "privacy" facts (certifications, encryption, incident history,
+# retention, data sharing) are what the security-perception claim scorer
+# checks AI answers against, so the extractor is asked to label them.
+FACT_TOPICS: tuple[str, ...] = (
+    "security", "privacy", "pricing", "product", "company", "other",
+)
+SECURITY_FACT_TOPICS: tuple[str, ...] = ("security", "privacy")
+
 EXTRACTION_PROMPT = (
     "Extract atomic facts about the brand from the following text. "
     "Return ONLY a JSON array. Each element has fields: subject (string), "
     "predicate (string, short verb phrase), object (string), confidence "
-    "(float between 0 and 1). No prose, no markdown. Use [] if no facts.\n\n"
+    "(float between 0 and 1), topic (one of: security, privacy, pricing, "
+    "product, company, other). Use topic \"security\" for certifications, "
+    "compliance, encryption, access control, incident history and "
+    "vulnerability handling; \"privacy\" for data collection, retention, "
+    "sharing and deletion. No prose, no markdown. Use [] if no facts.\n\n"
     "Text:\n{text}\n"
 )
 
@@ -127,11 +140,15 @@ def _persist_items(items: list[dict], *, website, source_chunk=None, source_url=
         if _exists(website.id, subject, predicate, obj):
             continue
         status = FactStatus.AUTO if confidence >= 0.9 else FactStatus.PENDING
+        topic = str(item.get("topic") or "").strip().lower()
+        if topic not in FACT_TOPICS:
+            topic = ""
         fact = BrandFact.objects.create(
             website=website,
             subject=subject[:300],
             predicate=predicate[:200],
             object=obj,
+            topic=topic,
             source_chunk=source_chunk,
             source_url=source_url[:1000],
             confidence=max(0.0, min(1.0, confidence)),

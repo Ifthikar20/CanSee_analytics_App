@@ -50,6 +50,16 @@ urlpatterns = [
         name="brand-security-prompts",
     ),
     path(
+        "websites/<uuid:website_id>/perception/",
+        v.BrandSecurityPerceptionView.as_view(),
+        name="brand-security-perception",
+    ),
+    path(
+        "websites/<uuid:website_id>/perception/probe/",
+        v.BrandSecurityProbeView.as_view(),
+        name="brand-security-probe",
+    ),
+    path(
         "prompts/<uuid:prompt_id>/",
         v.BrandSecurityPromptDetailView.as_view(),
         name="brand-security-prompt-detail",

@@ -19,7 +19,7 @@ class LLMRankingResultSerializer(serializers.ModelSerializer):
             "run_id", "is_linked", "competitors_mentioned",
             "primary_recommendation", "citations", "citation_countries",
             "extraction_model", "extraction_version",
-            "prompt_source_label",
+            "prompt_source_label", "security_claims",
         ]
         read_only_fields = fields
 
@@ -48,7 +48,7 @@ class LLMRankingAuditSerializer(serializers.ModelSerializer):
         fields = [
             "id", "status", "status_display",
             "business_name", "business_description", "industry", "location", "keywords",
-            "region", "prompt_source", "prompts", "overall_score", "mention_rate", "mention_rate_smoothed",
+            "region", "prompt_source", "probe_kind", "prompts", "overall_score", "mention_rate", "mention_rate_smoothed",
             "avg_mention_rank", "brand_strengths", "citation_countries",
             "mention_rate_ci_lower", "mention_rate_ci_upper",
             "runs_per_query", "extraction_method", "extraction_method_display",
@@ -79,7 +79,7 @@ class LLMRankingAuditListSerializer(serializers.ModelSerializer):
         fields = [
             "id", "status", "status_display",
             "business_name", "industry", "location", "region", "prompt_source",
-            "overall_score", "mention_rate", "mention_rate_smoothed",
+            "probe_kind", "overall_score", "mention_rate", "mention_rate_smoothed",
             "avg_mention_rank", "brand_strengths", "citation_countries",
             "mention_rate_ci_lower", "mention_rate_ci_upper",
             "providers_queried", "queries_completed", "total_queries",
@@ -172,6 +172,14 @@ class RunAuditSerializer(serializers.Serializer):
     )
     # Optional industry override for the prompt_library sample run.
     industry_id = serializers.UUIDField(required=False, allow_null=True)
+    # What to measure. "security" runs the security-perception pack (or the
+    # saved prompts tagged "security") cold, with no crawled context sent
+    # to the providers, and extracts security claims from every answer.
+    probe_kind = serializers.ChoiceField(
+        choices=["visibility", "security"],
+        required=False,
+        default="visibility",
+    )
 
 class LLMRankingScheduleSerializer(serializers.ModelSerializer):
     frequency_display = serializers.CharField(source="get_frequency_display", read_only=True)

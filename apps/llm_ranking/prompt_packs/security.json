@@ -1,0 +1,37 @@
+{
+  "schema": "prompt-pack/v1",
+  "name": "Security Perception",
+  "description": "Questions buyers, security reviewers and procurement teams ask AI assistants about a vendor's security, compliance, incident history and data handling. Unlike the visibility packs these prompts name the brand on purpose: the measurement is what the model says about the brand, not whether it surfaces unprompted.",
+  "industry_keys": [],
+  "prompts": [
+    {"text": "Is {brand} SOC 2 compliant?", "intent": "compliance", "placeholders": ["brand"]},
+    {"text": "Does {brand} hold ISO 27001 or any other security certification?", "intent": "compliance", "placeholders": ["brand"]},
+    {"text": "Is {brand} GDPR compliant and can it be used with EU customer data?", "intent": "compliance", "placeholders": ["brand"]},
+    {"text": "Is {brand} HIPAA compliant? Can it handle protected health information?", "intent": "compliance", "placeholders": ["brand"]},
+    {"text": "Does {brand} meet PCI DSS requirements for handling card data?", "intent": "compliance", "placeholders": ["brand"]},
+
+    {"text": "Has {brand} ever had a data breach or security incident?", "intent": "incident_history", "placeholders": ["brand"]},
+    {"text": "Are there any known vulnerabilities or CVEs affecting {brand}?", "intent": "incident_history", "placeholders": ["brand"]},
+    {"text": "Has {brand} been hacked, and what happened to customer data?", "intent": "incident_history", "placeholders": ["brand"]},
+    {"text": "What security problems has {brand} had in the past few years?", "intent": "incident_history", "placeholders": ["brand"]},
+
+    {"text": "How does {brand} store and protect customer data?", "intent": "data_handling", "placeholders": ["brand"]},
+    {"text": "Does {brand} encrypt data at rest and in transit?", "intent": "data_handling", "placeholders": ["brand"]},
+    {"text": "Where does {brand} host its data and who can access it?", "intent": "data_handling", "placeholders": ["brand"]},
+    {"text": "Does {brand} support single sign-on, two-factor authentication and role-based access control?", "intent": "data_handling", "placeholders": ["brand"]},
+
+    {"text": "Is {brand} or {competitor} more secure for an enterprise deployment?", "intent": "trust_comparison", "placeholders": ["brand", "competitor"]},
+    {"text": "Is it safe to give {brand} my payment details and personal information?", "intent": "trust_comparison", "placeholders": ["brand"]},
+    {"text": "Which {industry} vendors have the strongest security posture, and where does {brand} rank?", "intent": "trust_comparison", "placeholders": ["brand", "industry"]},
+    {"text": "Would a security team approve {brand} in a vendor risk review?", "intent": "trust_comparison", "placeholders": ["brand"]},
+    {"text": "Which {industry} tools would you not recommend on security grounds?", "intent": "trust_comparison", "placeholders": ["industry"]},
+
+    {"text": "What are the security weaknesses of {brand}?", "intent": "vulnerability", "placeholders": ["brand"]},
+    {"text": "Does {brand} run a bug bounty or responsible disclosure program?", "intent": "vulnerability", "placeholders": ["brand"]},
+    {"text": "How quickly does {brand} patch security issues?", "intent": "vulnerability", "placeholders": ["brand"]},
+
+    {"text": "What personal data does {brand} collect and does it sell it to third parties?", "intent": "privacy", "placeholders": ["brand"]},
+    {"text": "Does {brand} use customer data to train AI models?", "intent": "privacy", "placeholders": ["brand"]},
+    {"text": "Can I delete my data from {brand} and how long is it retained?", "intent": "privacy", "placeholders": ["brand"]}
+  ]
+}

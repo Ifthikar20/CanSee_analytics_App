@@ -241,6 +241,13 @@ class SafetyAlert(TimestampMixin):
     # identifiers). Distinct from accuracy: the claim may be TRUE, and
     # that is exactly the problem.
     ISSUE_PRIVATE_DATA = "private_data"
+    # Security perception. The answer asserts a certification, compliance
+    # status or control the brand's ground truth does not support; blames
+    # the brand for an incident the ground truth does not confirm; or
+    # advises against the brand on security or privacy grounds.
+    ISSUE_HALLUCINATED_COMPLIANCE = "hallucinated_compliance"
+    ISSUE_FALSE_INCIDENT = "false_incident"
+    ISSUE_SECURITY_ADVISORY = "security_advisory"
     ISSUE_CHOICES = [
         (ISSUE_HALLUCINATION, "Hallucination"),
         (ISSUE_UNVERIFIED, "Unverified claim"),
@@ -258,6 +265,9 @@ class SafetyAlert(TimestampMixin):
         (ISSUE_WEAK_ENDORSEMENT, "Weak endorsement"),
         (ISSUE_DISTRUST, "Distrust signals"),
         (ISSUE_PRIVATE_DATA, "Private data exposure"),
+        (ISSUE_HALLUCINATED_COMPLIANCE, "Hallucinated compliance claim"),
+        (ISSUE_FALSE_INCIDENT, "Unconfirmed security incident"),
+        (ISSUE_SECURITY_ADVISORY, "Advised against on security grounds"),
     ]
 
     SOURCE_LLM = "llm"

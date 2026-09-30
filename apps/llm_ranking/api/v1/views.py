@@ -105,6 +105,24 @@ class LLMRankingAuditListView(TenantScopedListAPIView):
                 }
                 for p in data["custom_prompts"]
             ]
+        elif data.get("probe_kind") == "security":
+            # Security perception probe: the customer's saved prompts tagged
+            # "security", else the security pack sampled for the brand. The
+            # prompts name the brand on purpose and run cold (no crawled
+            # context), see services/security_probe.py.
+            from apps.llm_ranking.services.security_probe import security_prompts_for
+            prompts = security_prompts_for(
+                website, request.user,
+                business_name=business_name, industry=industry,
+            )
+            if not prompts:
+                return Response(
+                    {
+                        "error": "No security prompts could be built for this website.",
+                        "code": "no_security_prompts",
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
         else:
             # Saved prompts only. The audit runs exactly the list the user
             # curated on the Prompts page — nothing generated. An empty list
@@ -148,6 +166,7 @@ class LLMRankingAuditListView(TenantScopedListAPIView):
             keywords=keywords,
             context_urls=data.get("context_urls", []),
             prompt_source=prompt_source,
+            probe_kind=data.get("probe_kind", "visibility"),
         )
 
         # Dispatch through the canonical scan dispatcher (Celery chord in

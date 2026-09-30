@@ -142,16 +142,18 @@ def _fact_text(fact) -> str:
     return f"{fact.subject} {fact.predicate} {fact.object}"[:MAX_FACT_TEXT]
 
 
-def _load_facts(website) -> list[tuple[BrandFact, list[float]]]:
-    rows = (
-        BrandFact.objects
-        .filter(
-            website=website,
-            status__in=(FactStatus.APPROVED, FactStatus.AUTO),
-            version_to__isnull=True,
-        )
-        .only("id", "subject", "predicate", "object", "embedding")[:MAX_FACTS]
+def _load_facts(website, topics=None) -> list[tuple[BrandFact, list[float]]]:
+    """Approved/auto facts with embeddings. ``topics`` (an iterable of
+    ``BrandFact.topic`` values) narrows the comparator set, e.g. to the
+    security and privacy facts the perception scorer checks against."""
+    qs = BrandFact.objects.filter(
+        website=website,
+        status__in=(FactStatus.APPROVED, FactStatus.AUTO),
+        version_to__isnull=True,
     )
+    if topics:
+        qs = qs.filter(topic__in=list(topics))
+    rows = qs.only("id", "subject", "predicate", "object", "embedding")[:MAX_FACTS]
     return [(f, f.embedding) for f in rows if f.embedding]
 
 

@@ -43,6 +43,7 @@ def create_audit(
     keywords: list | None = None,
     context_urls: list | None = None,
     prompt_source: str = "library",
+    probe_kind: str = LLMRankingAudit.PROBE_KIND_VISIBILITY,
 ) -> LLMRankingAudit:
     """Create an audit, falling back to Website row fields when a value
     is omitted. ``region=None`` derives the region from ``location``;
@@ -76,4 +77,9 @@ def create_audit(
         providers_queried=configured_providers(providers),
         context_urls=list(context_urls or []),
         prompt_source=prompt_source,
+        probe_kind=(
+            probe_kind
+            if probe_kind in dict(LLMRankingAudit.PROBE_KIND_CHOICES)
+            else LLMRankingAudit.PROBE_KIND_VISIBILITY
+        ),
     )
