@@ -83,11 +83,18 @@ SCENARIOS = [
 RUN_AGES_DAYS = (15, 8, 1)
 
 
-def _brand_list(rank):
-    """Brands in answer order, with ours at ``rank`` (or absent)."""
-    names = [c["name"] for c in COMPETITORS] + OTHER_BRANDS
-    slots = max(6, rank or 0)
-    listed = names[: slots - (1 if rank else 0)]
+def _brand_list(rank, offset=0):
+    """Brands in answer order, with ours at ``rank`` (or absent).
+
+    The category leader (first competitor) leads every list; ``offset``
+    rotates the rest and varies the list length, so share of voice differs
+    from brand to brand the way it does in real answers.
+    """
+    leader, *rest = [c["name"] for c in COMPETITORS] + OTHER_BRANDS
+    shift = offset % len(rest)
+    names = [leader, *rest[shift:], *rest[:shift]]
+    length = max(4 + offset % 4, rank or 0)
+    listed = names[: length - (1 if rank else 0)]
     if rank:
         listed.insert(rank - 1, BRAND)
     return listed
@@ -138,7 +145,7 @@ class Command(BaseCommand):
             slug="demo-crm", defaults={"name": "CRM (demo)", "is_active": True},
         )
         counts = {"prompts": 0, "answers": 0, "citations": 0, "checks": 0}
-        for text, position, path, ranks in SCENARIOS:
+        for index, (text, position, path, ranks) in enumerate(SCENARIOS):
             prompt, _ = Prompt.objects.get_or_create(
                 text_hash=text_hash(text),
                 defaults=dict(
@@ -160,7 +167,10 @@ class Command(BaseCommand):
                     completed_at=ran_at,
                 )
                 results = [
-                    self._result(audit, prompt, text, engine, ranks[engine][run], run)
+                    self._result(
+                        audit, prompt, text, engine, ranks[engine][run], run,
+                        offset=3 * index + ENGINES.index(engine) + run,
+                    )
                     for engine in ENGINES
                 ]
                 LLMRankingResult.objects.bulk_create(results)
@@ -176,8 +186,8 @@ class Command(BaseCommand):
             counts["checks"] += 1
         return counts
 
-    def _result(self, audit, prompt, text, engine, rank, run) -> LLMRankingResult:
-        brands = _brand_list(rank)
+    def _result(self, audit, prompt, text, engine, rank, run, offset=0) -> LLMRankingResult:
+        brands = _brand_list(rank, offset)
         answer = "\n".join(f"{i}. {name}" for i, name in enumerate(brands, start=1))
         return LLMRankingResult(
             audit=audit, provider=engine, prompt=text, prompt_index=0, run_id=run,
