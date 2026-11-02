@@ -12,7 +12,7 @@ class WebsiteSerializer(serializers.ModelSerializer):
     class Meta:
         model = Website
         fields = [
-            "id", "url", "name", "industry", "description", "topics",
+            "id", "url", "name", "industry", "description", "topics", "competitors",
             "platform_type",
             "pixel_key", "pixel_verified", "pixel_verified_at", "crawl_status",
             "is_active", "pixel_snippet", "created_by", "created_at", "updated_at",
@@ -50,15 +50,21 @@ class WebsiteCreateSerializer(serializers.Serializer):
             raise serializers.ValidationError(e.messages[0]) from None
 
 
+class CompetitorSerializer(serializers.Serializer):
+    name = serializers.CharField(max_length=200)
+    domain = serializers.CharField(max_length=300, required=False, allow_blank=True, default="")
+
+
 class WebsiteUpdateSerializer(serializers.Serializer):
     name = serializers.CharField(max_length=200, required=False)
     industry = serializers.CharField(max_length=100, required=False)
     description = serializers.CharField(required=False, allow_blank=True)
+    # No default: an update that leaves a list out must not wipe it.
     topics = serializers.ListField(
         child=serializers.CharField(max_length=200),
         required=False,
-        default=list,
     )
+    competitors = CompetitorSerializer(many=True, required=False, max_length=25)
 
 
 class WebsiteSettingsSerializer(serializers.ModelSerializer):

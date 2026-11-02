@@ -113,7 +113,13 @@ class WebsiteService:
 
     @staticmethod
     def update(*, website: Website, user, **kwargs) -> Website:
-        allowed_fields = {"name", "industry", "description", "topics"}
+        allowed_fields = {"name", "industry", "description", "topics", "competitors"}
+        if "competitors" in kwargs:
+            # Stored as plain [{name, domain}] dicts, the shape every reader expects.
+            kwargs["competitors"] = [
+                {"name": c["name"].strip(), "domain": (c.get("domain") or "").strip().lower()}
+                for c in kwargs["competitors"] if c.get("name", "").strip()
+            ]
         for field in allowed_fields & kwargs.keys():
             setattr(website, field, kwargs[field])
         website.save()
