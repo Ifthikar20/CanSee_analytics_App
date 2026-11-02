@@ -23,6 +23,8 @@ app.conf.task_routes = {
     # integrations / OAuth
     "apps.websites.tasks.refresh_expiring_tokens": {"queue": "integrations"},
     "apps.search_console.tasks.*": {"queue": "integrations"},
+    # Google rank checks are third-party HTTP (SerpAPI), not LLM work.
+    "apps.search_gap.tasks.*": {"queue": "integrations"},
     # AI / LLM
     "apps.llm_ranking.tasks.*": {"queue": "ai"},
     "apps.prompt_library.tasks.dispatch_scheduled_prompt_scans": {"queue": "ai"},

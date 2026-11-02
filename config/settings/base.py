@@ -64,6 +64,7 @@ LOCAL_APPS = [
     "apps.brand_vault",
     "apps.content_studio",
     "apps.search_console",
+    "apps.search_gap",
     "apps.assistant",
     "apps.web_analytics",
     # Stub app — kept only to satisfy historical lazy FK references
@@ -562,6 +563,14 @@ X_BEARER_TOKEN = env("X_BEARER_TOKEN", default="")  # X (Twitter) API for trendi
 TWITTER_BEARER_TOKEN = env("TWITTER_BEARER_TOKEN", default=X_BEARER_TOKEN)
 FEATURE_X_SCANNER = env.bool("FEATURE_X_SCANNER", default=False)
 SERPAPI_KEY = env("SERPAPI_KEY", default="")
+
+# ── Search vs AI gap (apps.search_gap) ─────────────────────────────────
+# Google rank per tracked prompt, via SerpAPI. A check pages 10 results at
+# a time and stops at the site, so MAX_DEPTH=100 costs at most 10 calls.
+SEARCH_GAP_MAX_DEPTH = env.int("SEARCH_GAP_MAX_DEPTH", default=100)
+SEARCH_GAP_RECHECK_HOURS = env.int("SEARCH_GAP_RECHECK_HOURS", default=24)
+SEARCH_GAP_DAILY_CHECKS_PER_WEBSITE = env.int("SEARCH_GAP_DAILY_CHECKS_PER_WEBSITE", default=100)
+SERPAPI_COST_PER_SEARCH_USD = env.float("SERPAPI_COST_PER_SEARCH_USD", default=0.015)
 
 # ── SMS (Twilio) ───────────────────────────────────────────────────────
 # The most intrusive channel in the product, so it is off by default and

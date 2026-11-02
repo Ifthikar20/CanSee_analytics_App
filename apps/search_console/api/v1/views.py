@@ -132,10 +132,10 @@ class GscOAuthCallbackView(APIView):
     authentication_classes = []
 
     def _spa_redirect(self, website_id, outcome: str, reason: str = "") -> HttpResponseRedirect:
-        # GSC management lives on the Integrations page; the old
-        # search-performance page is now the AI Search Insights page.
+        # GSC is connected from Settings > Connections. The UI still
+        # redirects the old /app/integrations path, for links in flight.
         base = settings.FRONTEND_URL.rstrip("/")
-        url = f"{base}/app/integrations?gsc={outcome}"
+        url = f"{base}/settings/connections?gsc={outcome}"
         if website_id:
             url += f"&website_id={website_id}"
         if reason:

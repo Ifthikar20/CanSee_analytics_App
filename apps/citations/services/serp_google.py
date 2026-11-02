@@ -102,8 +102,21 @@ def _parse_comment_count(value) -> int:
     return int(number)
 
 
-def search(query: str, *, max_results: int = DEFAULT_MAX_RESULTS, timeout: float = TIMEOUT) -> dict:
+def search(
+    query: str,
+    *,
+    max_results: int = DEFAULT_MAX_RESULTS,
+    timeout: float = TIMEOUT,
+    start: int = 0,
+    gl: str = "",
+    hl: str = "",
+) -> dict:
     """Run one SerpAPI Google search and parse every block we use.
+
+    ``start`` pages through results (Google serves 10 per page since it
+    stopped honouring ``num=100``); ``gl``/``hl`` set the country and
+    interface language. Brand Research uses none of them: one first-page
+    call. The search-gap rank check walks pages until it finds the site.
 
     Never raises. An unconfigured key, a network error, a non-200 or a
     non-JSON body all come back as an empty payload with ``error`` set.
@@ -119,17 +132,21 @@ def search(query: str, *, max_results: int = DEFAULT_MAX_RESULTS, timeout: float
     except ImportError:  # pragma: no cover - requests is a hard dependency
         return _empty("requests_unavailable")
 
+    params = {
+        "q": query[:500],
+        "engine": "google",
+        "num": str(max(5, min(int(max_results), MAX_ORGANIC))),
+        "api_key": settings.SERPAPI_KEY,
+    }
+    if start:
+        params["start"] = str(max(0, int(start)))
+    if gl:
+        params["gl"] = gl.strip().lower()[:2]
+    if hl:
+        params["hl"] = hl.strip().lower()[:5]
+
     try:
-        resp = requests.get(
-            SEARCH_ENDPOINT,
-            params={
-                "q": query[:500],
-                "engine": "google",
-                "num": str(max(5, min(int(max_results), MAX_ORGANIC))),
-                "api_key": settings.SERPAPI_KEY,
-            },
-            timeout=timeout,
-        )
+        resp = requests.get(SEARCH_ENDPOINT, params=params, timeout=timeout)
     except Exception as exc:
         logger.warning("serp_google network error for %r: %s", query, exc)
         return _empty("network")
@@ -171,8 +188,12 @@ def _parse_organic(data: dict, max_results: int) -> list[dict]:
         host = _host_of(url)
         if not host:
             continue
+        # SerpAPI's own position is absolute across pages (11-20 on page
+        # two); ``rank`` stays the 1-based index among the rows kept here.
+        position = item.get("position")
         rows.append({
             "rank": len(rows) + 1,
+            "position": position if isinstance(position, int) and position > 0 else None,
             "url": url,
             "domain": host,
             "title": _clean(item.get("title")),

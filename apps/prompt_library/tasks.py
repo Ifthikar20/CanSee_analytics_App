@@ -187,6 +187,12 @@ def dispatch_scheduled_prompt_scans() -> None:
             # ── 3. Run the single-prompt crawl ────────────────────────
             crawl_prompt_for_website.delay(str(website.id), str(prompt.id))
 
+            # ── 4. Recheck Google on the same cadence (search vs AI gap)
+            from apps.citations.services import serp_google
+            if serp_google.is_configured():
+                from apps.search_gap.tasks import check_google_rank
+                check_google_rank.delay(str(bp.id))
+
             # Advance + reset the failure counter (success path).
             delta = PROMPT_FREQUENCY_DELTAS.get(schedule.frequency, timedelta(weeks=1))
             schedule.last_run_at = now

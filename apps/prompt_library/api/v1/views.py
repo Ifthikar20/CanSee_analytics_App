@@ -1134,17 +1134,14 @@ class BrandPromptDetailAggView(TenantScopedAPIView):
       - domain type breakdown
     """
 
-    @staticmethod
-    def _normalise(text: str) -> str:
-        return " ".join((text or "").split()).lower()
-
     def get(self, request, website_id, prompt_id):
         from collections import Counter, defaultdict
 
-        from django.db.models import Q
-
         from apps.citations.models import Citation
-        from apps.llm_ranking.models import LLMRankingResult
+        from apps.prompt_library.services.prompt_stats import (
+            aggregate_by_model,
+            matching_results,
+        )
 
         website = self.get_website(website_id)
 
@@ -1165,56 +1162,31 @@ class BrandPromptDetailAggView(TenantScopedAPIView):
         selected_run = (request.query_params.get("run") or "").strip() or None
         period = (request.query_params.get("period") or "all").strip().lower()
 
-        # Match every LLMRankingResult on this website whose prompt text
-        # equals the prompt's text OR template_text. The audit serializer
-        # stores the resolved text on the result, so we compare against
-        # both shapes to catch templated variants.
-        # Match results to this prompt by the source_prompt FK (set when the
-        # cell ran) OR by exact text. The FK is the reliable link — it catches
-        # region-flavored or whitespace-different prompt text that pure string
-        # matching would miss.
-        norm_text = self._normalise(prompt.text)
-        norm_template = self._normalise(prompt.template_text or "")
-        candidates = (
-            LLMRankingResult.objects
-            .filter(audit__website=website)
-            .filter(
-                Q(source_prompt_id=prompt.id)
-                | Q(prompt__icontains=prompt.text[:80])
-                | Q(prompt__icontains=(prompt.template_text or "")[:80])
-            )
-            .only(
+        # Match every LLMRankingResult on this website that answered this
+        # prompt (source_prompt FK or exact text; see prompt_stats).
+        # Window by created_at when a period is requested. Applied to the
+        # queryset so both the trend series and the per-model aggregation
+        # below reflect the same window.
+        _PERIOD_DAYS = {"7d": 7, "30d": 30, "90d": 90, "1y": 365}
+        _period_days = _PERIOD_DAYS.get(period)
+        since = None
+        if _period_days:
+            from datetime import timedelta as _td
+
+            from django.utils import timezone as _tz
+            since = _tz.now() - _td(days=_period_days)
+
+        results = matching_results(
+            website, prompt, since=since,
+            fields=(
                 "id", "public_id", "provider", "prompt", "response_text",
                 "is_mentioned", "mention_rank", "sentiment",
                 "competitors_mentioned", "created_at",
                 "citation_countries", "query_succeeded", "error_message",
                 "extraction_model", "source_prompt_id", "audit_id",
                 "alignment_score", "alignment_detail",
-            )
+            ),
         )
-
-        # Window by created_at when a period is requested. Applied to the
-        # queryset so both the trend series and the per-model aggregation
-        # below reflect the same window.
-        _PERIOD_DAYS = {"7d": 7, "30d": 30, "90d": 90, "1y": 365}
-        _period_days = _PERIOD_DAYS.get(period)
-        if _period_days:
-            from datetime import timedelta as _td
-
-            from django.utils import timezone as _tz
-            candidates = candidates.filter(
-                created_at__gte=_tz.now() - _td(days=_period_days)
-            )
-
-        results = []
-        for r in candidates:
-            rn = self._normalise(r.prompt)
-            if (
-                r.source_prompt_id == prompt.id
-                or rn == norm_text
-                or (norm_template and rn == norm_template)
-            ):
-                results.append(r)
 
         # Visibility is "in what share of real answers does this brand
         # appear", so the denominator must be the responses that actually
@@ -1620,79 +1592,7 @@ class BrandPromptDetailAggView(TenantScopedAPIView):
         ]
 
         # ── Brand visibility per model for this prompt ──
-        # Every implemented provider appears: unconfigured ones are flagged
-        # so the UI shows "Not configured" instead of a misleading 0%.
-        # Failed cells whose error_message starts with the service_unavailable
-        # sentinel are counted separately so the UI can show a distinct state
-        # for "we tried but the provider was down" versus "no data yet".
-        from django.conf import settings as dj_settings
-
-        from apps.llm_ranking.providers import PROVIDERS
-
-        model_labels = {
-            "claude": "Claude", "gpt4": "ChatGPT", "gemini": "Gemini",
-            "perplexity": "Perplexity", "grok": "Grok",
-        }
-        per_model: dict[str, dict] = {}
-        for r in results:
-            m = per_model.setdefault(r.provider, {
-                "responses": 0, "mentioned": 0, "unavailable": 0, "failed": 0,
-                "ranks": [],
-            })
-            if not r.query_succeeded:
-                err = getattr(r, "error_message", "") or ""
-                if err.startswith("service_unavailable"):
-                    m["unavailable"] += 1
-                else:
-                    m["failed"] += 1
-                continue
-            m["responses"] += 1
-            if r.is_mentioned:
-                m["mentioned"] += 1
-                if r.mention_rank is not None:
-                    m["ranks"].append(r.mention_rank)
-
-        def _rank_buckets(ranks: list) -> dict:
-            buckets = {"1": 0, "2-3": 0, "4-10": 0, "11+": 0}
-            for rank in ranks:
-                if rank == 1:
-                    buckets["1"] += 1
-                elif rank <= 3:
-                    buckets["2-3"] += 1
-                elif rank <= 10:
-                    buckets["4-10"] += 1
-                else:
-                    buckets["11+"] += 1
-            return buckets
-
-        by_model = []
-        for key, cls in PROVIDERS.items():
-            configured = bool(getattr(dj_settings, cls.api_key_setting, ""))
-            stat = per_model.get(key, {
-                "responses": 0, "mentioned": 0, "unavailable": 0, "failed": 0,
-                "ranks": [],
-            })
-            responses = stat["responses"]
-            by_model.append({
-                "provider": key,
-                "model": model_key(key),
-                "label": model_labels.get(key, key),
-                "configured": configured,
-                "responses": responses,
-                "mentioned": stat["mentioned"],
-                "unavailable": stat["unavailable"],
-                "failed": stat.get("failed", 0),
-                "visibility_pct": (
-                    round(100 * stat["mentioned"] / responses, 1) if responses else 0.0
-                ),
-                "rank_buckets": _rank_buckets(stat["ranks"]),
-                "avg_rank": (
-                    round(sum(stat["ranks"]) / len(stat["ranks"]), 1)
-                    if stat["ranks"] else None
-                ),
-            })
-        # Configured-with-data first, then by visibility, unconfigured last.
-        by_model.sort(key=lambda m: (not m["configured"], -m["responses"], -m["visibility_pct"]))
+        by_model = aggregate_by_model(results)
 
         ordered = sorted(
             results, key=lambda r: r.created_at or prompt.created_at, reverse=True,
