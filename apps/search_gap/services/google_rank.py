@@ -13,7 +13,6 @@ import logging
 import math
 import re
 from datetime import timedelta
-from decimal import Decimal
 
 from django.conf import settings
 from django.utils import timezone
@@ -28,7 +27,7 @@ MAX_AI_OVERVIEW_REFERENCES = 5
 
 
 class NotConfigured(Exception):
-    """SERPAPI_KEY is not set."""
+    """Neither SERPAPI_KEY nor SCRAPERAPI_KEY is set."""
 
 
 class DailyLimitReached(Exception):
@@ -180,7 +179,7 @@ def check(brand_prompt, *, force: bool = False, now=None):
         ai_overview=summarize_ai_overview(found["ai_overview"], brand=website.name, apex=apex,
                                           deferred=bool(found.get("ai_overview_deferred"))),
         pages_fetched=pages,
-        cost_usd=Decimal(str(settings.SERPAPI_COST_PER_SEARCH_USD)) * pages,
+        cost_usd=serp_google.cost_per_search_usd() * pages,
         error=found["error"][:200],
         checked_at=now,
     )

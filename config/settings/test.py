@@ -58,11 +58,14 @@ CLAIM_VERIFICATION_ENABLED = False
 INTELLIGENCE_SERVICE_URL = ""
 SOURCES_SERVICE_URL = ""
 
-# Brand Research discovery must never leave the process. SERPAPI_KEY comes
+# Brand Research discovery must never leave the process. SERPAPI_KEY and
+# SCRAPERAPI_KEY come
 # from .env on a developer machine, and the Reddit community lane has no key
 # to blank -- without both of these the scan pipeline tests make real
 # outbound calls. Tests covering these lanes mock the clients directly.
 SERPAPI_KEY = ""
+SCRAPERAPI_KEY = ""
+SERP_PROVIDER = ""
 BRAND_RESEARCH_COMMUNITY_ENABLED = False
 # SMS must never leave the process in tests: a real send costs money and
 # texts a real handset. Tests that cover the channel enable it explicitly

@@ -594,6 +594,11 @@ WORKOS_CLIENT_ID = env("WORKOS_CLIENT_ID", default="")
 BACKEND_PUBLIC_URL = env("BACKEND_PUBLIC_URL", default="http://localhost:8000")
 SENTRY_DSN = env("SENTRY_DSN", default="")
 SERPAPI_KEY = env("SERPAPI_KEY", default="")
+# ScraperAPI's structured Google search: the other Google results provider.
+# With both keys set SerpAPI is used, unless SERP_PROVIDER ("serpapi" or
+# "scraperapi") pins one.
+SCRAPERAPI_KEY = env("SCRAPERAPI_KEY", default="")
+SERP_PROVIDER = env("SERP_PROVIDER", default="")
 
 # ── Search vs AI gap (apps.search_gap) ─────────────────────────────────
 # Google rank per tracked prompt, via SerpAPI. A check pages 10 results at
@@ -602,6 +607,9 @@ SEARCH_GAP_MAX_DEPTH = env.int("SEARCH_GAP_MAX_DEPTH", default=100)
 SEARCH_GAP_RECHECK_HOURS = env.int("SEARCH_GAP_RECHECK_HOURS", default=24)
 SEARCH_GAP_DAILY_CHECKS_PER_WEBSITE = env.int("SEARCH_GAP_DAILY_CHECKS_PER_WEBSITE", default=100)
 SERPAPI_COST_PER_SEARCH_USD = env.float("SERPAPI_COST_PER_SEARCH_USD", default=0.015)
+# ScraperAPI bills credits from a monthly allowance: set your plan's dollar
+# cost per Google search to record it (0 records nothing, as on the free plan).
+SCRAPERAPI_COST_PER_SEARCH_USD = env.float("SCRAPERAPI_COST_PER_SEARCH_USD", default=0.0)
 
 # ── SMS (Twilio) ───────────────────────────────────────────────────────
 # The most intrusive channel in the product, so it is off by default and

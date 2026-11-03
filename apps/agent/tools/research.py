@@ -15,7 +15,6 @@ import threading
 import uuid
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timedelta
-from decimal import Decimal
 
 from django.conf import settings
 from django.db import close_old_connections, connections
@@ -159,6 +158,7 @@ def build_serp_capture(payload: dict, *, website, query: str, page: int, locatio
         "start": start,
         "location": location,
         "captured_at": now_iso(),
+        "provider": payload.get("provider") or "",
         "brand": {"name": website.name, "domain": apex},
         "brand_positions": [r["position"] for r in results if r["is_yours"]],
         "results": results,
@@ -194,6 +194,7 @@ def _record_rank_check(website, brand_prompt, *, query: str, location: str, page
     searched, or the full depth when Google ran out of results first (as
     search_gap's own check records it). ``pages_fetched`` and the cost
     count the pages this search paid for."""
+    from apps.citations.services import serp_google
     from apps.search_gap.models import GoogleRankCheck
 
     first = pages[0]
@@ -223,7 +224,7 @@ def _record_rank_check(website, brand_prompt, *, query: str, location: str, page
             "references": overview.get("references") or [],
         },
         pages_fetched=fetched,
-        cost_usd=Decimal(str(settings.SERPAPI_COST_PER_SEARCH_USD)) * fetched,
+        cost_usd=serp_google.cost_per_search_usd() * fetched,
         error="",
         # When Google was searched: a page shown again keeps its capture time.
         checked_at=min(parse_datetime(p["captured_at"]) for p in pages),
@@ -327,7 +328,7 @@ def _fetch_page(ctx: ToolContext, *, query: str, page: int, location: str, gl: s
         payload = {"error": "network"}
     capture = build_serp_capture(payload, website=ctx.website, query=query, page=page,
                                  location=location, capture_id=capture_id)
-    capture["cost_usd"] = float(Decimal(str(settings.SERPAPI_COST_PER_SEARCH_USD)))
+    capture["cost_usd"] = float(serp_google.cost_per_search_usd())
     if payload.get("error"):
         capture["error"] = _serp_error(payload["error"])
     em.record_research("serp", capture_id, capture)
@@ -360,9 +361,10 @@ def google_search(ctx: ToolContext, args) -> ToolResult:
             status="error", tab_id=None, brand_positions=[], result_count=0,
             ai_overview_shown=False,
             error={"code": "serp_not_configured",
-                   "message": "Google search isn't available: SERPAPI_KEY is not set."},
+                   "message": "Google search isn't available: no Google results key (SERPAPI_KEY or SCRAPERAPI_KEY) is set."},
         )
-        raise ToolError("Google search isn't available: SERPAPI_KEY is not set.",
+        raise ToolError("Google search isn't available: no Google results key "
+                        "(SERPAPI_KEY or SCRAPERAPI_KEY) is set.",
                         summary="Google search not configured")
 
     gl, hl = locale(location)
@@ -449,7 +451,7 @@ def google_search(ctx: ToolContext, args) -> ToolResult:
         "pages_searched": len(captures),
         "pages_fetched": fetched,
         "pages_reused": reused,
-        "cost_usd": float(Decimal(str(settings.SERPAPI_COST_PER_SEARCH_USD)) * fetched),
+        "cost_usd": float(serp_google.cost_per_search_usd() * fetched),
         "pages_left_today": quota.remaining(str(ctx.website.id)),
         "brand_best_position": min(positions) if positions else None,
         "ai_overview": ai_overview_summary(first["ai_overview"] or {}),

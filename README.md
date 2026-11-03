@@ -19,7 +19,7 @@ their `*_SERVICE_URL` variables are unset, Django runs the same code in-process.
 | Path | What it holds |
 |---|---|
 | `apps/llm_ranking` | Prompt runs across the AI engines: answers, mentions, scores |
-| `apps/search_gap` | Google rank per tracked prompt (SerpAPI) next to AI placement |
+| `apps/search_gap` | Google rank per tracked prompt (SerpAPI or ScraperAPI) next to AI placement |
 | `apps/agent` | The agent workspace: chats, SEO/GEO research tools, writing agents, reports (see Agent service) |
 | `apps/prompt_library` | Tracked prompts, industries, prompt suggestions |
 | `apps/citations` | Sources the AI answers cite |
@@ -118,8 +118,9 @@ worker that receives a `live/` request answers `503 agent_unavailable`.
 
 **Switches.** `AGENT_ENABLED` (default off) gates every agent endpoint except
 `status/`, which reports what is configured: the switch, the agent process, the model,
-which AI engines and SerpAPI have keys, and the user's AI allowance. Without
+which AI engines and Google results provider have keys, and the user's AI allowance. Without
 `ANTHROPIC_API_KEY` no run starts (`503 agent_not_configured`); without `SERPAPI_KEY`
+or `SCRAPERAPI_KEY`
 Google research reports `serp_not_configured`; an engine without a key is reported as
 not configured. Nothing is filled in with sample data. The `AGENT_*` settings in
 `config/settings/base.py` (model, effort, token and cost ceilings, concurrency,

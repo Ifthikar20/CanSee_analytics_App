@@ -1,4 +1,5 @@
-"""Google SERP lane for Brand Research, via SerpAPI.
+"""Google results for Brand Research, the search-gap rank checks and the
+agent's research, via SerpAPI or ScraperAPI's structured Google search.
 
 The scan's other discovery lane (``web_search`` / Perplexity) returns an
 AI-era index: good recall on things Google buries, but the response carries
@@ -14,6 +15,7 @@ point returns a well-formed empty payload instead of raising.
 Returns::
 
     {"configured": bool,
+     "provider": "serpapi" | "scraperapi" | "",
      "error": str,                     # "" when fine
      "organic":     [{rank, url, domain, title, snippet, date}],
      "discussions": [{rank, url, domain, title, snippet, source_label,
@@ -29,6 +31,7 @@ from __future__ import annotations
 
 import logging
 import re
+from decimal import Decimal
 
 from django.conf import settings
 
@@ -37,8 +40,15 @@ from apps.citations.services.url_normalizer import normalize_url
 logger = logging.getLogger("apps")
 
 SEARCH_ENDPOINT = "https://serpapi.com/search.json"
+SCRAPERAPI_ENDPOINT = "https://api.scraperapi.com/structured/google/search"
 DEFAULT_MAX_RESULTS = 10
 TIMEOUT = 15.0
+# ScraperAPI fetches and renders Google before parsing it, so one search
+# takes far longer than a SerpAPI lookup.
+SCRAPERAPI_TIMEOUT = 70.0
+
+PROVIDER_SERPAPI = "serpapi"
+PROVIDER_SCRAPERAPI = "scraperapi"
 
 # Caps. The SERP can return a lot of PAA/related-search chaff; past these
 # counts it stops informing the graph and starts crowding it.
@@ -49,13 +59,45 @@ MAX_RELATED = 8
 MAX_AI_REFERENCES = 10
 
 
+def provider() -> str:
+    """The Google results provider in use, or "" when neither has a key.
+
+    SERP_PROVIDER pins one ("serpapi" or "scraperapi"). Otherwise SerpAPI
+    wins when both keys are set: it also returns the AI Overview text and
+    the knowledge panel, which ScraperAPI does not.
+    """
+    has_key = {
+        PROVIDER_SERPAPI: bool(getattr(settings, "SERPAPI_KEY", "")),
+        PROVIDER_SCRAPERAPI: bool(getattr(settings, "SCRAPERAPI_KEY", "")),
+    }
+    pinned = (getattr(settings, "SERP_PROVIDER", "") or "").strip().lower()
+    if pinned in has_key:
+        return pinned if has_key[pinned] else ""
+    for name in (PROVIDER_SERPAPI, PROVIDER_SCRAPERAPI):
+        if has_key[name]:
+            return name
+    return ""
+
+
 def is_configured() -> bool:
-    return bool(getattr(settings, "SERPAPI_KEY", ""))
+    return bool(provider())
 
 
-def _empty(error: str = "", configured: bool = True) -> dict:
+def cost_per_search_usd() -> Decimal:
+    """What one search costs with the provider in use (0 when none is set)."""
+    setting = {
+        PROVIDER_SERPAPI: "SERPAPI_COST_PER_SEARCH_USD",
+        PROVIDER_SCRAPERAPI: "SCRAPERAPI_COST_PER_SEARCH_USD",
+    }.get(provider())
+    if not setting:
+        return Decimal("0")
+    return Decimal(str(getattr(settings, setting, 0) or 0))
+
+
+def _empty(error: str = "", configured: bool = True, provider: str = "") -> dict:
     return {
         "configured": configured,
+        "provider": provider,
         "error": error,
         "organic": [],
         "discussions": [],
@@ -104,18 +146,27 @@ def _parse_comment_count(value) -> int:
     return int(number)
 
 
+def _redacted(error: Exception, key: str) -> str:
+    """An exception message without the API key (it rides in the URL)."""
+    text = str(error)
+    return text.replace(key, "***") if key else text
+
+
 def search(
     query: str,
     *,
     max_results: int = DEFAULT_MAX_RESULTS,
-    timeout: float = TIMEOUT,
+    timeout: float | None = None,
     start: int = 0,
     gl: str = "",
     hl: str = "",
 ) -> dict:
-    """Run one SerpAPI Google search and parse every block we use.
+    """Run one Google search and parse every block we use.
 
-    ``start`` pages through results (Google serves 10 per page since it
+    The provider is SerpAPI or ScraperAPI (see ``provider()``); both come
+    back in the same shape, with ``provider`` naming the one used. A
+    ``timeout`` of None means the provider's own default. ``start`` pages
+    through results (Google serves 10 per page since it
     stopped honouring ``num=100``); ``gl``/``hl`` set the country and
     interface language. Brand Research uses none of them: one first-page
     call. The search-gap rank check walks pages until it finds the site.
@@ -126,51 +177,73 @@ def search(
     query = (query or "").strip()
     if not query:
         return _empty("empty_query")
-    if not is_configured():
+    which = provider()
+    if not which:
         return _empty("serpapi_not_configured", configured=False)
 
     try:
         import requests
     except ImportError:  # pragma: no cover - requests is a hard dependency
-        return _empty("requests_unavailable")
+        return _empty("requests_unavailable", provider=which)
 
-    params = {
-        "q": query[:500],
-        "engine": "google",
-        "num": str(max(5, min(int(max_results), MAX_ORGANIC))),
-        "api_key": settings.SERPAPI_KEY,
-    }
+    if which == PROVIDER_SCRAPERAPI:
+        endpoint, key = SCRAPERAPI_ENDPOINT, settings.SCRAPERAPI_KEY
+        # The structured endpoint takes the country, not the interface
+        # language, and always returns one page of results.
+        params = {"api_key": key, "query": query[:500]}
+        if gl:
+            params["country_code"] = gl.strip().lower()[:2]
+        timeout = SCRAPERAPI_TIMEOUT if timeout is None else timeout
+    else:
+        endpoint, key = SEARCH_ENDPOINT, settings.SERPAPI_KEY
+        params = {
+            "q": query[:500],
+            "engine": "google",
+            "num": str(max(5, min(int(max_results), MAX_ORGANIC))),
+            "api_key": key,
+        }
+        if gl:
+            params["gl"] = gl.strip().lower()[:2]
+        if hl:
+            params["hl"] = hl.strip().lower()[:5]
+        timeout = TIMEOUT if timeout is None else timeout
     if start:
         params["start"] = str(max(0, int(start)))
-    if gl:
-        params["gl"] = gl.strip().lower()[:2]
-    if hl:
-        params["hl"] = hl.strip().lower()[:5]
 
     try:
-        resp = requests.get(SEARCH_ENDPOINT, params=params, timeout=timeout)
+        resp = requests.get(endpoint, params=params, timeout=timeout)
     except Exception as exc:
-        logger.warning("serp_google network error for %r: %s", query, exc)
-        return _empty("network")
+        logger.warning("serp_google (%s) network error for %r: %s",
+                       which, query, _redacted(exc, key))
+        return _empty("network", provider=which)
 
     if resp.status_code != 200:
-        logger.warning("serp_google %r -> HTTP %s", query, resp.status_code)
-        return _empty(f"http_{resp.status_code}")
+        logger.warning("serp_google (%s) %r -> HTTP %s", which, query, resp.status_code)
+        return _empty(f"http_{resp.status_code}", provider=which)
 
     try:
         data = resp.json()
     except Exception:
-        logger.warning("serp_google %r -> non-JSON body", query)
-        return _empty("decode")
+        logger.warning("serp_google (%s) %r -> non-JSON body", which, query)
+        return _empty("decode", provider=which)
 
     if not isinstance(data, dict):
-        return _empty("decode")
+        return _empty("decode", provider=which)
 
-    payload = _empty()
-    payload["organic"] = _parse_organic(data, max_results)
+    payload = _empty(provider=which)
+    payload["organic"] = _parse_organic(
+        data, max_results, start=start, page_relative=which == PROVIDER_SCRAPERAPI,
+    )
     payload["discussions"] = _parse_discussions(data)
     payload["questions"] = _parse_questions(data)
     payload["related_searches"] = _parse_related_searches(data)
+    if which == PROVIDER_SCRAPERAPI:
+        # ScraperAPI marks where Google showed an AI Overview (``ai_box``)
+        # but sends neither its text nor its sources, so it is reported as
+        # shown and unread, like SerpAPI's page_token case below.
+        block = data.get("ai_box")
+        payload["ai_overview_deferred"] = isinstance(block, dict) and bool(block)
+        return payload
     payload["ai_overview"] = _parse_ai_overview(data)
     # Google showed an AI Overview whose content did not come with the page
     # (SerpAPI sent only a page_token / serpapi_link for it). ``ai_overview``
@@ -188,9 +261,10 @@ def search(
 # blocks are absent far more often than they are present.
 
 
-def _parse_organic(data: dict, max_results: int) -> list[dict]:
+def _parse_organic(data: dict, max_results: int, *, start: int = 0,
+                   page_relative: bool = False) -> list[dict]:
     rows = []
-    for item in (data.get("organic_results") or [])[:MAX_ORGANIC]:
+    for index, item in enumerate((data.get("organic_results") or [])[:MAX_ORGANIC]):
         if not isinstance(item, dict):
             continue
         url = _clean(item.get("link"), 2000)
@@ -199,7 +273,9 @@ def _parse_organic(data: dict, max_results: int) -> list[dict]:
             continue
         # SerpAPI's own position is absolute across pages (11-20 on page
         # two); ``rank`` stays the 1-based index among the rows kept here.
-        position = item.get("position")
+        # ScraperAPI numbers each page on its own, and not always from 1,
+        # so there the position comes from ``start`` and the row's place.
+        position = start + index + 1 if page_relative else item.get("position")
         rows.append({
             "rank": len(rows) + 1,
             "position": position if isinstance(position, int) and position > 0 else None,
@@ -255,7 +331,8 @@ def _parse_questions(data: dict) -> list[dict]:
     double as content opportunities: a question with no good answer ranking
     is a gap the user can fill."""
     rows = []
-    for item in (data.get("related_questions") or [])[:MAX_QUESTIONS]:
+    raw = data.get("related_questions") or data.get("people_also_ask") or []
+    for item in raw[:MAX_QUESTIONS]:
         if not isinstance(item, dict):
             continue
         question = _clean(item.get("question"), 300)
