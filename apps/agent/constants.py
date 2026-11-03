@@ -62,6 +62,9 @@ class RunTrigger(models.TextChoices):
     REGENERATE = "regenerate", "Regenerate"
     EDIT = "edit", "Edit"
     CONTINUE = "continue", "Continue"
+    # A research re-run turn: it runs the research agents and makes no
+    # model request of its own.
+    RERUN = "rerun", "Re-run"
 
 
 class RunStatus(models.TextChoices):
@@ -138,6 +141,9 @@ class PartType:
     CHART = "chart"
     BROWSER_OPEN = "browser_open"
     NOTICE = "notice"
+    # The research agents (design/swarm_contract.md section 5).
+    SWARM = "swarm"
+    SWARM_TABLE = "swarm_table"
 
 
 class EventType:
@@ -163,6 +169,12 @@ class EventType:
     ARTIFACT_FAILED = "artifact.failed"
     BROWSER_OPEN = "browser.open"
     BROWSER_UPDATE = "browser.update"
+    # One research agent of a swarm part (swarm contract section 4).
+    TASK_STARTED = "task.started"
+    TASK_PROGRESS = "task.progress"
+    TASK_FINISHED = "task.finished"
+    # A capture a research agent took, for the message's research store.
+    RESEARCH_RECORDED = "research.recorded"
 
 
 TERMINAL_EVENT_TYPES = (
@@ -171,3 +183,102 @@ TERMINAL_EVENT_TYPES = (
     EventType.RUN_CANCELLED,
     EventType.RUN_INTERRUPTED,
 )
+
+# Part events that patch one task of a swarm part.
+TASK_EVENT_TYPES = (EventType.TASK_STARTED, EventType.TASK_PROGRESS, EventType.TASK_FINISHED)
+
+
+# ── Research agents (design/swarm_contract.md) ──────────────────────────
+
+
+class SwarmCategory(models.TextChoices):
+    """The fixed categories of a swarm, in display order."""
+
+    GOOGLE = "google", "Google (SEO)"
+    ENGINES = "engines", "AI engines (GEO)"
+    COMPETITORS = "competitors", "Competitor pages"
+    SITE = "site", "Your site and content gaps"
+    SOURCES = "sources", "Sources and citations"
+
+
+class WorkerType:
+    """What one task does (contract section 1c)."""
+
+    SERP_PAGE = "serp_page"
+    ENGINE_ANSWER = "engine_answer"
+    PAGE_INSPECT = "page_inspect"
+    CONTENT_GAP = "content_gap"
+    CITATIONS = "citations"
+
+
+class TaskStatus(models.TextChoices):
+    QUEUED = "queued", "Queued"
+    RUNNING = "running", "Running"
+    DONE = "done", "Done"
+    FAILED = "failed", "Failed"
+    SKIPPED = "skipped", "Skipped"
+    STOPPED = "stopped", "Stopped"
+
+
+class SwarmStatus(models.TextChoices):
+    """The status of a ``swarm`` part."""
+
+    PLANNING = "planning", "Planning"
+    RUNNING = "running", "Running"
+    DONE = "done", "Done"
+    PARTIAL = "partial", "Partial"
+    ERROR = "error", "Error"
+    CANCELLED = "cancelled", "Cancelled"
+    INTERRUPTED = "interrupted", "Interrupted"
+
+
+class VersionStatus(models.TextChoices):
+    """AgentSwarmVersion.status: one execution of a swarm."""
+
+    QUEUED = "queued", "Queued"
+    RUNNING = "running", "Running"
+    DONE = "done", "Done"
+    PARTIAL = "partial", "Partial"
+    ERROR = "error", "Error"
+    CANCELLED = "cancelled", "Cancelled"
+    INTERRUPTED = "interrupted", "Interrupted"
+
+
+class SwarmScope(models.TextChoices):
+    """What one execution runs: every task, one category or one task."""
+
+    ALL = "all", "All agents"
+    CATEGORY = "category", "One category"
+    TASK = "task", "One agent"
+
+
+class FindingStatus(models.TextChoices):
+    OPEN = "open", "Open"
+    DONE = "done", "Done"
+    DISMISSED = "dismissed", "Dismissed"
+
+
+class FindingSeverity(models.TextChoices):
+    HIGH = "high", "High"
+    MEDIUM = "medium", "Medium"
+    LOW = "low", "Low"
+
+
+# A task in one of these never changes again within its part.
+TERMINAL_TASK_STATUSES = (
+    TaskStatus.DONE.value,
+    TaskStatus.FAILED.value,
+    TaskStatus.SKIPPED.value,
+    TaskStatus.STOPPED.value,
+)
+LIVE_SWARM_STATUSES = (SwarmStatus.PLANNING.value, SwarmStatus.RUNNING.value)
+# Version statuses of an execution that has not ended.
+ACTIVE_VERSION_STATUSES = (VersionStatus.QUEUED.value, VersionStatus.RUNNING.value)
+FINDING_CATEGORIES = (*SwarmCategory.values, "other")
+FINDING_CATEGORY_LABELS = {**dict(SwarmCategory.choices), "other": "Other"}
+MAX_SWARM_VERSIONS = 50
+SWARM_TITLE_MAX_LENGTH = 120
+# The ``engines`` entry of a cited source that Google's AI Overview cited
+# (the citations agent counts its references next to the engines' citations).
+AI_OVERVIEW_SOURCE = "ai_overview"
+AI_OVERVIEW_SOURCE_LABEL = "Google AI Overview"

@@ -12,6 +12,9 @@ Access rules:
     * Chats and messages are private: they also filter on the user.
       Artifacts, reports and brand context are shared by the website's
       members.
+    * The research agents' swarms are private to the chat's user (another
+      member gets 404); findings are shared by the website's members
+      (design/swarm_contract.md section 6).
 """
 from __future__ import annotations
 
@@ -32,9 +35,15 @@ from apps.agent.api.v1.serializers import (
     ChatSummarySerializer,
     ChatUpdateSerializer,
     FeedbackSerializer,
+    FindingCreateSerializer,
+    FindingListParamsSerializer,
+    FindingSerializer,
+    FindingUpdateSerializer,
     ReportCreateSerializer,
     artifact_detail,
     chat_detail,
+    swarm_detail,
+    swarm_version,
 )
 from apps.agent.conf import agent_conf, api_key_configured
 from apps.agent.constants import ArtifactKind
@@ -46,8 +55,10 @@ from apps.agent.services import (
     browse,
     catalog,
     chats,
+    findings,
     reports,
     suggestions,
+    swarms,
 )
 from core.exceptions import CanseeException, PermissionDenied, RateLimited
 from core.interceptors.response_envelope import EnvelopeRenderer
@@ -261,6 +272,78 @@ class ReportCreateView(AgentAPIView):
             artifact_detail(artifact, artifacts.latest_version(artifact), request.user),
             status=201,
         )
+
+
+# ── Research agents and findings ──────────────────────────────────────────
+
+
+class SwarmDetailView(AgentAPIView):
+    """One of the user's research swarms: plan, tasks and versions."""
+
+    def get(self, request, website_id, swarm_id):
+        swarm = swarms.get_swarm(request.user, self.website(), swarm_id)
+        return Response(swarm_detail(swarm, swarms.list_versions(swarm)))
+
+
+class SwarmVersionView(AgentAPIView):
+    """One version of a swarm, with its results table."""
+
+    def get(self, request, website_id, swarm_id, number):
+        swarm = swarms.get_swarm(request.user, self.website(), swarm_id)
+        return Response(swarm_version(swarm, swarms.get_version(swarm, number)))
+
+
+def _findings_data(items, user) -> list[dict]:
+    return list(FindingSerializer(items, many=True, context={"user": user}).data)
+
+
+class FindingListCreateView(AgentAPIView):
+    renderer_classes = [PlainEnvelopeRenderer]
+
+    def get(self, request, website_id):
+        website = self.website()
+        params = _validated(FindingListParamsSerializer, request.query_params)
+        rows, next_cursor, counts = findings.list_findings(website, **params)
+        return Response({
+            "results": _findings_data(rows, request.user),
+            "next_cursor": next_cursor,
+            "counts": counts,
+            "can_edit": _can_write(request.user, website),
+        })
+
+    def post(self, request, website_id):
+        website = self.website(write=True)
+        data = _validated(FindingCreateSerializer, request.data)
+        if "from_swarm" in data:
+            source = data["from_swarm"]
+            created, duplicates = findings.create_from_swarm(
+                request.user, website, swarm_id=source["swarm_id"], version=source["version"],
+                sheet=source["sheet"], row_keys=source["row_keys"],
+            )
+        else:
+            created = [findings.create_manual(
+                request.user, website, title=data["title"], category=data["category"],
+                severity=data["severity"], detail=data["detail"],
+                prompt_text=data["prompt_text"],
+            )]
+            duplicates = []
+        return Response({
+            "created": _findings_data(created, request.user),
+            "duplicates": _findings_data(duplicates, request.user),
+        }, status=201)
+
+
+class FindingDetailView(AgentAPIView):
+    def patch(self, request, website_id, finding_id):
+        finding = findings.get_finding(self.website(write=True), finding_id)
+        data = _validated(FindingUpdateSerializer, request.data)
+        finding = findings.update_finding(finding, request.user, **data)
+        return Response(FindingSerializer(finding, context={"user": request.user}).data)
+
+    def delete(self, request, website_id, finding_id):
+        finding = findings.get_finding(self.website(write=True), finding_id)
+        findings.delete_finding(finding)
+        return Response(status=204)
 
 
 # ── Project data ──────────────────────────────────────────────────────────

@@ -38,6 +38,15 @@ PRICING = {
         "input": 5.00, "output": 25.00,
         "cache_write_5m": 6.25, "cache_write_1h": 10.00, "cache_read": 0.50,
     },
+    # The agent's research-agent analyses (AGENT_WORKER_MODEL). These are
+    # the rates for prompts of at most 100K tokens; above that the model
+    # bills $0.50 / $2.50, which this table does not model, so every caller
+    # keeps its input far below (a worker request carries at most 24,000
+    # characters of content).
+    "claude-haiku-5-5": {
+        "input": 0.10, "output": 0.50,
+        "cache_write_5m": 0.125, "cache_write_1h": 0.20, "cache_read": 0.01,
+    },
     # Engine-check variants a tracked prompt can select
     # (apps.llm_ranking.providers.MODEL_VARIANTS).
     "claude-fable-5": {
@@ -90,6 +99,7 @@ MODEL_PROVIDER = {
     "claude-opus-5-5": "anthropic",
     "claude-opus-5": "anthropic",
     "claude-opus-4-8": "anthropic",
+    "claude-haiku-5-5": "anthropic",
     "claude-fable-5": "anthropic",
     "claude-sonnet-5": "anthropic",
     "claude-sonnet-4-20250514": "anthropic",

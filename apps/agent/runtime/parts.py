@@ -9,15 +9,16 @@ from __future__ import annotations
 
 import copy
 
-from apps.agent.constants import EventType
+from apps.agent.constants import TASK_EVENT_TYPES, EventType, PartType
 
-# Events that change parts. Everything else (lifecycle, artifact and
-# browser events) leaves them alone.
+# Events that change parts. Everything else (lifecycle, artifact, browser
+# and research.recorded events) leaves them alone.
 PART_EVENT_TYPES = frozenset({
     EventType.PART_ADDED,
     EventType.PART_DELTA,
     EventType.PART_UPDATED,
     EventType.TURN_RESET,
+    *TASK_EVENT_TYPES,
 })
 
 
@@ -66,6 +67,25 @@ class PartsState:
         elif kind == EventType.TURN_RESET:
             request = event.get("request")
             self.parts = [p for p in self.parts if p.get("request") != request]
+        elif kind in TASK_EVENT_TYPES:
+            self._apply_task(event)
+
+    def _apply_task(self, event: dict) -> None:
+        """task.started / task.progress / task.finished (swarm contract 4c):
+        the patch is merged into the task with ``task_id`` of the swarm part
+        ``part_id`` when its ``rev`` is newer than the task's; a missing
+        part or task, or an old rev, leaves the parts unchanged."""
+        part = self.get(event.get("part_id"))
+        if part is None or part.get("type") != PartType.SWARM:
+            return
+        task_id = event.get("task_id")
+        task = next((t for t in part.get("tasks") or [] if t.get("id") == task_id), None)
+        rev = event.get("rev")
+        if task is None or not isinstance(rev, int) or rev <= int(task.get("rev") or 0):
+            return
+        patch = {k: v for k, v in (event.get("patch") or {}).items() if k not in ("id", "rev")}
+        task.update(copy.deepcopy(patch))
+        task["rev"] = rev
 
     def snapshot(self) -> list[dict]:
         return copy.deepcopy(self.parts)

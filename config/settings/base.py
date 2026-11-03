@@ -531,6 +531,25 @@ AGENT_HEARTBEAT_SECONDS = env.int("AGENT_HEARTBEAT_SECONDS", default=10)
 AGENT_STALE_SECONDS = env.int("AGENT_STALE_SECONDS", default=90)
 # Days a chat is kept after its last message; 0 keeps chats.
 AGENT_CHAT_RETENTION_DAYS = env.int("AGENT_CHAT_RETENTION_DAYS", default=0)
+# The research agents (research_swarm): one tool call runs up to
+# AGENT_SWARM_MAX_TASKS tasks, AGENT_SWARM_WORKERS at a time in one swarm
+# and AGENT_SWARM_PROCESS_WORKERS across the agent process, with limits per
+# provider on Google results, page fetches, engine requests (per engine)
+# and analysis requests. A swarm stops after AGENT_SWARM_MAX_SECONDS.
+AGENT_SWARM_ENABLED = env.bool("AGENT_SWARM_ENABLED", default=True)
+AGENT_SWARM_MAX_TASKS = env.int("AGENT_SWARM_MAX_TASKS", default=30)
+AGENT_SWARM_WORKERS = env.int("AGENT_SWARM_WORKERS", default=6)
+AGENT_SWARM_PROCESS_WORKERS = env.int("AGENT_SWARM_PROCESS_WORKERS", default=12)
+AGENT_SWARM_SERP_CONCURRENCY = env.int("AGENT_SWARM_SERP_CONCURRENCY", default=5)
+AGENT_SWARM_BROWSE_CONCURRENCY = env.int("AGENT_SWARM_BROWSE_CONCURRENCY", default=6)
+AGENT_SWARM_ENGINE_CONCURRENCY = env.int("AGENT_SWARM_ENGINE_CONCURRENCY", default=3)
+AGENT_SWARM_HAIKU_CONCURRENCY = env.int("AGENT_SWARM_HAIKU_CONCURRENCY", default=8)
+AGENT_SWARM_MAX_SECONDS = env.int("AGENT_SWARM_MAX_SECONDS", default=420)
+# The research agents' analysis model: structured output with thinking
+# off, which the model accepts at effort low, medium or high.
+AGENT_WORKER_MODEL = env("AGENT_WORKER_MODEL", default="claude-haiku-5-5")
+AGENT_WORKER_EFFORT = env("AGENT_WORKER_EFFORT", default="low")
+AGENT_WORKER_MAX_TOKENS = env.int("AGENT_WORKER_MAX_TOKENS", default=2048)
 
 # ── RAG vector index (optional) ──
 # "python" (default): retriever.py scores every (user, website) chunk in

@@ -1,11 +1,12 @@
 """Read-only operator views of runs and artifacts.
 
-Chat content (titles, previews, messages, wire, parts) and artifact bodies
-are never shown: the admin lists ids, owners, states, timings and cost.
+Chat content (titles, previews, messages, wire, parts), artifact bodies
+and research plans, tables and findings are never shown: the admin lists
+ids, owners, states, timings and cost.
 """
 from django.contrib import admin
 
-from apps.agent.models import AgentArtifact, AgentRun
+from apps.agent.models import AgentArtifact, AgentRun, AgentSwarm, AgentSwarmVersion
 
 
 class _ReadOnlyAdmin(admin.ModelAdmin):
@@ -54,5 +55,36 @@ class AgentArtifactAdmin(_ReadOnlyAdmin):
     fields = (
         "id", "website", "kind", "agent_key", "latest_version", "created_by",
         "source_chat_id", "deleted_at", "created_at", "updated_at",
+    )
+    readonly_fields = fields
+
+
+@admin.register(AgentSwarm)
+class AgentSwarmAdmin(_ReadOnlyAdmin):
+    list_display = ("id", "user", "website", "latest_version", "created_at")
+    list_select_related = ("user", "website")
+    search_fields = ("id", "user__email")
+    date_hierarchy = "created_at"
+    ordering = ("-created_at",)
+    fields = (
+        "id", "user", "website", "chat_id", "message_id", "run_id", "latest_version",
+        "created_at", "updated_at",
+    )
+    readonly_fields = fields
+
+
+@admin.register(AgentSwarmVersion)
+class AgentSwarmVersionAdmin(_ReadOnlyAdmin):
+    list_display = (
+        "id", "swarm", "version", "scope", "status", "cost_usd", "duration_ms",
+    )
+    list_filter = ("status", "scope")
+    list_select_related = ("swarm",)
+    search_fields = ("id", "swarm__id")
+    ordering = ("-created_at",)
+    fields = (
+        "id", "swarm", "version", "scope", "status", "run_id", "message_id",
+        "worker_requests", "cost_usd", "error_code", "created_at", "started_at",
+        "finished_at", "duration_ms",
     )
     readonly_fields = fields

@@ -2,9 +2,9 @@
 
 ``agents()`` is the fixed catalog behind GET agents/. ``status_for(user)``
 reports the live configuration (switch, process, model, which AI engines
-and Google search have keys, the user's allowance and which writing agents
-it can start); every value comes from settings or the usage ledger, never
-from a default that pretends.
+and Google search have keys, the user's allowance, which writing agents
+it can start and whether the research agents are on); every value comes
+from settings or the usage ledger, never from a default that pretends.
 """
 from __future__ import annotations
 
@@ -144,4 +144,10 @@ def status_for(user) -> dict:
             "warning": allowance["warning"],
         },
         "writers": writers(user),
+        # The research agents (research_swarm and re-runs).
+        "swarm": {
+            "enabled": conf.swarm_enabled,
+            "max_agents": conf.swarm_max_tasks,
+            "worker_model": conf.worker_model,
+        },
     }

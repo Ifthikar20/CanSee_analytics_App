@@ -3,7 +3,8 @@
 A run is stale when its heartbeat (or, before its first one, its
 creation) is older than AGENT_STALE_SECONDS. It moves to ``interrupted``
 with a compare-and-set, its message is marked interrupted, open parts
-are closed, and its stored wire is left valid for the next turn
+are closed (a research's swarm part and its unfinished agents included,
+and its version row), and its stored wire is left valid for the next turn
 (wire.close_turn: an unanswered tool call gets a "Stopped before this
 ran." result, a paused server tool call without its result goes). The
 celery beat task runs it every minute; reading a chat runs it for that
@@ -20,14 +21,48 @@ from django.db.models.functions import Coalesce
 from django.utils import timezone
 
 from apps.agent.conf import agent_conf
-from apps.agent.constants import ACTIVE_RUN_STATUSES, EventType, MessageStatus, RunStatus
+from apps.agent.constants import (
+    ACTIVE_RUN_STATUSES,
+    ACTIVE_VERSION_STATUSES,
+    LIVE_SWARM_STATUSES,
+    EventType,
+    MessageStatus,
+    PartType,
+    RunStatus,
+    VersionStatus,
+)
 from apps.agent.runtime import wire
 from apps.agent.runtime.events import get_event_store, now_iso
 from apps.agent.runtime.parts import strip_nul
 
 logger = logging.getLogger("apps")
 
-_DONE = {"done", "error", "cancelled", "unavailable"}
+_DONE = {"done", "error", "cancelled", "unavailable", "partial", "interrupted"}
+_OPEN_TASK = ("queued", "running")
+INTERRUPTED_VERSION_MESSAGE = "The agent process stopped before this research finished."
+
+
+def _interrupt_swarm(part: dict) -> dict:
+    """A swarm part the process left open: interrupted, and each agent that
+    had not finished stopped (rev + 1, as a task event would)."""
+    from apps.agent.runtime.swarm.reporter import duration_ms_since
+
+    now = now_iso()
+    tasks = []
+    for task in part.get("tasks") or []:
+        task = dict(task)
+        if task.get("status") in _OPEN_TASK:
+            task.update(
+                status="stopped", step="", ended_at=now,
+                duration_ms=duration_ms_since(task.get("started_at")),
+                error={"code": "interrupted", "message": "Interrupted"},
+                rev=int(task.get("rev") or 0) + 1,
+            )
+        tasks.append(task)
+    part.update(status="interrupted", ended_at=now, tasks=tasks)
+    if part.get("started_at"):
+        part["duration_ms"] = duration_ms_since(part["started_at"])
+    return part
 
 
 def _close_parts(parts: list[dict]) -> list[dict]:
@@ -35,6 +70,9 @@ def _close_parts(parts: list[dict]) -> list[dict]:
     for part in parts or []:
         part = dict(part)
         status = part.get("status")
+        if part.get("type") == PartType.SWARM and status in LIVE_SWARM_STATUSES:
+            out.append(_interrupt_swarm(part))
+            continue
         if part.get("type") == "thinking" and not part.get("ended_at"):
             part["ended_at"] = now_iso()
         elif status is not None and status not in _DONE:
@@ -51,7 +89,7 @@ def _close_parts(parts: list[dict]) -> list[dict]:
 
 def interrupt_runs(run_ids, *, reason: str) -> int:
     """Move these runs (when still active) to interrupted. Returns how many."""
-    from apps.agent.models import AgentMessage, AgentRun
+    from apps.agent.models import AgentMessage, AgentRun, AgentSwarmVersion
 
     count = 0
     store = get_event_store()
@@ -77,6 +115,10 @@ def interrupt_runs(run_ids, *, reason: str) -> int:
             error_code="interrupted",
             error_message="The agent process stopped before this reply finished.",
             finished_at=now,
+        )
+        AgentSwarmVersion.objects.filter(run_id=run.id, status__in=ACTIVE_VERSION_STATUSES).update(
+            status=VersionStatus.INTERRUPTED, finished_at=now, error_code="interrupted",
+            error_message=INTERRUPTED_VERSION_MESSAGE,
         )
         if store.has(run.id):
             store.append(str(run.id), {

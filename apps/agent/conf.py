@@ -12,6 +12,9 @@ from django.core import checks
 
 RUN_MODES = ("thread", "inline")
 EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+# The worker requests turn thinking off, which the API accepts only at
+# these levels (xhigh and max return a 400).
+WORKER_EFFORT_LEVELS = ("low", "medium", "high")
 CACHE_TTLS = ("5m", "1h")
 
 _POSITIVE_INT_SETTINGS = (
@@ -30,6 +33,15 @@ _POSITIVE_INT_SETTINGS = (
     "AGENT_STREAM_MAX_SECONDS",
     "AGENT_HEARTBEAT_SECONDS",
     "AGENT_STALE_SECONDS",
+    "AGENT_SWARM_MAX_TASKS",
+    "AGENT_SWARM_WORKERS",
+    "AGENT_SWARM_PROCESS_WORKERS",
+    "AGENT_SWARM_SERP_CONCURRENCY",
+    "AGENT_SWARM_BROWSE_CONCURRENCY",
+    "AGENT_SWARM_ENGINE_CONCURRENCY",
+    "AGENT_SWARM_HAIKU_CONCURRENCY",
+    "AGENT_SWARM_MAX_SECONDS",
+    "AGENT_WORKER_MAX_TOKENS",
 )
 
 
@@ -62,6 +74,18 @@ class AgentConf:
     heartbeat_seconds: int
     stale_seconds: int
     chat_retention_days: int
+    swarm_enabled: bool
+    swarm_max_tasks: int
+    swarm_workers: int
+    swarm_process_workers: int
+    swarm_serp_concurrency: int
+    swarm_browse_concurrency: int
+    swarm_engine_concurrency: int
+    swarm_haiku_concurrency: int
+    swarm_max_seconds: int
+    worker_model: str
+    worker_effort: str
+    worker_max_tokens: int
 
 
 def agent_conf() -> AgentConf:
@@ -95,6 +119,18 @@ def agent_conf() -> AgentConf:
         heartbeat_seconds=int(s.AGENT_HEARTBEAT_SECONDS),
         stale_seconds=int(s.AGENT_STALE_SECONDS),
         chat_retention_days=int(s.AGENT_CHAT_RETENTION_DAYS),
+        swarm_enabled=bool(s.AGENT_SWARM_ENABLED),
+        swarm_max_tasks=int(s.AGENT_SWARM_MAX_TASKS),
+        swarm_workers=int(s.AGENT_SWARM_WORKERS),
+        swarm_process_workers=int(s.AGENT_SWARM_PROCESS_WORKERS),
+        swarm_serp_concurrency=int(s.AGENT_SWARM_SERP_CONCURRENCY),
+        swarm_browse_concurrency=int(s.AGENT_SWARM_BROWSE_CONCURRENCY),
+        swarm_engine_concurrency=int(s.AGENT_SWARM_ENGINE_CONCURRENCY),
+        swarm_haiku_concurrency=int(s.AGENT_SWARM_HAIKU_CONCURRENCY),
+        swarm_max_seconds=int(s.AGENT_SWARM_MAX_SECONDS),
+        worker_model=s.AGENT_WORKER_MODEL,
+        worker_effort=s.AGENT_WORKER_EFFORT,
+        worker_max_tokens=int(s.AGENT_WORKER_MAX_TOKENS),
     )
 
 
@@ -115,6 +151,8 @@ def check_agent_settings(app_configs=None, **kwargs):
     for setting in ("AGENT_EFFORT", "AGENT_SUBAGENT_EFFORT", "AGENT_TITLE_EFFORT"):
         if getattr(settings, setting) not in EFFORT_LEVELS:
             _error(setting, f"must be one of {', '.join(EFFORT_LEVELS)}.", 2)
+    if settings.AGENT_WORKER_EFFORT not in WORKER_EFFORT_LEVELS:
+        _error("AGENT_WORKER_EFFORT", f"must be one of {', '.join(WORKER_EFFORT_LEVELS)}.", 2)
     if settings.AGENT_CACHE_TTL not in CACHE_TTLS:
         _error("AGENT_CACHE_TTL", f"must be one of {', '.join(CACHE_TTLS)}.", 3)
     for setting in _POSITIVE_INT_SETTINGS:
@@ -127,4 +165,6 @@ def check_agent_settings(app_configs=None, **kwargs):
         _error("AGENT_RUN_MAX_COST_USD", "must be greater than zero.", 6)
     if settings.AGENT_CHAT_RETENTION_DAYS < 0:
         _error("AGENT_CHAT_RETENTION_DAYS", "must be zero (keep) or a number of days.", 7)
+    if not settings.AGENT_WORKER_MODEL:
+        _error("AGENT_WORKER_MODEL", "must name a model.", 8)
     return errors

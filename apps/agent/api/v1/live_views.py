@@ -1,12 +1,12 @@
 """Endpoints served by the agent process (/api/v1/agent/live/).
 
-Starting runs (send, regenerate, edit, continue), stopping one, and the
-long-poll event feed. Every view refuses to work unless AGENT_ENABLED is
-on (503 agent_disabled) and this is the agent process (503
-agent_unavailable), so a gunicorn worker never starts runner threads or
-holds a poll open. Starting a run needs member access to the website
-(viewers get 403, as for every other agent write); runs are only ever
-visible to the user who started them.
+Starting runs (send, regenerate, edit, continue, a research re-run),
+stopping one, and the long-poll event feed. Every view refuses to work
+unless AGENT_ENABLED is on (503 agent_disabled) and this is the agent
+process (503 agent_unavailable), so a gunicorn worker never starts runner
+threads or holds a poll open. Starting a run needs member access to the
+website (viewers get 403, as for every other agent write); runs are only
+ever visible to the user who started them.
 """
 from __future__ import annotations
 
@@ -17,16 +17,18 @@ from rest_framework import status
 from rest_framework.renderers import JSONRenderer
 from rest_framework.response import Response
 
-from apps.agent.api.v1.serializers import MessageSerializer, RunSerializer
+from apps.agent.api.v1.serializers import MessageSerializer, RunSerializer, SwarmRerunSerializer
 from apps.agent.api.v1.stream import open_reads, run_ended
-from apps.agent.api.v1.views import AgentAPIView
+from apps.agent.api.v1.views import AgentAPIView, _validated
+from apps.agent.conf import agent_conf
 from apps.agent.constants import TERMINAL_RUN_STATUSES
-from apps.agent.exceptions import TooManyStreams
+from apps.agent.exceptions import SwarmDisabled, TooManyStreams
 from apps.agent.runtime.cancel import request_cancel
 from apps.agent.runtime.events import get_event_store, resync_event
 from apps.agent.runtime.registry import start_process_services
 from apps.agent.runtime.sweeper import interrupt_if_orphaned
 from apps.agent.services import runs as run_service
+from apps.agent.services import swarms as swarm_service
 from core.exceptions import CanseeException, ResourceNotFound
 
 LONG_POLL_MAX_SECONDS = 25
@@ -120,6 +122,26 @@ class ContinueMessageView(_LiveView):
             user=request.user, website=website, message_id=message_id,
         )
         return Response(_started_payload(started), status=status.HTTP_202_ACCEPTED)
+
+
+class SwarmRerunView(_LiveView):
+    """POST {scope, category?, task_id?}: run a research again, all of it,
+    one category or one agent, as a new version in a new turn (202)."""
+
+    def post(self, request, website_id, swarm_id):
+        website = self.website(write=True)
+        if not agent_conf().swarm_enabled:
+            raise SwarmDisabled()
+        data = _validated(SwarmRerunSerializer, request.data)
+        started = swarm_service.start_rerun(
+            request.user, website, swarm_id, scope=data["scope"],
+            category=data.get("category"), task_id=data.get("task_id"),
+            idempotency_key=request.headers.get("Idempotency-Key"),
+        )
+        return Response(
+            {**_started_payload(started), "swarm_version": started.extra["swarm_version"]},
+            status=status.HTTP_202_ACCEPTED,
+        )
 
 
 def _own_run(user, run_id):

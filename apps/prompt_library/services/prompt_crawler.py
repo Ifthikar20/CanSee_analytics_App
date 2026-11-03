@@ -21,7 +21,10 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import dataclass
+import threading
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from datetime import datetime
 
 from django.db.models import Q
 from django.utils import timezone
@@ -565,3 +568,238 @@ def crawl_prompt(
 
     return CrawlOutcome(fanouts=fanouts, responses=responses_logged, errors=errors,
                         stopped=stopped)
+
+
+# ── One engine at a time (the agent's research swarm) ──────────────────
+
+
+@dataclass
+class EngineAnswer:
+    """One engine's answer to one prompt, as EngineScan.ask stored it."""
+
+    succeeded: bool
+    # Raw provider text: for logs and public_engine_error only.
+    error: str = ""
+    response_text: str = ""
+    # _extract_brands output (is_mentioned, mention_rank, sentiment,
+    # competitors_mentioned, mention_context, ...).
+    analysis: dict = field(default_factory=dict)
+    # The merged citation URLs stored on the result row.
+    citations: list = field(default_factory=list)
+    model_id: str = ""
+    # LLMRankingResult.public_id of the stored row.
+    result_id: str | None = None
+    created_at: datetime | None = None
+    # Not asked: Stop came first, or the scan had finished.
+    stopped: bool = False
+    # Not asked: the engine has no API key.
+    not_configured: bool = False
+
+
+class EngineScan:
+    """One prompt's AI engine checks, asked one engine at a time (the agent's
+    research swarm). Records what crawl_prompt records for the same engines:
+    one PromptCrawlRun, one LLMRankingAudit and one LLMRankingResult per engine
+    asked, citation and alignment tasks per answer, and the brand security
+    audit at the end. It does not generate fan-out sub-queries.
+
+    ``ask`` is safe to call from several threads at once (one per engine);
+    the crawl run and the audit are created by the first call that asks an
+    engine. ``finish`` scores the audit and closes the crawl run, once. An
+    answer that arrives after ``finish`` (a thread still waiting on its
+    engine after Stop) is stored, but the audit is not scored again.
+    """
+
+    def __init__(self, website: Website, prompt: Prompt, *, acting_user):
+        self.website = website
+        self.prompt = prompt
+        self.acting_user = acting_user
+        self.brand_name = getattr(website, "business_name", None) or website.name or "your brand"
+        self.keywords = _website_keywords(website)
+        self._lock = threading.Lock()
+        self._crawl_run: PromptCrawlRun | None = None
+        self._audit: LLMRankingAudit | None = None
+        self._queried: list[str] = []
+        self._errors: list[str] = []
+        self._responses = 0
+        self._finished = False
+        self._outcome: CrawlOutcome | None = None
+
+    def _rows(self) -> LLMRankingAudit | None:
+        """The audit to store answers on (with its crawl run), created on
+        first use; None once the scan finished."""
+        with self._lock:
+            if self._finished:
+                return None
+            if self._audit is None:
+                now = timezone.now()
+                self._crawl_run = PromptCrawlRun.objects.create(
+                    website=self.website,
+                    prompt=self.prompt,
+                    status=PromptCrawlRun.STATUS_RUNNING,
+                    started_at=now,
+                )
+                self._audit = LLMRankingAudit.objects.create(
+                    website=self.website,
+                    # As in crawl_prompt: audits run on behalf of the owner.
+                    created_by=self.website.user,
+                    business_name=self.brand_name,
+                    status=LLMRankingAudit.STATUS_RUNNING,
+                    prompt_source=getattr(LLMRankingAudit, "PROMPT_SOURCE_LIBRARY", "library"),
+                    prompts=[self.prompt.text],
+                    providers_queried=[],
+                    started_at=now,
+                )
+            return self._audit
+
+    def _note_error(self, line: str) -> None:
+        with self._lock:
+            if not self._finished:
+                self._errors.append(line)
+
+    def ask(self, provider_key: str, variant: str | None, *,
+            should_stop: Callable[[], bool] | None = None,
+            on_step: Callable[[str], None] | None = None) -> EngineAnswer:
+        """Ask one engine (the provider's default model, or ``variant``,
+        "provider:model_id") and store its answer as crawl_prompt does.
+        ``on_step("extracting")`` is called once the answer arrived."""
+        try:
+            instance = (get_provider_for_variant(variant) if variant
+                        else PROVIDERS[provider_key]())
+        except Exception as exc:
+            self._note_error(f"{provider_key}: {exc!s}"[:200])
+            return EngineAnswer(succeeded=False, error=str(exc)[:300])
+        if instance is None or not instance.is_configured():
+            self._note_error(f"{variant or provider_key}: provider not configured")
+            return EngineAnswer(succeeded=False, not_configured=True,
+                                error=f"{provider_key}: provider not configured")
+        if should_stop is not None and should_stop():
+            return EngineAnswer(succeeded=False, stopped=True)
+        audit = self._rows()
+        if audit is None:
+            return EngineAnswer(succeeded=False, stopped=True)
+
+        model_used = getattr(instance, "model", "")
+        if not isinstance(model_used, str):
+            model_used = ""
+        result = _query_with_retry(
+            instance, self.prompt.text,
+            user=self.acting_user, website=self.website, audit_id=str(audit.id), actor="user",
+        )
+        if result is None:
+            self._note_error(f"{provider_key}: query raised on both attempts")
+            return EngineAnswer(succeeded=False, error="query raised on both attempts",
+                                model_id=model_used[:64])
+        if on_step is not None:
+            on_step("extracting")
+
+        succeeded = getattr(result, "succeeded", True)
+        response_text = getattr(result, "text", None) or ""
+        err = getattr(result, "error", "") or ""
+        analysis = _extract_brands(
+            response_text=response_text if succeeded else "",
+            website=self.website,
+            brand_name=self.brand_name,
+            keywords=self.keywords,
+            audit_id=str(audit.id),
+            user=self.acting_user,
+        )
+        citations = _merge_citation_lists(getattr(result, "citations", None),
+                                          analysis.get("citations"))
+        row = LLMRankingResult.objects.create(
+            audit=audit,
+            provider=provider_key,
+            model_id=model_used[:64],
+            prompt_index=0,
+            prompt=self.prompt.text,
+            source_prompt=self.prompt,
+            response_text=response_text,
+            query_succeeded=succeeded,
+            error_message=err[:500],
+            is_mentioned=analysis["is_mentioned"],
+            mention_rank=analysis["mention_rank"],
+            sentiment=analysis["sentiment"],
+            confidence_score=analysis["confidence_score"],
+            mention_context=analysis["mention_context"],
+            is_linked=analysis.get("is_linked", False),
+            competitors_mentioned=analysis.get("competitors_mentioned", []),
+            primary_recommendation=analysis.get("primary_recommendation", ""),
+            citations=citations,
+            extraction_model=analysis.get("extraction_model", ""),
+            extraction_version=analysis.get("extraction_version", ""),
+        )
+        with self._lock:
+            if not self._finished:
+                self._queried.append(provider_key)
+                if succeeded:
+                    self._responses += 1
+                else:
+                    self._errors.append(f"{provider_key}: {err[:120]}")
+        if succeeded:
+            _dispatch_citations(row.id)
+            _dispatch_alignment(row.id)
+        return EngineAnswer(
+            succeeded=succeeded,
+            error=err,
+            response_text=response_text,
+            analysis=analysis,
+            citations=citations,
+            model_id=model_used[:64],
+            result_id=str(row.public_id),
+            created_at=row.created_at,
+        )
+
+    def finish(self, *, stopped: bool = False) -> CrawlOutcome:
+        """Score the audit, queue the brand security audit and close the
+        crawl run, as crawl_prompt ends. Calling it again changes nothing."""
+        with self._lock:
+            if self._finished and self._outcome is not None:
+                return self._outcome
+            self._finished = True
+            crawl_run, audit = self._crawl_run, self._audit
+            queried, errors, responses = list(self._queried), list(self._errors), self._responses
+
+        if audit is not None:
+            scores = LLMRankingService.compute_overall_score(list(audit.results.all()))
+            for name, value in scores.items():
+                setattr(audit, name, value)
+            audit.providers_queried = queried
+            audit.status = (
+                LLMRankingAudit.STATUS_COMPLETED if responses
+                else LLMRankingAudit.STATUS_FAILED
+            )
+            audit.completed_at = timezone.now()
+            audit.save(update_fields=[
+                *SCORE_FIELDS, "providers_queried", "status", "completed_at",
+            ])
+            if audit.status == LLMRankingAudit.STATUS_COMPLETED:
+                try:
+                    from apps.brand_vault.tasks import audit_recent_results
+                    audit_recent_results.delay(str(self.website.id), str(audit.id))
+                except Exception as exc:
+                    logger.warning(
+                        "could not queue brand security audit for crawl %s: %s",
+                        crawl_run.id if crawl_run else None, exc,
+                    )
+
+        if crawl_run is not None:
+            crawl_run.providers = queried
+            crawl_run.fanout_count = 0
+            crawl_run.source_count = responses
+            crawl_run.status = (
+                PromptCrawlRun.STATUS_COMPLETE if responses else PromptCrawlRun.STATUS_FAILED
+            )
+            run_errors = [*errors, "stopped before every model was asked"] if stopped else errors
+            if crawl_run.status == PromptCrawlRun.STATUS_FAILED and not run_errors:
+                run_errors = ["no engine answered"]
+            crawl_run.error = "; ".join(run_errors)[:1000]
+            crawl_run.completed_at = timezone.now()
+            crawl_run.save(update_fields=[
+                "providers", "fanout_count", "source_count",
+                "status", "error", "completed_at",
+            ])
+
+        outcome = CrawlOutcome(fanouts=[], responses=responses, errors=errors, stopped=stopped)
+        with self._lock:
+            self._outcome = outcome
+        return outcome

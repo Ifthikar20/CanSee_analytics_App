@@ -1,6 +1,7 @@
 """Stopping a run. Idempotent: stopping a finished run changes nothing.
 
-A queued run is cancelled on the spot. A running one gets
+A queued run is cancelled on the spot (with the research version a
+queued re-run would have run). A running one gets
 ``cancel_requested_at``; the process executing it closes its stream
 (right away when that is this process, else at its next heartbeat) and
 the runner finishes the run as cancelled, keeping what is safe to keep.
@@ -14,6 +15,7 @@ from apps.agent.constants import (
     EventType,
     MessageStatus,
     RunStatus,
+    VersionStatus,
 )
 from apps.agent.runtime.events import get_event_store, now_iso
 from apps.agent.runtime.registry import get_registry
@@ -21,7 +23,7 @@ from apps.agent.runtime.registry import get_registry
 
 def request_cancel(run) -> str:
     """Ask ``run`` to stop; returns its status after the request."""
-    from apps.agent.models import AgentMessage, AgentRun
+    from apps.agent.models import AgentMessage, AgentRun, AgentSwarmVersion
 
     if run.status not in ACTIVE_RUN_STATUSES:
         return run.status
@@ -35,6 +37,9 @@ def request_cancel(run) -> str:
     if cancelled:
         AgentMessage.objects.filter(id=run.assistant_message_id).update(
             status=MessageStatus.CANCELLED, finished_at=now,
+        )
+        AgentSwarmVersion.objects.filter(run_id=run.id, status=VersionStatus.QUEUED).update(
+            status=VersionStatus.CANCELLED, finished_at=now,
         )
         store = get_event_store()
         if store.has(run.id):

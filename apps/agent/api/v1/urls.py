@@ -13,6 +13,7 @@ from apps.agent.api.v1.live_views import (
     RegenerateMessageView,
     RunEventsView,
     SendMessageView,
+    SwarmRerunView,
 )
 from apps.agent.api.v1.stream import run_stream
 
@@ -53,6 +54,23 @@ urlpatterns = [
         name="agent-artifact-version",
     ),
     path(f"{WEBSITE}reports/", views.ReportCreateView.as_view(), name="agent-reports"),
+    # Research agents (private to their chat's user) and findings (shared)
+    path(
+        f"{WEBSITE}swarms/<uuid:swarm_id>/",
+        views.SwarmDetailView.as_view(),
+        name="agent-swarm-detail",
+    ),
+    path(
+        f"{WEBSITE}swarms/<uuid:swarm_id>/versions/<int:number>/",
+        views.SwarmVersionView.as_view(),
+        name="agent-swarm-version",
+    ),
+    path(f"{WEBSITE}findings/", views.FindingListCreateView.as_view(), name="agent-findings"),
+    path(
+        f"{WEBSITE}findings/<uuid:finding_id>/",
+        views.FindingDetailView.as_view(),
+        name="agent-finding-detail",
+    ),
     # Project data
     path(f"{WEBSITE}context/", views.BrandContextView.as_view(), name="agent-context"),
     path(f"{WEBSITE}suggestions/", views.SuggestionsView.as_view(), name="agent-suggestions"),
@@ -77,6 +95,11 @@ urlpatterns = [
         f"{LIVE}{WEBSITE}messages/<uuid:message_id>/continue/",
         ContinueMessageView.as_view(),
         name="agent-live-continue",
+    ),
+    path(
+        f"{LIVE}{WEBSITE}swarms/<uuid:swarm_id>/rerun/",
+        SwarmRerunView.as_view(),
+        name="agent-live-swarm-rerun",
     ),
     path(f"{LIVE}runs/<uuid:run_id>/cancel/", CancelRunView.as_view(), name="agent-live-cancel"),
     path(f"{LIVE}runs/<uuid:run_id>/stream/", run_stream, name="agent-live-stream"),

@@ -21,6 +21,10 @@ A manual loop over streamed requests (design section 6):
   next turn can follow (wire.close_turn: a paused server tool call that
   never got its result is dropped).
 
+A re-run turn (trigger ``rerun``) makes no model request: it runs one
+version of a research swarm, adds the results table and a short summary
+of what changed, and stores that summary as the turn's wire.
+
 Usage is recorded per request and the gate (llm.gate) is checked before
 every request. Postgres holds the result: wire at each boundary, parts
 at checkpoints, status with a compare-and-set at the end. A run always
@@ -40,11 +44,14 @@ from django.utils import timezone
 from apps.agent.conf import agent_conf
 from apps.agent.constants import (
     ACTIVE_RUN_STATUSES,
+    ACTIVE_VERSION_STATUSES,
+    LIVE_SWARM_STATUSES,
     EventType,
     MessageStatus,
     PartType,
     RunStatus,
     RunTrigger,
+    VersionStatus,
 )
 from apps.agent.llm.client import get_client
 from apps.agent.llm.errors import INTERNAL, classify
@@ -58,7 +65,7 @@ from apps.agent.runtime.registry import get_registry
 from apps.agent.runtime.request_stream import stream_request
 from apps.agent.runtime.translate import StreamTranslator
 from apps.agent.tools import registry as tool_registry
-from apps.agent.tools.context import ToolContext
+from apps.agent.tools.context import ToolContext, ToolResult
 from core.resilience import CircuitBreaker
 
 logger = logging.getLogger("apps")
@@ -70,7 +77,8 @@ MAX_STREAM_RETRIES = 2
 RETRY_DELAYS = (2.0, 6.0)
 BREAKER = CircuitBreaker("llm:claude-agent", failure_threshold=5, recovery_timeout=60)
 
-_TERMINAL_PART_STATUS = {"done", "error", "cancelled", "unavailable"}
+_TERMINAL_PART_STATUS = {"done", "error", "cancelled", "unavailable", "partial",
+                         "interrupted"}
 
 
 @dataclass
@@ -119,8 +127,9 @@ def _reset_connections() -> None:
 
 def fail_unstarted(run_id) -> None:
     """Fail a run whose runner never got going (it could not start, or not
-    be handed to a thread), and end its event stream."""
-    from apps.agent.models import AgentMessage, AgentRun
+    be handed to a thread), and end its event stream. The research version
+    a re-run would have run fails with it, so it never stays queued."""
+    from apps.agent.models import AgentMessage, AgentRun, AgentSwarmVersion
 
     message_id = None
     try:
@@ -136,6 +145,11 @@ def fail_unstarted(run_id) -> None:
                 status=MessageStatus.FAILED, error_code=INTERNAL.code,
                 error_message=INTERNAL.message, finished_at=now,
             )
+        if failed:
+            AgentSwarmVersion.objects.filter(
+                run_id=run_id, status__in=ACTIVE_VERSION_STATUSES,
+            ).update(status=VersionStatus.ERROR, error_code=INTERNAL.code,
+                     error_message=INTERNAL.message, finished_at=now)
     except Exception:
         logger.exception("agent run %s could not be marked failed", run_id)
     store = get_event_store()
@@ -188,7 +202,7 @@ class TurnRunner:
             self._announce_fallback_title()
             self._start_title()
             try:
-                ending = self._loop()
+                ending = self._rerun() if self.run.trigger == RunTrigger.RERUN else self._loop()
             except CancelRequested:
                 ending = Ending(MessageStatus.CANCELLED)
             except GateStop as stop:
@@ -308,6 +322,24 @@ class TurnRunner:
                 continue
             return Ending(MessageStatus.COMPLETE, stop_reason=stop)
 
+    def _rerun(self) -> Ending:
+        """A re-run turn: one version of a research swarm, its table and a
+        summary of the changes; no model request."""
+        from apps.agent.models import AgentSwarmVersion
+        from apps.agent.runtime.swarm.executor import execute_version
+        from apps.agent.services.swarm_tables import finalize_version
+
+        self._gate()
+        version = AgentSwarmVersion.objects.select_related("swarm").get(run=self.run)
+        self.request_index = 1
+        ctx = self._tool_context(1, f"rerun:{version.id}", None)
+        outcome = execute_version(ctx, version.swarm, version)
+        finalized = finalize_version(ctx, version.swarm, version, outcome)
+        self.emitter.add_part(PartType.TEXT, request=1, text=finalized.summary_text, citations=[])
+        self.turn_wire = [wire.assistant_message([wire.text_block(finalized.wire_text)])]
+        self._save_wire()
+        return Ending(MessageStatus.CANCELLED if outcome.cancelled else MessageStatus.COMPLETE)
+
     def _gate(self) -> None:
         before_request(self.run, started_monotonic=self.started, requests=self.totals.requests,
                        cost_usd=self.totals.cost_usd, cancelled=self.active.cancelled)
@@ -407,6 +439,8 @@ class TurnRunner:
             emitter=self.emitter, active=self.active, request=req_n, tool_use_id=tool_use_id,
             part_id=part_id, history_text=history_text, add_usage=self.add_usage,
             check_gate=self._gate, inline=self.conf.run_mode == "inline",
+            # The research agents end before the run's own deadline.
+            extra={"run_started": self.started},
         )
 
     def _run_tools(self, tool_uses: list[dict], req_n: int, translator) -> None:
@@ -423,7 +457,14 @@ class TurnRunner:
             ctx = self._tool_context(req_n, tid, part_id)
             try:
                 result = tool_registry.execute(ctx, name, block.get("input"))
-            except (CancelRequested, GateStop):
+            except (CancelRequested, GateStop) as stop:
+                # A tool stopped part way (the research agents) answers its
+                # own call with what it finished; the others get the
+                # stopped result.
+                partial = getattr(stop, "tool_result", None)
+                if isinstance(partial, ToolResult):
+                    results.append(wire.tool_result(tid, partial.content,
+                                                    is_error=partial.is_error))
                 self._stop_tools(tool_uses[i:], translator, results)
                 raise
             if generic:
@@ -434,7 +475,11 @@ class TurnRunner:
                     self.emitter.update_part(part_id, status="done", summary=result.summary)
             elif part_id is not None:
                 current = self.emitter.part(part_id) or {}
-                if current.get("status") not in _TERMINAL_PART_STATUS:
+                if current.get("type") == PartType.SWARM:
+                    # A research whose handler failed before it closed its part.
+                    if current.get("status") in LIVE_SWARM_STATUSES:
+                        self._close_swarm(current, stopped=False, error=result.summary)
+                elif current.get("status") not in _TERMINAL_PART_STATUS:
                     self.emitter.update_part(
                         part_id, status="error" if result.is_error else "done",
                         error=result.summary if result.is_error else None,
@@ -504,6 +549,22 @@ class TurnRunner:
 
     # ── End ──────────────────────────────────────────────────────────
 
+    def _close_swarm(self, part: dict, *, stopped: bool, error: str | None = None) -> None:
+        """A swarm part still open: its unfinished agents get task.finished
+        (stopped, or not finished because the run failed), then the part is
+        cancelled (or failed). The codes are the contract's task error codes
+        (swarm contract 5c)."""
+        from apps.agent.runtime.swarm.reporter import close_open_tasks
+
+        close_open_tasks(self.emitter, part, status="stopped", error={
+            "code": "stopped" if stopped else "internal_error",
+            "message": "Stopped" if stopped else "Not finished",
+        })
+        patch = {"status": "cancelled" if stopped else "error", "ended_at": now_iso()}
+        if error and not stopped:
+            patch["error"] = error
+        self.emitter.update_part(part["id"], **patch)
+
     def _close_open_parts(self, ending: Ending) -> None:
         stopped = ending.message_status == MessageStatus.CANCELLED
         for part in self.emitter.parts():
@@ -511,6 +572,10 @@ class TurnRunner:
             kind = part.get("type")
             if kind == PartType.THINKING and not part.get("ended_at"):
                 self.emitter.update_part(part["id"], ended_at=now_iso())
+                continue
+            if kind == PartType.SWARM:
+                if status in LIVE_SWARM_STATUSES:
+                    self._close_swarm(part, stopped=stopped)
                 continue
             if status is None or status in _TERMINAL_PART_STATUS:
                 continue
@@ -555,6 +620,7 @@ class TurnRunner:
                 )
             )
         claimed = self._claimed
+        self._end_versions(run_status, error)
         message_fields = {
             "wire": wire.dumps(self.turn_wire),
             "parts": parts,
@@ -580,6 +646,23 @@ class TurnRunner:
         if not self.emitter.ended:
             self._emit_terminal(run_status, ending, parts_seq)
         AgentRun.objects.filter(id=self.run.id).update(last_seq=self.emitter.last_seq)
+
+    def _end_versions(self, run_status: str, error: dict) -> None:
+        """A research version of this run that has not ended ends with it:
+        cancelled when the run was stopped, else failed."""
+        from apps.agent.models import AgentSwarmVersion
+
+        cancelled = run_status == RunStatus.CANCELLED
+        fields = {
+            "status": VersionStatus.CANCELLED if cancelled else VersionStatus.ERROR,
+            "finished_at": timezone.now(),
+        }
+        if not cancelled:
+            fields.update(error_code=error.get("code") or INTERNAL.code,
+                          error_message=error.get("message") or INTERNAL.message)
+        AgentSwarmVersion.objects.filter(
+            run_id=self.run.id, status__in=ACTIVE_VERSION_STATUSES,
+        ).update(**fields)
 
     def _emit_terminal(self, run_status: str, ending: Ending, parts_seq: int) -> None:
         error = ending.error or {}

@@ -1,4 +1,4 @@
-"""Starting runs: send, regenerate, edit and continue.
+"""Starting runs: send, regenerate, edit, continue and re-run.
 
 Each writes the new tree nodes and a queued run in one transaction,
 under a per-user advisory lock (one active run per user, one per chat),
@@ -8,7 +8,9 @@ used returns that earlier run instead of starting another.
 Tree rules: regenerate adds an assistant sibling under the same user
 message; edit adds a user sibling (and its reply) under the same parent;
 continue adds a synthetic "Continue" user message under a truncated
-reply. The chat's current leaf moves to the new reply.
+reply; a research re-run adds a generated user message ("Re-run all 21
+research agents") under the chat's current leaf, and its run makes no
+model request. The chat's current leaf moves to the new reply.
 """
 from __future__ import annotations
 
@@ -20,14 +22,16 @@ from django.utils import timezone
 
 from apps.agent.constants import (
     CHAT_PREVIEW_MAX_LENGTH,
+    MAX_SWARM_VERSIONS,
     AgentKey,
     MessageRole,
     MessageStatus,
     RunStatus,
     RunTrigger,
     TitleSource,
+    VersionStatus,
 )
-from apps.agent.exceptions import RunInProgress
+from apps.agent.exceptions import InsufficientAllowance, RunInProgress, VersionLimit
 from apps.agent.prompts import context as context_prompt
 from apps.agent.runtime import wire
 from apps.agent.runtime.dispatch import dispatch_run
@@ -55,6 +59,8 @@ class StartedRun:
     run: object
     # True when an Idempotency-Key matched an earlier request.
     replayed: bool = False
+    # What a starter adds to its 202 response (a re-run: {"swarm_version"}).
+    extra: dict | None = None
 
 
 def clean_text(text) -> str:
@@ -290,5 +296,64 @@ def start_continue(*, user, website, message_id) -> StartedRun:
         _locked_checks(user, chat)
         return _create_turn(chat, user=user, parent=message, text=CONTINUE_TEXT,
                             trigger=RunTrigger.CONTINUE)
+
+    return _start(user, build)
+
+
+def _version_payload(version) -> dict:
+    return {
+        "swarm_id": str(version.swarm_id),
+        "version": version.version,
+        "scope": version.scope,
+        "scope_key": version.scope_key,
+        "task_ids": list(version.task_ids or []),
+    }
+
+
+def start_rerun(*, user, chat, swarm, scope: str, scope_key: str, task_ids: list[str],
+                text: str, idempotency_key=None, need_usd=None) -> StartedRun:
+    """A research re-run: a new turn at the end of the chat's current
+    branch (a generated user message, an assistant message and a run with
+    trigger ``rerun``, which makes no model request) and the swarm's next
+    version, queued for that run. ``need_usd`` is the re-run's upper-bound
+    cost, checked against the allowance left (403 insufficient_allowance).
+    A replayed Idempotency-Key returns the earlier run and its version.
+    """
+    from apps.agent.models import AgentSwarm, AgentSwarmVersion
+    from apps.agent.services.swarms import allowance_shortfall
+
+    key = clean_idempotency_key(idempotency_key)
+    quota.check_configured()
+
+    def build() -> StartedRun:
+        current = _load_chat(chat)
+        replay = _replay(user, current, key)
+        if replay is not None:
+            version = AgentSwarmVersion.objects.filter(run=replay.run).first()
+            if version is None:
+                raise InvalidRequest("This Idempotency-Key was already used for another request.")
+            replay.extra = {"swarm_version": _version_payload(version)}
+            return replay
+        parent = current.current_leaf
+        if parent is None or parent.role != MessageRole.ASSISTANT:
+            raise InvalidRequest("Send a message first.")
+        locked = AgentSwarm.objects.select_for_update().get(id=swarm.id)
+        number = (AgentSwarmVersion.objects.filter(swarm=locked)
+                  .order_by("-version").values_list("version", flat=True).first() or 0) + 1
+        if number > MAX_SWARM_VERSIONS:
+            raise VersionLimit(MAX_SWARM_VERSIONS)
+        _locked_checks(user, current)
+        shortfall = allowance_shortfall(user, need_usd) if need_usd is not None else None
+        if shortfall is not None:
+            raise InsufficientAllowance(**shortfall)
+        started = _create_turn(current, user=user, parent=parent, text=text,
+                               trigger=RunTrigger.RERUN, idempotency_key=key)
+        version = AgentSwarmVersion.objects.create(
+            swarm=locked, version=number, scope=scope, scope_key=scope_key or "",
+            task_ids=list(task_ids), status=VersionStatus.QUEUED, run=started.run,
+            message=started.assistant_message,
+        )
+        started.extra = {"swarm_version": _version_payload(version)}
+        return started
 
     return _start(user, build)

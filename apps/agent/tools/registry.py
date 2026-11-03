@@ -13,8 +13,9 @@ from dataclasses import dataclass
 
 from pydantic import ValidationError
 
+from apps.agent.conf import agent_conf
 from apps.agent.llm.gate import CancelRequested, GateStop
-from apps.agent.tools import actions, data, research
+from apps.agent.tools import actions, data, research, swarm
 from apps.agent.tools.context import ToolContext, ToolError, ToolResult
 from apps.agent.tools.schemas import DEFINITIONS, MODELS
 from apps.agent.tools.server import server_tool_definitions
@@ -50,13 +51,22 @@ TOOLS: dict[str, ToolSpec] = {
         ToolSpec("run_agent", actions.run_agent, "Writing agent", own_parts=True),
         ToolSpec("show_chart", actions.show_chart, "Chart", own_parts=True),
         ToolSpec("open_in_browser", actions.open_in_browser, "Open link", own_parts=True),
+        # The swarm and swarm_table parts; the translator adds the planning
+        # part when the call starts streaming.
+        ToolSpec("research_swarm", swarm.research_swarm, "Research agents", own_parts=True),
     )
 }
 
 SERVER_TOOL_NAMES = ("web_search", "web_fetch")
+# Offered only while AGENT_SWARM_ENABLED is on.
+SWARM_TOOL_NAME = "research_swarm"
 
 
 def client_tool_definitions() -> list[dict]:
+    """The client tools a new snapshot offers. research_swarm is left out
+    while the research agents are turned off (chats pinned to a snapshot
+    that has it get a swarm_disabled result instead)."""
+    swarm_enabled = agent_conf().swarm_enabled
     return [
         {
             "name": name,
@@ -65,6 +75,7 @@ def client_tool_definitions() -> list[dict]:
             "eager_input_streaming": True,
         }
         for name in TOOLS
+        if swarm_enabled or name != SWARM_TOOL_NAME
     ]
 
 

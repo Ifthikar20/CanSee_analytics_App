@@ -1,12 +1,14 @@
 """Request validation and response shapes of the agent API.
 
-Response shapes follow design/agent_contract.md section 4. Output is
-JSON-native (strings, numbers, lists, dicts) so it can go into an event
-payload as well as a response. The runtime's live views import
+Response shapes follow design/agent_contract.md section 4, and
+design/swarm_contract.md section 6d for the research agents and findings.
+Output is JSON-native (strings, numbers, lists, dicts) so it can go into
+an event payload as well as a response. The runtime's live views import
 MessageSerializer and RunSerializer from here.
 """
 from __future__ import annotations
 
+import uuid
 from urllib.parse import urlsplit
 
 from rest_framework import serializers
@@ -17,8 +19,24 @@ from apps.agent.constants import (
     DEFAULT_ENTRY_AGENT,
     FEEDBACK_DOWN,
     FEEDBACK_UP,
+    FINDING_CATEGORIES,
+    FINDING_CATEGORY_LABELS,
+    TERMINAL_TASK_STATUSES,
     AgentKey,
+    FindingSeverity,
+    FindingStatus,
     MessageRole,
+    SwarmCategory,
+    SwarmScope,
+)
+from apps.agent.services.findings import (
+    DETAIL_MAX_LENGTH,
+    MAX_ROWS_PER_CREATE,
+    PROMPT_TEXT_MAX_LENGTH,
+    SEARCH_MAX_LENGTH,
+    SHEETS,
+    STATUS_FILTER_ALL,
+    TITLE_MAX_LENGTH,
 )
 from core.validators.url_safety import safe_display_url
 
@@ -314,3 +332,218 @@ class ReportCreateSerializer(serializers.Serializer):
 
 class BrowseSerializer(serializers.Serializer):
     url = serializers.CharField(max_length=2000)
+
+
+# ── Research agents ───────────────────────────────────────────────────────
+
+
+def _empty_counts(total: int) -> dict:
+    return {"total": total, **{status: 0 for status in TERMINAL_TASK_STATUSES}}
+
+
+def _scope_label(swarm, version) -> str:
+    from apps.agent.runtime.swarm.plan import scope_label
+
+    return scope_label(swarm.categories or [], swarm.tasks or [],
+                       (swarm.plan or {}).get("prompts") or [], version.scope, version.scope_key)
+
+
+def _version_fields(swarm, version) -> dict:
+    return {
+        "version": version.version,
+        "scope": version.scope,
+        "scope_label": _scope_label(swarm, version),
+        "status": version.status,
+        "counts": version.counts or _empty_counts(len(version.task_ids or [])),
+        "started_at": dt(version.started_at),
+        "finished_at": dt(version.finished_at),
+        "duration_ms": version.duration_ms,
+        "message_id": str_id(version.message_id),
+    }
+
+
+def swarm_detail(swarm, versions) -> dict:
+    """Contract ``SwarmDetail``; ``versions`` newest first, each with a
+    ``has_table`` attribute (services.swarms.list_versions)."""
+    plan = swarm.plan if isinstance(swarm.plan, dict) else {}
+    tasks = [t for t in swarm.tasks or [] if isinstance(t, dict)]
+    return {
+        "id": str(swarm.id),
+        "title": swarm.title,
+        "chat_id": str(swarm.chat_id),
+        "message_id": str_id(swarm.message_id),
+        "created_at": dt(swarm.created_at),
+        "latest_version": swarm.latest_version,
+        "prompts": [
+            {"key": p.get("key"), "prompt_id": p.get("prompt_id"), "text": p.get("text"),
+             "location": p.get("location") or ""}
+            for p in plan.get("prompts") or [] if isinstance(p, dict)
+        ],
+        "categories": [
+            {"key": c.get("key"), "label": c.get("label"),
+             "task_ids": [t["id"] for t in tasks if t.get("category") == c.get("key")]}
+            for c in swarm.categories or [] if isinstance(c, dict)
+        ],
+        "tasks": [
+            {key: t.get(key) for key in ("id", "category", "subcategory", "worker", "label")}
+            for t in tasks
+        ],
+        "versions": [
+            {**_version_fields(swarm, v), "run_id": str_id(v.run_id), "has_table": _has_table(v)}
+            for v in versions
+        ],
+    }
+
+
+def _has_table(version) -> bool:
+    annotated = getattr(version, "has_table", None)
+    return bool(annotated) if annotated is not None else version.table is not None
+
+
+def swarm_version(swarm, version) -> dict:
+    """Contract ``SwarmVersion``: one execution and its table."""
+    return {"swarm_id": str(swarm.id), **_version_fields(swarm, version), "table": version.table}
+
+
+class SwarmRerunSerializer(serializers.Serializer):
+    scope = serializers.ChoiceField(choices=SwarmScope.values)
+    category = serializers.ChoiceField(choices=SwarmCategory.values, required=False)
+    task_id = serializers.CharField(max_length=80, required=False)
+
+    def validate(self, attrs):
+        if attrs["scope"] == SwarmScope.CATEGORY and not attrs.get("category"):
+            raise serializers.ValidationError({"category": ["Choose the category to re-run."]})
+        if attrs["scope"] == SwarmScope.TASK and not attrs.get("task_id"):
+            raise serializers.ValidationError({"task_id": ["Choose the agent to re-run."]})
+        return attrs
+
+
+# ── Findings ──────────────────────────────────────────────────────────────
+
+
+def _finding_source(finding, user) -> dict | None:
+    """Where a finding came from; null for one written by hand. The chat
+    and message ids go only to that chat's owner (chats are private)."""
+    if finding.source_swarm_id is None and not finding.source_sheet:
+        return None
+    chat = finding.source_chat if finding.source_chat_id else None
+    owner = chat is not None and user is not None and chat.user_id == user.id
+    swarm = finding.source_swarm if finding.source_swarm_id else None
+    return {
+        "swarm_id": str_id(finding.source_swarm_id),
+        "swarm_title": swarm.title if swarm is not None else None,
+        "version": finding.source_version,
+        "sheet": finding.source_sheet,
+        "row_key": finding.source_row_key,
+        "task_ids": list(finding.source_task_ids or []),
+        "chat_id": str(chat.id) if owner else None,
+        "message_id": str_id(finding.source_message_id) if owner else None,
+    }
+
+
+class FindingSerializer(serializers.BaseSerializer):
+    """Contract ``Finding``; needs ``context={"user": ...}``."""
+
+    def to_representation(self, finding):
+        return {
+            "id": str(finding.id),
+            "title": finding.title,
+            "detail": finding.detail,
+            "category": finding.category,
+            "category_label": FINDING_CATEGORY_LABELS.get(finding.category, finding.category),
+            "severity": finding.severity,
+            "status": finding.status,
+            "prompt_text": finding.prompt_text,
+            "evidence": finding.evidence or [],
+            "source": _finding_source(finding, self.context.get("user")),
+            "created_at": dt(finding.created_at),
+            "updated_at": dt(finding.updated_at),
+            "created_by_name": display_name(finding.created_by) if finding.created_by_id else None,
+            "status_changed_at": dt(finding.status_changed_at),
+            "status_changed_by_name": (display_name(finding.status_changed_by)
+                                       if finding.status_changed_by_id else None),
+        }
+
+
+class FindingListParamsSerializer(serializers.Serializer):
+    """GET findings/ query parameters; a blank value means "not filtered"."""
+
+    status = serializers.ChoiceField(choices=[*FindingStatus.values, STATUS_FILTER_ALL],
+                                     required=False, allow_blank=True)
+    category = serializers.ChoiceField(choices=FINDING_CATEGORIES, required=False,
+                                       allow_blank=True)
+    severity = serializers.ChoiceField(choices=FindingSeverity.values, required=False,
+                                       allow_blank=True)
+    swarm_id = serializers.CharField(required=False, allow_blank=True)
+    q = serializers.CharField(required=False, allow_blank=True, trim_whitespace=True)
+    cursor = serializers.CharField(required=False, allow_blank=True)
+
+    def validate_swarm_id(self, value):
+        if not value:
+            return None
+        try:
+            return uuid.UUID(value)
+        except ValueError:
+            raise serializers.ValidationError("Not a valid research id.") from None
+
+    def validate_q(self, value):
+        return (value or "")[:SEARCH_MAX_LENGTH]
+
+    def validate(self, attrs):
+        return {
+            "status": attrs.get("status") or FindingStatus.OPEN.value,
+            "category": attrs.get("category") or None,
+            "severity": attrs.get("severity") or None,
+            "swarm_id": attrs.get("swarm_id"),
+            "q": attrs.get("q") or "",
+            "cursor": attrs.get("cursor") or "",
+        }
+
+
+class FindingsFromSwarmSerializer(serializers.Serializer):
+    swarm_id = serializers.UUIDField()
+    version = serializers.IntegerField(min_value=1)
+    sheet = serializers.ChoiceField(choices=SHEETS)
+    row_keys = serializers.ListField(
+        child=serializers.CharField(max_length=80), min_length=1, max_length=MAX_ROWS_PER_CREATE,
+    )
+
+
+class FindingCreateSerializer(serializers.Serializer):
+    """Either ``from_swarm`` (rows of a results table) or the fields of a
+    finding written by hand."""
+
+    from_swarm = FindingsFromSwarmSerializer(required=False)
+    title = serializers.CharField(max_length=TITLE_MAX_LENGTH, required=False)
+    detail = serializers.CharField(max_length=DETAIL_MAX_LENGTH, required=False,
+                                   allow_blank=True, default="")
+    category = serializers.ChoiceField(choices=FINDING_CATEGORIES, required=False)
+    severity = serializers.ChoiceField(choices=FindingSeverity.values, required=False)
+    prompt_text = serializers.CharField(max_length=PROMPT_TEXT_MAX_LENGTH, required=False,
+                                        allow_blank=True, default="")
+
+    MANUAL_FIELDS = ("title", "detail", "category", "severity", "prompt_text")
+
+    def validate(self, attrs):
+        given = self.initial_data if isinstance(self.initial_data, dict) else {}
+        if "from_swarm" in attrs:
+            if any(given.get(key) not in (None, "") for key in self.MANUAL_FIELDS):
+                raise serializers.ValidationError(
+                    "Send from_swarm or a finding's fields, not both.")
+            return attrs
+        missing = [key for key in ("title", "category", "severity") if not attrs.get(key)]
+        if missing:
+            raise serializers.ValidationError({key: ["This field is required."] for key in missing})
+        return attrs
+
+
+class FindingUpdateSerializer(serializers.Serializer):
+    status = serializers.ChoiceField(choices=FindingStatus.values, required=False)
+    severity = serializers.ChoiceField(choices=FindingSeverity.values, required=False)
+    title = serializers.CharField(max_length=TITLE_MAX_LENGTH, required=False)
+    detail = serializers.CharField(max_length=DETAIL_MAX_LENGTH, required=False, allow_blank=True)
+
+    def validate(self, attrs):
+        if not attrs:
+            raise serializers.ValidationError("Send a status, severity, title or detail.")
+        return attrs

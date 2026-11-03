@@ -56,8 +56,11 @@ def record_request_usage(
     stop_reason: str = "",
     estimated: bool = False,
     duration_ms: int = 0,
+    extra: dict | None = None,
 ) -> UsageTotals:
-    """Record one request's usage and return what it adds to the run."""
+    """Record one request's usage and return what it adds to the run.
+    ``extra`` adds flat keys to each row's metadata (the research agents
+    tag their analyses with the swarm, version and task)."""
     rows = usage_rows(model, usage, default_ttl=agent_conf().cache_ttl)
     totals = UsageTotals(requests=1, estimated=estimated)
     for i, row in enumerate(rows):
@@ -72,6 +75,8 @@ def record_request_usage(
             provider="anthropic",
             duration_ms=duration_ms if i == 0 else 0,
             metadata={
+                # The ledger's own keys below win over ``extra``.
+                **(extra or {}),
                 "role": role,
                 "run_id": str(run.id),
                 "chat_id": str(run.chat_id),

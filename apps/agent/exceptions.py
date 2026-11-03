@@ -105,3 +105,54 @@ class RevisionConflict(CanseeException):
             status_code=409,
             details={"revision": revision} if revision is not None else None,
         )
+
+
+class SwarmDisabled(CanseeException):
+    """AGENT_SWARM_ENABLED is off (re-runs only; reads still work)."""
+
+    def __init__(self):
+        super().__init__(
+            "The research agents are turned off on this server.",
+            code="swarm_disabled",
+            status_code=503,
+        )
+
+
+class VersionLimit(CanseeException):
+    """The research already has MAX_SWARM_VERSIONS versions."""
+
+    def __init__(self, limit: int = 50):
+        super().__init__(
+            f"This research already has {limit} versions; start a new research.",
+            code="version_limit",
+            status_code=400,
+        )
+
+
+class NoFinding(CanseeException):
+    """Rows asked for have no finding draft; nothing was created."""
+
+    def __init__(self, row_keys):
+        super().__init__(
+            "Some of these rows have no finding to add.",
+            code="no_finding",
+            status_code=400,
+            details={"row_keys": [str(k) for k in row_keys]},
+        )
+
+
+class InsufficientAllowance(CanseeException):
+    """The AI allowance left is below a re-run's upper-bound cost."""
+
+    def __init__(self, *, need_usd: float, left_usd: float, cap_usd: float):
+        super().__init__(
+            f"Not enough AI allowance: this re-run needs up to ${need_usd:.2f} and "
+            f"${max(left_usd, 0):.2f} of the ${cap_usd:.2f} monthly allowance is left.",
+            code="insufficient_allowance",
+            status_code=403,
+            details={
+                "need_usd": round(need_usd, 2),
+                "left_usd": round(max(left_usd, 0), 2),
+                "cap_usd": round(cap_usd, 2),
+            },
+        )

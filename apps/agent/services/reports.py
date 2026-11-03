@@ -2,9 +2,11 @@
 
 The report is the reply's Markdown plus a snapshot of the research behind
 it: the Google results pages and pages it inspected (from the message's
-research store), the AI engine checks (its engine_check parts) and the
-prompt gaps it read. Nothing is recomputed; a report shows exactly what
-the reply was written from.
+research store), the AI engine checks (its engine_check parts), the
+prompt gaps it read and, when the reply ran the research agents, their
+results table (its last swarm_table part), which the report Markdown
+also ends with as a "Research agents" appendix. Nothing is recomputed; a
+report shows exactly what the reply was written from.
 """
 from __future__ import annotations
 
@@ -15,6 +17,7 @@ from django.utils import timezone
 
 from apps.agent.constants import (
     ARTIFACT_TITLE_MAX_LENGTH,
+    TERMINAL_TASK_STATUSES,
     AgentKey,
     ArtifactKind,
     MessageRole,
@@ -24,6 +27,7 @@ from apps.agent.constants import (
 )
 from apps.agent.exceptions import AlreadySaved
 from apps.agent.models import AgentArtifact, AgentMessage
+from apps.agent.services import swarm_tables
 from apps.agent.services.artifacts import add_version
 from core.exceptions import CanseeException, ResourceNotFound
 
@@ -59,15 +63,20 @@ def save_report(user, website, *, message_id, title: str = "") -> AgentArtifact:
         if existing is not None and existing.deleted_at is None:
             raise AlreadySaved(artifact_id=existing.id)
 
-        content = report_markdown(message.parts)
-        if not content:
+        text = report_markdown(message.parts)
+        if not text:
             raise NotSavable("This reply has no text to save.")
         data = research_snapshot(message)
+        content = text
+        if data["swarm"] is not None:
+            content = f"{text}\n\n" + swarm_tables.report_appendix(
+                data["swarm"]["table"], _swarm_parts(message.parts)[0] or {})
         artifact = AgentArtifact.objects.create(
             website=website,
             kind=ArtifactKind.REPORT,
             agent_key=AgentKey.GAP_ANALYST,
-            title=report_title(title, content, website),
+            # From the reply's own text: the appendix's heading is not its title.
+            title=report_title(title, text, website),
             created_by=user,
             source_chat_id=message.chat_id,
             source_message=message,
@@ -98,11 +107,13 @@ def report_markdown(parts) -> str:
 
 
 def research_snapshot(message: AgentMessage) -> dict:
-    """{serp, pages, engines, gaps} as captured while the reply was written.
+    """{serp, pages, engines, gaps, swarm} as captured while the reply was
+    written.
 
     Captures appear in the order their parts appear in the reply; any
     capture no part points at follows, oldest first. Page captures carry
-    no reader text.
+    no reader text. ``swarm`` is the research agents' last results table
+    (contract 6e), or None.
     """
     research = message.research if isinstance(message.research, dict) else {}
     parts = [p for p in (message.parts or []) if isinstance(p, dict)]
@@ -117,6 +128,59 @@ def research_snapshot(message: AgentMessage) -> dict:
         "pages": pages,
         "engines": [p for p in parts if p.get("type") == PartType.ENGINE_CHECK],
         "gaps": gaps if isinstance(gaps, list) else [],
+        "swarm": swarm_snapshot(parts),
+    }
+
+
+def _swarm_parts(parts) -> tuple[dict | None, dict | None]:
+    """(the swarm part, the swarm_table part) of the reply's last results
+    table: the table part last in the reply, and the swarm part of the
+    same swarm and version."""
+    parts = [p for p in parts or [] if isinstance(p, dict)]
+    table_part = next((p for p in reversed(parts) if p.get("type") == PartType.SWARM_TABLE
+                       and isinstance(p.get("table"), dict)), None)
+    if table_part is None:
+        return None, None
+    swarm_part = next((p for p in reversed(parts) if p.get("type") == PartType.SWARM
+                       and p.get("swarm_id") == table_part.get("swarm_id")
+                       and p.get("version") == table_part.get("version")), None)
+    return swarm_part, table_part
+
+
+def _task_counts(tasks) -> dict:
+    statuses = [t.get("status") for t in tasks if isinstance(t, dict)]
+    counts = {"total": len(statuses)}
+    for status in TERMINAL_TASK_STATUSES:
+        counts[status] = sum(1 for s in statuses if s == status)
+    return counts
+
+
+def swarm_snapshot(parts) -> dict | None:
+    """``data.swarm`` of a report (contract 6e): the results table and the
+    run it came from, with per-category agent counts."""
+    swarm_part, table_part = _swarm_parts(parts)
+    if table_part is None:
+        return None
+    table = table_part["table"]
+    swarm_part = swarm_part or {}
+    tasks = [t for t in swarm_part.get("tasks") or [] if isinstance(t, dict)]
+    return {
+        "swarm_id": table_part.get("swarm_id") or table.get("swarm_id"),
+        "version": table_part.get("version") or table.get("version"),
+        "title": table_part.get("title") or table.get("title") or "",
+        "status": table_part.get("status") or table.get("status"),
+        "duration_ms": swarm_part.get("duration_ms"),
+        "counts": table.get("counts") or _task_counts(tasks),
+        "categories": [
+            {
+                "key": category.get("key"),
+                "label": category.get("label"),
+                "counts": _task_counts(t for t in tasks
+                                       if t.get("category") == category.get("key")),
+            }
+            for category in swarm_part.get("categories") or [] if isinstance(category, dict)
+        ],
+        "table": table,
     }
 
 
@@ -173,6 +237,9 @@ def _summary(content: str, data: dict) -> str:
         return f"{n} {noun}{'' if n == 1 else 's'}{suffix}"
 
     bits = []
+    if data.get("swarm"):
+        bits.append(count(int((data["swarm"].get("counts") or {}).get("total") or 0),
+                          "research agent"))
     if data["serp"]:
         bits.append(count(len(data["serp"]), "Google results page"))
     if data["pages"]:

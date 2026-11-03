@@ -13,6 +13,8 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
+from apps.agent.constants import SWARM_TITLE_MAX_LENGTH
+
 GAP_CLASSES = ("ai_ahead", "google_ahead", "strong_both", "invisible_both", "even", "no_data")
 ENGINE_KEYS = ("chatgpt", "claude", "gemini", "grok", "perplexity")
 ARTIFACT_KINDS = ("page", "document", "sheet", "report")
@@ -22,6 +24,8 @@ CHART_TYPES = ("bar", "line", "doughnut")
 MAX_SERP_PAGES = 5
 MAX_TRACK_PROMPTS = 10
 MAX_ENGINE_PROMPTS = 5
+MAX_SWARM_PROMPTS = 5
+MAX_SWARM_COMPETITORS = 5
 
 Text = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 CountryCode = Annotated[str, StringConstraints(strip_whitespace=True, pattern=r"^[A-Za-z]{2}$")]
@@ -125,6 +129,58 @@ class ShowChartInput(_Input):
 class OpenInBrowserInput(_Input):
     url: Annotated[str, StringConstraints(strip_whitespace=True, min_length=4, max_length=2000)]
     title: Annotated[str, StringConstraints(strip_whitespace=True, max_length=200)] | None = None
+
+
+class SwarmPromptInput(_Input):
+    """One prompt of a research: a tracked prompt, or a new one by text."""
+
+    prompt_id: uuid.UUID | None = None
+    text: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=3, max_length=300)
+    ] | None = None
+    location: CountryCode | None = None
+
+    @model_validator(mode="after")
+    def _one_prompt(self):
+        if (self.prompt_id is None) == (self.text is None):
+            raise ValueError("Give exactly one of prompt_id and text.")
+        if self.location is not None and self.text is None:
+            raise ValueError("location goes with text only: a tracked prompt is searched from "
+                             "its own location.")
+        return self
+
+
+class ResearchSwarmInput(_Input):
+    """A research plan, or ``rerun_of`` alone to run an earlier one again."""
+
+    title: Annotated[
+        str, StringConstraints(strip_whitespace=True, max_length=SWARM_TITLE_MAX_LENGTH)
+    ] | None = None
+    prompts: list[SwarmPromptInput] | None = Field(
+        None, min_length=1, max_length=MAX_SWARM_PROMPTS,
+    )
+    google_pages: int = Field(1, ge=1, le=2)
+    engines: list[Literal[ENGINE_KEYS]] | None = Field(None, min_length=1, max_length=5)
+    competitor_pages: int = Field(1, ge=0, le=2)
+    competitors: list[
+        Annotated[str, StringConstraints(strip_whitespace=True, min_length=3, max_length=253)]
+    ] = Field(default_factory=list, max_length=MAX_SWARM_COMPETITORS)
+    content_gaps: bool = True
+    citations: bool = True
+    rerun_of: uuid.UUID | None = None
+
+    @model_validator(mode="after")
+    def _plan_or_rerun(self):
+        if self.rerun_of is not None:
+            others = sorted(self.model_fields_set - {"rerun_of"})
+            if others:
+                raise ValueError("rerun_of runs the earlier plan again: leave out "
+                                 + ", ".join(others) + ".")
+            return self
+        if not self.prompts:
+            raise ValueError("Give prompts (1 to 5), or rerun_of with an earlier result's "
+                             "swarm_id.")
+        return self
 
 
 # ── JSON schemas (what the model sees) ──────────────────────────────────
@@ -331,6 +387,86 @@ DEFINITIONS: dict[str, dict] = {
             "title": {"type": "string"},
         }, ["url"]),
     },
+    "research_swarm": {
+        "description": (
+            "Run the research agents: a team of up to 30 agents that work in parallel on 1 to 5 "
+            "buyer prompts, each doing one real step: fetching one Google results page, asking "
+            "one AI engine one prompt, reading one competitor page or the brand's own page, or "
+            "analyzing content gaps or cited sources. The user sees every agent's status live. "
+            "Returns one consolidated table: per prompt the Google position, the AI Overview, "
+            "each engine's mention and rank, the brands ahead, the cited sources and the gap "
+            "class, plus the content gaps and the cited sources. Agents per prompt = Google pages "
+            "+ engines asked + competitor pages + 2 when content_gaps is on + 1 when citations is "
+            "on; at most 30 in total. Pass rerun_of with an earlier result's swarm_id, and "
+            "nothing else, to run the same research again with fresh data. Google pages and "
+            "engine answers cost money and use the project's allowances."
+        ),
+        "input_schema": _object({
+            "title": {
+                "type": "string",
+                "description": "A short name for this research, shown to the user, for example "
+                               "\"Research Notion\".",
+            },
+            "prompts": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": MAX_SWARM_PROMPTS,
+                "description": "The buyer prompts to research. Use tracked prompts (prompt_id) "
+                               "when they fit. A new prompt (text) must be one the user wrote "
+                               "or confirmed in this chat; it is tracked before the agents "
+                               "start.",
+                "items": _object({
+                    "prompt_id": _PROMPT_ID,
+                    "text": {
+                        "type": "string",
+                        "description": "A new prompt's exact text, as the user wrote or "
+                                       "confirmed it.",
+                    },
+                    "location": {
+                        "type": "string",
+                        "description": "Two-letter country code (ISO 3166-1 alpha-2) to search "
+                                       "from, for a new prompt only, for example \"us\".",
+                    },
+                }),
+            },
+            "google_pages": {
+                "type": "integer", "minimum": 1, "maximum": 2,
+                "description": "Google results pages per prompt, 10 results each (default 1).",
+            },
+            "engines": {
+                "type": "array", "minItems": 1, "maxItems": 5,
+                "items": {"type": "string", "enum": list(ENGINE_KEYS)},
+                "description": "AI engines to ask (default: every configured engine). Engines "
+                               "without an API key are reported as not configured.",
+            },
+            "competitor_pages": {
+                "type": "integer", "minimum": 0, "maximum": 2,
+                "description": "Competitor pages to read per prompt, chosen from that prompt's "
+                               "Google results (default 1).",
+            },
+            "competitors": {
+                "type": "array", "maxItems": MAX_SWARM_COMPETITORS, "items": {"type": "string"},
+                "description": "Competitor domains to prefer when choosing competitor pages, "
+                               "for example \"atlassian.com\".",
+            },
+            "content_gaps": {
+                "type": "boolean",
+                "description": "Read the brand's own page for each prompt and compare it with "
+                               "the competitor pages (default true).",
+            },
+            "citations": {
+                "type": "boolean",
+                "description": "Collect and analyze the sources the AI engines cite for each "
+                               "prompt (default true).",
+            },
+            "rerun_of": {
+                "type": "string",
+                "description": "A swarm_id from an earlier research_swarm result: runs that "
+                               "research again with fresh data and the same plan. Leave out "
+                               "every other field.",
+            },
+        }),
+    },
 }
 
 MODELS: dict[str, type[_Input]] = {
@@ -348,4 +484,5 @@ MODELS: dict[str, type[_Input]] = {
     "run_agent": RunAgentInput,
     "show_chart": ShowChartInput,
     "open_in_browser": OpenInBrowserInput,
+    "research_swarm": ResearchSwarmInput,
 }

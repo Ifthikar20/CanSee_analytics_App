@@ -5,8 +5,10 @@
 - text: one part per text block, its deltas coalesced (60 ms or 2 KB);
   citations land on the part when the block stops.
 - tool_use: data tools get a ``tool`` part (preparing; the runner moves
-  it on), run_agent an ``agent_call`` part; the research tools, charts
-  and links add their own parts when they run.
+  it on), run_agent an ``agent_call`` part, research_swarm a ``swarm``
+  part (planning; its title when the input is complete, the full part
+  when the agents start); the research tools, charts and links add their
+  own parts when they run.
 - server tools: ``web_search`` / ``web_fetch`` parts, completed by their
   result blocks (which arrive whole).
 - fallback: a notice part. Any other block type gets no part (its wire
@@ -17,10 +19,14 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 
-from apps.agent.constants import PartType
+from apps.agent.constants import SWARM_TITLE_MAX_LENGTH, PartType
 from apps.agent.runtime.events import now_iso
+from apps.agent.runtime.swarm.reporter import planning_part_fields
 from apps.agent.services.catalog import agent_name
 from apps.agent.tools.registry import label_for, owns_parts
+from apps.agent.tools.shaping import clip
+
+SWARM_TOOL = "research_swarm"
 
 FLUSH_SECONDS = 0.06
 FLUSH_CHARS = 2048
@@ -135,6 +141,9 @@ class StreamTranslator:
                     status="preparing", artifact_id=None, version=None, title=None, kind=None,
                     summary="", error=None,
                 )
+            elif block.name == SWARM_TOOL:
+                block.part_id = self.em.add_part(PartType.SWARM, request=self.request,
+                                                 **planning_part_fields())
             elif not owns_parts(block.name):
                 block.part_id = self.em.add_part(
                     PartType.TOOL, request=self.request, name=block.name,
@@ -211,6 +220,11 @@ class StreamTranslator:
                 block.part_id, agent=agent, agent_name=agent_name(agent) if agent else None,
                 title=args.get("title") if isinstance(args.get("title"), str) else None,
             )
+        elif block.kind == "tool_use" and block.name == SWARM_TOOL and block.part_id:
+            args = data.get("input") if isinstance(data.get("input"), dict) else {}
+            if isinstance(args.get("title"), str) and args["title"].strip():
+                self.em.update_part(block.part_id,
+                                    title=clip(args["title"].strip(), SWARM_TITLE_MAX_LENGTH))
         elif block.kind == "server_tool_use" and block.part_id:
             args = data.get("input") if isinstance(data.get("input"), dict) else {}
             if block.name == "web_search":
