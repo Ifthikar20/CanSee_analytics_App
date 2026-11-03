@@ -32,6 +32,7 @@ from __future__ import annotations
 import logging
 import re
 from decimal import Decimal
+from urllib.parse import parse_qs, urlsplit
 
 from django.conf import settings
 
@@ -49,6 +50,11 @@ SCRAPERAPI_TIMEOUT = 70.0
 
 PROVIDER_SERPAPI = "serpapi"
 PROVIDER_SCRAPERAPI = "scraperapi"
+
+# Google's own click redirects (/goto?url=<opaque token>, /url?q=<target>)
+# and the site at the start of a result's breadcrumb ("https://x.com › a").
+_GOOGLE_REDIRECT = re.compile(r"^https?://(?:www\.)?google\.[a-z.]+/(?:goto|url)\b", re.IGNORECASE)
+_BREADCRUMB_SITE = re.compile(r"^(https?://[^\s\u203a>]+)")
 
 # Caps. The SERP can return a lot of PAA/related-search chaff; past these
 # counts it stops informing the graph and starts crowding it.
@@ -261,13 +267,39 @@ def search(
 # blocks are absent far more often than they are present.
 
 
+def _scraperapi_link(item: dict) -> tuple[str, bool]:
+    """(url, site_only) for one ScraperAPI organic row.
+
+    For many results ScraperAPI hands back Google's click redirect
+    (google.com/goto?url=<opaque token>) instead of the page. A /url?q=
+    redirect still names its target; a /goto token does not, and then the
+    page's site survives only in the breadcrumb (``displayed_link``), so
+    the row keeps that site's address: right for ranking, not the exact
+    page. A breadcrumb that names no site ("40+ answers") gives "".
+    """
+    link = _clean(item.get("link"), 2000)
+    if link and not _GOOGLE_REDIRECT.match(link):
+        return link, False
+    if link:
+        params = parse_qs(urlsplit(link).query)
+        for key in ("q", "url"):
+            target = (params.get(key) or [""])[0]
+            if target.startswith(("http://", "https://")):
+                return _clean(target, 2000), False
+    match = _BREADCRUMB_SITE.match(str(item.get("displayed_link") or "").strip())
+    return (match.group(1).rstrip("/") + "/", True) if match else ("", False)
+
+
 def _parse_organic(data: dict, max_results: int, *, start: int = 0,
                    page_relative: bool = False) -> list[dict]:
     rows = []
     for index, item in enumerate((data.get("organic_results") or [])[:MAX_ORGANIC]):
         if not isinstance(item, dict):
             continue
-        url = _clean(item.get("link"), 2000)
+        if page_relative:
+            url, site_only = _scraperapi_link(item)
+        else:
+            url, site_only = _clean(item.get("link"), 2000), False
         host = _host_of(url)
         if not host:
             continue
@@ -281,6 +313,9 @@ def _parse_organic(data: dict, max_results: int, *, start: int = 0,
             "position": position if isinstance(position, int) and position > 0 else None,
             "url": url,
             "domain": host,
+            # True when only the result's site is known (see _scraperapi_link).
+            "site_only": site_only,
+            "breadcrumb": _clean(item.get("displayed_link"), 300),
             "title": _clean(item.get("title")),
             "snippet": _clean(item.get("snippet"), 1000),
             "date": _clean(item.get("date"), 40),

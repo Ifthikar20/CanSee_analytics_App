@@ -137,7 +137,10 @@ def build_serp_capture(payload: dict, *, website, query: str, page: int, locatio
             "position": position,
             "title": row.get("title") or "",
             "url": row.get("url") or "",
-            "display_url": display_url(row.get("url") or ""),
+            # Only the site is known for some ScraperAPI rows; Google's own
+            # breadcrumb then says more than the bare site address would.
+            "display_url": (row.get("breadcrumb") if row.get("site_only") else "")
+            or display_url(row.get("url") or ""),
             "domain": domain,
             "snippet": row.get("snippet") or "",
             "is_yours": is_yours,
