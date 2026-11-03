@@ -71,8 +71,12 @@ class OnboardingPayload:
     competitors: list[dict] = field(default_factory=list)
 
 
-def run_onboarding_scan(url: str) -> OnboardingPayload:
-    """Scan + polish + discover, returning a single payload for the UI."""
+def run_onboarding_scan(url: str, *, user=None) -> OnboardingPayload:
+    """Scan + polish + discover, returning a single payload for the UI.
+
+    ``user`` is who the Claude calls are recorded and allowance-checked
+    against, like every other AI feature.
+    """
     from apps.llm_ranking.services.domain_scanner import scan_domain
 
     payload = OnboardingPayload(url=url)
@@ -97,6 +101,7 @@ def run_onboarding_scan(url: str) -> OnboardingPayload:
         raw_description=payload.description_raw,
         selling_points=payload.selling_points,
         products=payload.products,
+        user=user,
     )
 
     # Topics come only from Claude, which also names the brands the audit
@@ -111,6 +116,7 @@ def run_onboarding_scan(url: str) -> OnboardingPayload:
             description=payload.description_short or payload.description_raw,
             selling_points=payload.selling_points,
             products=payload.products,
+            user=user,
         )
         payload.topics_source = "ai" if llm_topic_rows else "failed"
         payload.topics = [row["topic"] for row in llm_topic_rows]
@@ -125,6 +131,7 @@ def run_onboarding_scan(url: str) -> OnboardingPayload:
             industry=payload.industry,
             domain=payload.domain,
             description=payload.description_short or payload.description_raw,
+            user=user,
         )
     except Exception as exc:
         logger.warning("Competitor discovery failed: %s", exc)
@@ -147,6 +154,7 @@ def _polish_description(
     raw_description: str,
     selling_points: list[str],
     products: list[str],
+    user=None,
 ) -> str:
     """
     Ask Claude Haiku for a clean 1-2 sentence "what they do" line.
@@ -180,7 +188,7 @@ def _polish_description(
     # The gateway records token usage centrally (module="onboarding",
     # role="description_polish" — same keys the old inline block wrote).
     # No user/website yet: the scan runs before the Website row exists.
-    result = provider.query(prompt, module="onboarding", role="description_polish")
+    result = provider.query(prompt, module="onboarding", role="description_polish", user=user)
     if not result.succeeded:
         logger.debug("Description polish skipped: %s", result.error)
         return fallback
@@ -195,6 +203,7 @@ def _llm_topics(
     description: str,
     selling_points: list[str],
     products: list[str],
+    user=None,
 ) -> list[dict]:
     """
     Ask Claude Haiku for 8 buyer-intent search queries + the brand
@@ -262,7 +271,7 @@ def _llm_topics(
         # The gateway records token usage centrally (module="onboarding",
         # role="topic_generation" — same keys the old inline block wrote).
         # No user/website yet: the scan runs before the Website row exists.
-        result = provider.query(prompt, module="onboarding", role="topic_generation")
+        result = provider.query(prompt, module="onboarding", role="topic_generation", user=user)
         if not result.succeeded:
             logger.debug("LLM topic generation skipped: %s", result.error)
             return []
@@ -314,6 +323,7 @@ def _llm_competitors(
     industry: str,
     domain: str,
     description: str,
+    user=None,
 ) -> list[dict]:
     """
     Ask Claude Haiku to name 8 real competitors of the business.
@@ -360,7 +370,8 @@ def _llm_competitors(
         # The gateway records token usage centrally (module="onboarding",
         # role="competitor_discovery" — same keys the old inline block wrote).
         # No user/website yet: the scan runs before the Website row exists.
-        result = provider.query(prompt, module="onboarding", role="competitor_discovery")
+        result = provider.query(prompt, module="onboarding", role="competitor_discovery",
+                                user=user)
         if not result.succeeded:
             logger.debug("LLM competitor discovery skipped: %s", result.error)
             return []
@@ -403,7 +414,7 @@ def _llm_competitors(
 
 
 def _safe_discover_competitors(
-    *, business_name: str, industry: str, domain: str, description: str,
+    *, business_name: str, industry: str, domain: str, description: str, user=None,
 ) -> list[dict]:
     """
     Find competitors for the onboarded website.
@@ -425,6 +436,7 @@ def _safe_discover_competitors(
         industry=industry,
         domain=domain,
         description=description,
+        user=user,
     )
     if competitors:
         return competitors

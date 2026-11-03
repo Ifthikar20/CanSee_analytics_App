@@ -24,8 +24,10 @@ class ClaudeProvider(LLMProvider):
     burst = 15
 
     # Output budget for models that answer without thinking unless asked
-    # (Haiku 4.5, the 4.x Sonnet and Opus models).
-    ANSWER_MAX_TOKENS = 1024
+    # (Haiku 4.5, the 4.x Sonnet and Opus models). A buying-guide answer
+    # with a ranked list often runs past 1024 tokens and was cut off; the
+    # bill follows what the model writes, not this cap.
+    ANSWER_MAX_TOKENS = 4096
     # Model families that think whenever `thinking` is omitted (adaptive by
     # default, or always on). max_tokens caps thinking plus the answer on
     # these, so a 1024 budget can end mid-list; they get room for both, and

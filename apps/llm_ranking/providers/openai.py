@@ -8,6 +8,8 @@ from .claude import DEFAULT_SYSTEM
 class OpenAIProvider(LLMProvider):
     name = "gpt4"
     model = "gpt-4o-mini"
+    # Room for a full ranked-list answer; the bill follows what is written.
+    ANSWER_MAX_TOKENS = 4096
     api_key_setting = "OPENAI_API_KEY"
     # OpenAI Tier 1 for gpt-4o-mini = ~500 RPM. Cap at 200 for headroom.
     rpm = 200
@@ -26,18 +28,31 @@ class OpenAIProvider(LLMProvider):
 
         resp = client.chat.completions.create(
             model=self.model,
-            max_tokens=1024,
+            max_tokens=self.ANSWER_MAX_TOKENS,
             messages=[
                 {"role": "system", "content": system_prompt or DEFAULT_SYSTEM},
                 {"role": "user", "content": prompt},
             ],
         )
         usage = getattr(resp, "usage", None)
+        tokens = {
+            "input_tokens": getattr(usage, "prompt_tokens", 0) if usage else 0,
+            "output_tokens": getattr(usage, "completion_tokens", 0) if usage else 0,
+        }
+        choice = resp.choices[0]
+        if getattr(choice, "finish_reason", None) == "length":
+            # An answer cut off mid-list would read as "not mentioned" for
+            # every brand it never reached, so it is not kept as an answer
+            # (the Claude engine does the same).
+            return ProviderResult(
+                succeeded=False,
+                error=f"max_tokens: the answer was cut off at the {self.ANSWER_MAX_TOKENS}-token limit",
+                **tokens,
+            )
         return ProviderResult(
             succeeded=True,
-            text=resp.choices[0].message.content.strip(),
-            input_tokens=getattr(usage, "prompt_tokens", 0) if usage else 0,
-            output_tokens=getattr(usage, "completion_tokens", 0) if usage else 0,
+            text=(choice.message.content or "").strip(),
+            **tokens,
         )
 
     def _web_search_call(self, client, prompt, system_prompt, region):

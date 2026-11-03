@@ -43,7 +43,7 @@ class GrokProvider(LLMProvider):
 
         resp = client.chat.completions.create(
             model=self.model,
-            max_tokens=1024,
+            max_tokens=4096,
             messages=[
                 {"role": "system", "content": sys_prompt},
                 {"role": "user", "content": prompt},
