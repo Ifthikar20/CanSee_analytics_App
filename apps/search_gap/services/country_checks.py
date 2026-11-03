@@ -43,7 +43,11 @@ from core.quota import DailyQuota
 logger = logging.getLogger("apps")
 
 # Planning upper bounds per engine answer, including its extraction.
-ENGINE_ANSWER_USD = Decimal("0.0200")          # answer + Haiku extraction (swarm ENGINE_TASK_USD)
+# An answer is capped at 4,096 output tokens: Claude Haiku 4.5 ($5 per million
+# out) can reach about $0.021 before its extraction, and Grok 4 ($15 per
+# million out) about $0.062, so each gets a bound it cannot exceed.
+ENGINE_ANSWER_USD = Decimal("0.0300")          # answer + Haiku extraction
+GROK_ANSWER_USD = Decimal("0.0700")            # Grok 4: 4,096 tokens at $15 per million + extraction
 ENGINE_ANSWER_SEARCH_USD = Decimal("0.0800")   # ChatGPT / Claude searching (5 searches + tokens)
 PERPLEXITY_ANSWER_USD = Decimal("0.0300")      # Sonar request fee + tokens
 
@@ -153,6 +157,8 @@ def answer_usd_max(engine: str) -> Decimal:
         return PERPLEXITY_ANSWER_USD
     if regions.planned_country_method(key) == regions.METHOD_SEARCHED:
         return ENGINE_ANSWER_SEARCH_USD
+    if key == "grok":
+        return GROK_ANSWER_USD
     return ENGINE_ANSWER_USD
 
 
