@@ -44,8 +44,10 @@ services:
       retries: 5
     restart: unless-stopped
 
+  # Published by the UI repo's CI (.github/workflows/build.yml) on every
+  # push to its main branch; `latest` is whatever UI main last built.
   frontend:
-    image: ghcr.io/ifthikar20/ftb-ui:${UI_VERSION:-latest}
+    image: ghcr.io/ifthikar20/cansee-ui:${UI_VERSION:-latest}
     volumes:
       - frontend_dist:/app/dist
 
