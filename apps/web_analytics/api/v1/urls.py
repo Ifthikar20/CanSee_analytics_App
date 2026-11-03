@@ -1,6 +1,6 @@
 from django.urls import path
 
-from apps.web_analytics.api.v1 import views
+from apps.web_analytics.api.v1 import traffic_views, views
 
 urlpatterns = [
     # OAuth callback (unauthenticated; trust = signed state)
@@ -29,4 +29,10 @@ urlpatterns = [
     path("cloudflare/<uuid:website_id>/zone/", views.CloudflareSelectZoneView.as_view(), name="wa-cf-select-zone"),
     path("cloudflare/<uuid:website_id>/connection/", views.CloudflareDisconnectView.as_view(), name="wa-cf-disconnect"),
     path("cloudflare/<uuid:website_id>/snapshot/", views.CloudflareSnapshotView.as_view(), name="wa-cf-snapshot"),
+
+    # Traffic pages: whichever source the website has (pixel, GA4, Cloudflare)
+    path("<uuid:website_id>/traffic/sources/", traffic_views.TrafficSourcesView.as_view(), name="wa-traffic-sources"),
+    path("<uuid:website_id>/traffic/", traffic_views.TrafficView.as_view(), name="wa-traffic"),
+    path("<uuid:website_id>/traffic/countries/", traffic_views.TrafficCountriesView.as_view(), name="wa-traffic-countries"),
+    path("<uuid:website_id>/ai-traffic/", traffic_views.AiTrafficView.as_view(), name="wa-ai-traffic"),
 ]

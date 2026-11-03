@@ -629,6 +629,31 @@ SERPAPI_COST_PER_SEARCH_USD = env.float("SERPAPI_COST_PER_SEARCH_USD", default=0
 # ScraperAPI bills credits from a monthly allowance: set your plan's dollar
 # cost per Google search to record it (0 records nothing, as on the free plan).
 SCRAPERAPI_COST_PER_SEARCH_USD = env.float("SCRAPERAPI_COST_PER_SEARCH_USD", default=0.0)
+# Countries the ScraperAPI plan can search from: ISO codes ("us", the
+# default, works on every plan) or "all" on plans with country targeting.
+# Other countries search from the US with Google's country setting.
+SCRAPERAPI_GEO_COUNTRIES = env("SCRAPERAPI_GEO_COUNTRIES", default="us")
+# API credits per structured Google request (ScraperAPI docs).
+SCRAPERAPI_CREDITS_PER_SEARCH = env.int("SCRAPERAPI_CREDITS_PER_SEARCH", default=25)
+
+# Country checks: Google and the AI engines for tracked prompts in several
+# countries, run on demand after the user confirms the estimate.
+COUNTRY_CHECKS_ENABLED = env.bool("COUNTRY_CHECKS_ENABLED", default=True)
+COUNTRY_CHECK_MAX_COUNTRIES = env.int("COUNTRY_CHECK_MAX_COUNTRIES", default=5)
+COUNTRY_CHECK_MAX_PROMPTS = env.int("COUNTRY_CHECK_MAX_PROMPTS", default=10)
+# Google results pages per prompt and country.
+COUNTRY_CHECK_MAX_PAGES = env.int("COUNTRY_CHECK_MAX_PAGES", default=2)
+COUNTRY_CHECK_MAX_GOOGLE_PAGES = env.int("COUNTRY_CHECK_MAX_GOOGLE_PAGES", default=50)
+COUNTRY_CHECK_MAX_ENGINE_ANSWERS = env.int("COUNTRY_CHECK_MAX_ENGINE_ANSWERS", default=100)
+# Google pages per website per UTC day.
+COUNTRY_CHECK_DAILY_GOOGLE_PAGES = env.int("COUNTRY_CHECK_DAILY_GOOGLE_PAGES", default=100)
+COUNTRY_CHECK_SERP_CONCURRENCY = env.int("COUNTRY_CHECK_SERP_CONCURRENCY", default=2)
+COUNTRY_CHECK_ENGINE_CONCURRENCY = env.int("COUNTRY_CHECK_ENGINE_CONCURRENCY", default=3)
+# auto | celery | thread | inline. auto runs one Celery task per country on
+# the integrations queue, or a background thread when Celery runs eagerly.
+COUNTRY_CHECK_RUN_MODE = env("COUNTRY_CHECK_RUN_MODE", default="auto")
+# A queued or running check with no heartbeat for this long is interrupted.
+COUNTRY_CHECK_STALE_MINUTES = env.int("COUNTRY_CHECK_STALE_MINUTES", default=20)
 
 # ── SMS (Twilio) ───────────────────────────────────────────────────────
 # The most intrusive channel in the product, so it is off by default and

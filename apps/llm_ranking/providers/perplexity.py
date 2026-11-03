@@ -67,4 +67,6 @@ class PerplexityProvider(LLMProvider):
             output_tokens=int(usage.get("completion_tokens", 0)),
             raw=body,
             citations=citations,
+            # Sonar lists its sources only when it searched the web.
+            searched=bool(citations),
         )

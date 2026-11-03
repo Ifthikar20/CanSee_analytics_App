@@ -64,6 +64,7 @@ class OpenAIProvider(LLMProvider):
         as a second attempt for accounts/models still on the preview alias.
         """
         from apps.llm_ranking.providers.openai_compat import (
+            _get,
             extract_responses_citations,
         )
         from apps.llm_ranking.services.regions import get_region
@@ -99,4 +100,8 @@ class OpenAIProvider(LLMProvider):
             input_tokens=getattr(usage, "input_tokens", 0) if usage else 0,
             output_tokens=getattr(usage, "output_tokens", 0) if usage else 0,
             citations=extract_responses_citations(resp),
+            searched=any(
+                _get(item, "type") == "web_search_call"
+                for item in (_get(resp, "output", None) or [])
+            ),
         )

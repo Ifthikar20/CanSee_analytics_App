@@ -383,6 +383,11 @@ def build_prompt_detail(website, brand_prompt) -> dict:
 
     check = _latest_checks(website, [brand_prompt]).get(brand_prompt.id)
     google = _google(check)
+    # How a Google check for this prompt's location runs now.
+    plan = serp_google.geo_plan(brand_prompt.location or "")
+    google["method"] = (
+        {"method": plan["method"], "label": plan["label"]} if serp_google.is_configured() else None
+    )
     google["top_results"] = [
         {
             **r,

@@ -192,13 +192,13 @@ class TaskReporter:
                 self._attempt += 1
 
     def record_capture(self, kind: str, capture_id: str, capture: dict) -> bool:
-        """research.recorded for a capture this task took (dropped once the
-        task finished, so a late capture never follows task.finished).
-        True when it was recorded."""
+        """research.recorded, naming this task, for a capture this task took
+        (dropped once the task finished, so a late capture never follows
+        task.finished). True when it was recorded."""
         with self._lock:
             if self.closed:
                 return False
-            self.emitter.record_capture(kind, capture_id, capture)
+            self.emitter.record_capture(kind, capture_id, capture, task_id=self.task_id)
             return True
 
     def finished(self, status: str, *, result: str = "", tone: str | None = None,

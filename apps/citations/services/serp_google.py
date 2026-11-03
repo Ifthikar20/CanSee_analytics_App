@@ -24,7 +24,15 @@ Returns::
      "related_searches": [str],
      "ai_overview": {"text": str, "references": [{url, domain, title}]},
      "ai_overview_deferred": bool,     # shown, but its content was not read
-     "knowledge_graph": {"title", "type", "website", "description", "thumbnail"}}
+     "knowledge_graph": {"title", "type", "website", "description", "thumbnail"},
+     "geo": {"country", "method", "proxy_country", "label"} | None}
+
+Country targeting (``geo_plan``): Google's own country code for the United
+Kingdom is ``uk``, not ISO's ``gb``, for both SerpAPI ``gl`` and ScraperAPI
+``country_code``. ScraperAPI connects from the country only when the plan
+supports it (SCRAPERAPI_GEO_COUNTRIES); otherwise it connects from the US
+and sets Google's country (``gl``). SerpAPI always sets ``gl`` and the
+country's Google domain.
 """
 
 from __future__ import annotations
@@ -64,6 +72,40 @@ MAX_QUESTIONS = 8
 MAX_RELATED = 8
 MAX_AI_REFERENCES = 10
 
+# ISO 3166-1 -> Google's gl and ScraperAPI's country_code, where they differ.
+GOOGLE_COUNTRY = {"gb": "uk"}
+# ISO form of ScraperAPI's documented country list (its "uk" is ISO "gb").
+SCRAPERAPI_COUNTRIES = frozenset("""
+    us au ae ar at bd be bg br ca ch cl cn co cy cz de dk ec ee eg es fi fr gb gr hk hr hu id ie
+    il in is it jo jp ke kr li lt lv mt mx my ng nl no nz pa pe ph pk pl pt ro ru sa se sg si sk
+    th tr tw ua ve vn za
+""".split())
+# Google domains ScraperAPI documents a ``tld`` for. A foreign domain needs
+# both tld and country_code, so it is only sent when connecting from there.
+SCRAPERAPI_TLDS = {
+    "gb": "co.uk", "ca": "ca", "de": "de", "es": "es", "fr": "fr", "it": "it", "jp": "co.jp",
+    "in": "in", "cn": "cn", "sg": "com.sg", "mx": "com.mx", "ae": "ae", "br": "com.br", "nl": "nl",
+    "au": "com.au", "tr": "com.tr", "sa": "sa", "se": "se", "pl": "pl",
+}
+# SerpAPI google_domain per country (google.com, the default, is left out).
+GOOGLE_DOMAINS = {
+    "gb": "google.co.uk", "ca": "google.ca", "au": "google.com.au", "de": "google.de",
+    "fr": "google.fr", "es": "google.es", "it": "google.it", "nl": "google.nl", "se": "google.se",
+    "pl": "google.pl", "in": "google.co.in", "jp": "google.co.jp", "br": "google.com.br",
+    "mx": "google.com.mx", "sg": "google.com.sg", "ae": "google.ae", "sa": "google.com.sa",
+    "tr": "google.com.tr", "ie": "google.ie", "nz": "google.co.nz", "za": "google.co.za",
+    "ch": "google.ch", "at": "google.at", "be": "google.be", "pt": "google.pt", "no": "google.no",
+    "dk": "google.dk", "fi": "google.fi", "ar": "google.com.ar", "cl": "google.cl",
+    "co": "google.com.co", "pe": "google.com.pe", "kr": "google.co.kr", "tw": "google.com.tw",
+    "hk": "google.com.hk", "id": "google.co.id", "ph": "google.com.ph", "my": "google.com.my",
+    "th": "google.co.th", "vn": "google.com.vn", "il": "google.co.il", "gr": "google.gr",
+    "cz": "google.cz", "ro": "google.ro", "hu": "google.hu", "ua": "google.com.ua",
+    "eg": "google.com.eg", "ng": "google.com.ng", "ke": "google.co.ke", "pk": "google.com.pk",
+    "bd": "google.com.bd",
+}
+# How a search was localized (contract section 1c).
+METHOD_PROXY, METHOD_GOOGLE_SETTING, METHOD_DEFAULT = "proxy", "google_setting", "default"
+
 
 def provider() -> str:
     """The Google results provider in use, or "" when neither has a key.
@@ -89,18 +131,112 @@ def is_configured() -> bool:
     return bool(provider())
 
 
-def cost_per_search_usd() -> Decimal:
-    """What one search costs with the provider in use (0 when none is set)."""
+def _provider_in_use() -> str:
+    # geo_plan's ``provider`` argument shadows the function inside it.
+    return provider()
+
+
+def cost_per_search_usd(which: str | None = None) -> Decimal:
+    """What one search costs with ``which`` provider, by default the one in
+    use (0 when none is set)."""
     setting = {
         PROVIDER_SERPAPI: "SERPAPI_COST_PER_SEARCH_USD",
         PROVIDER_SCRAPERAPI: "SCRAPERAPI_COST_PER_SEARCH_USD",
-    }.get(provider())
+    }.get(provider() if which is None else which)
     if not setting:
         return Decimal("0")
     return Decimal(str(getattr(settings, setting, 0) or 0))
 
 
-def _empty(error: str = "", configured: bool = True, provider: str = "") -> dict:
+# -- country targeting --------------------------------------------------------
+
+
+def iso_country(code) -> str:
+    """Lower-case ISO-2 code for a country, "" for global, empty or invalid.
+
+    Accepts any case and spacing ("GB", " gb ") and Google's "uk".
+    """
+    value = str(code or "").strip().lower()
+    if len(value) != 2 or not (value.isascii() and value.isalpha()):
+        return ""
+    return "gb" if value == "uk" else value
+
+
+def google_code(iso: str) -> str:
+    """Google's gl (and ScraperAPI's country_code) for an ISO code."""
+    return GOOGLE_COUNTRY.get(iso, iso)
+
+
+def scraperapi_geo_countries() -> frozenset:
+    """Countries the ScraperAPI plan can connect from.
+
+    SCRAPERAPI_GEO_COUNTRIES is "all" (plans with country targeting) or a
+    comma or space separated list. The US is always included: every plan
+    searches from the US, which is how the default search has always run.
+    """
+    raw = str(getattr(settings, "SCRAPERAPI_GEO_COUNTRIES", "us") or "").strip().lower()
+    if raw == "all":
+        return SCRAPERAPI_COUNTRIES
+    codes = {iso_country(part) for part in raw.replace(",", " ").split()}
+    return frozenset((codes & SCRAPERAPI_COUNTRIES) | {"us"})
+
+
+def geo_label(method: str, country: str, provider: str) -> str:
+    """How a Google search was localized, in words (contract section 1c)."""
+    cc = (country or "").upper()
+    scraper = provider == PROVIDER_SCRAPERAPI
+    if method == METHOD_PROXY:
+        return f"Searched from {cc}"
+    if method == METHOD_GOOGLE_SETTING:
+        return f"Google set to {cc}, US connection" if scraper else f"Google set to {cc}"
+    return "Searched from US (default)" if scraper else "Google default (US)"
+
+
+def geo_plan(country: str, provider: str | None = None) -> dict:
+    """How a search for ``country`` runs with ``provider`` (default: the one
+    in use): ``{country, method, proxy_country, params, label}``.
+
+    ``params`` are the provider's request parameters for the country and
+    ``proxy_country`` the ISO code the request connects from ("" when the
+    provider does not say, as with SerpAPI).
+    """
+    which = _provider_in_use() if provider is None else provider
+    iso = iso_country(country)
+    if which == PROVIDER_SCRAPERAPI:
+        if not iso:
+            method, proxy_country, params = METHOD_DEFAULT, "us", {"country_code": "us"}
+        elif iso in scraperapi_geo_countries():
+            method, proxy_country = METHOD_PROXY, iso
+            params = {"country_code": google_code(iso)}
+            if iso != "us":
+                params["gl"] = google_code(iso)
+                if iso in SCRAPERAPI_TLDS:
+                    params["tld"] = SCRAPERAPI_TLDS[iso]
+        else:
+            method, proxy_country = METHOD_GOOGLE_SETTING, "us"
+            params = {"country_code": "us", "gl": google_code(iso)}
+    elif not iso:
+        method, proxy_country, params = METHOD_DEFAULT, "", {}
+    else:
+        method, proxy_country = METHOD_GOOGLE_SETTING, ""
+        params = {"gl": google_code(iso)}
+        if iso in GOOGLE_DOMAINS:
+            params["google_domain"] = GOOGLE_DOMAINS[iso]
+    return {
+        "country": iso,
+        "method": method,
+        "proxy_country": proxy_country,
+        "params": params,
+        "label": geo_label(method, iso, which),
+    }
+
+
+def _geo(plan: dict) -> dict:
+    return {key: plan[key] for key in ("country", "method", "proxy_country", "label")}
+
+
+def _empty(error: str = "", configured: bool = True, provider: str = "",
+           geo: dict | None = None) -> dict:
     return {
         "configured": configured,
         "provider": provider,
@@ -112,6 +248,7 @@ def _empty(error: str = "", configured: bool = True, provider: str = "") -> dict
         "ai_overview": {},
         "ai_overview_deferred": False,
         "knowledge_graph": {},
+        "geo": geo,
     }
 
 
@@ -166,6 +303,7 @@ def search(
     start: int = 0,
     gl: str = "",
     hl: str = "",
+    country: str | None = None,
 ) -> dict:
     """Run one Google search and parse every block we use.
 
@@ -173,9 +311,11 @@ def search(
     back in the same shape, with ``provider`` naming the one used. A
     ``timeout`` of None means the provider's own default. ``start`` pages
     through results (Google serves 10 per page since it
-    stopped honouring ``num=100``); ``gl``/``hl`` set the country and
-    interface language. Brand Research uses none of them: one first-page
-    call. The search-gap rank check walks pages until it finds the site.
+    stopped honouring ``num=100``); ``hl`` sets the interface language
+    (SerpAPI only). ``country`` (ISO-2, "" for global) decides how the search
+    is localized (``geo_plan``); without it ``gl`` does, read as an ISO code.
+    Brand Research uses none of them: one first-page call. The search-gap
+    rank check walks pages until it finds the site.
 
     Never raises. An unconfigured key, a network error, a non-200 or a
     non-JSON body all come back as an empty payload with ``error`` set.
@@ -186,11 +326,13 @@ def search(
     which = provider()
     if not which:
         return _empty("serpapi_not_configured", configured=False)
+    plan = geo_plan(gl if country is None else country, which)
+    geo = _geo(plan)
 
     try:
         import requests
     except ImportError:  # pragma: no cover - requests is a hard dependency
-        return _empty("requests_unavailable", provider=which)
+        return _empty("requests_unavailable", provider=which, geo=geo)
 
     if which == PROVIDER_SCRAPERAPI:
         endpoint, key = SCRAPERAPI_ENDPOINT, settings.SCRAPERAPI_KEY
@@ -202,7 +344,7 @@ def search(
         params = {
             "api_key": key,
             "query": query[:500],
-            "country_code": (gl or "us").strip().lower()[:2],
+            **plan["params"],
         }
         timeout = SCRAPERAPI_TIMEOUT if timeout is None else timeout
     else:
@@ -212,9 +354,8 @@ def search(
             "engine": "google",
             "num": str(max(5, min(int(max_results), MAX_ORGANIC))),
             "api_key": key,
+            **plan["params"],
         }
-        if gl:
-            params["gl"] = gl.strip().lower()[:2]
         if hl:
             params["hl"] = hl.strip().lower()[:5]
         timeout = TIMEOUT if timeout is None else timeout
@@ -226,20 +367,20 @@ def search(
     except Exception as exc:
         logger.warning("serp_google (%s) network error for %r: %s",
                        which, query, _redacted(exc, key))
-        return _empty("network", provider=which)
+        return _empty("network", provider=which, geo=geo)
 
     if resp.status_code != 200:
         logger.warning("serp_google (%s) %r -> HTTP %s", which, query, resp.status_code)
-        return _empty(f"http_{resp.status_code}", provider=which)
+        return _empty(f"http_{resp.status_code}", provider=which, geo=geo)
 
     try:
         data = resp.json()
     except Exception:
         logger.warning("serp_google (%s) %r -> non-JSON body", which, query)
-        return _empty("decode", provider=which)
+        return _empty("decode", provider=which, geo=geo)
 
     if not isinstance(data, dict):
-        return _empty("decode", provider=which)
+        return _empty("decode", provider=which, geo=geo)
 
     # Google's first page for a real query always lists results. An empty one
     # means the provider failed to read the page (a block or a layout it could
@@ -248,9 +389,9 @@ def search(
     # out of results.
     if not start and not data.get("organic_results"):
         logger.warning("serp_google (%s) %r -> empty first page", which, query)
-        return _empty("empty_results", provider=which)
+        return _empty("empty_results", provider=which, geo=geo)
 
-    payload = _empty(provider=which)
+    payload = _empty(provider=which, geo=geo)
     payload["organic"] = _parse_organic(
         data, max_results, start=start, page_relative=which == PROVIDER_SCRAPERAPI,
     )

@@ -153,6 +153,7 @@ class ClaudeProvider(LLMProvider):
             output_tokens=usage.output_tokens,
             citations=citations,
             web_search_requests=searches,
+            searched=searches > 0,
         )
 
 

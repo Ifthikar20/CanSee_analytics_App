@@ -1,6 +1,6 @@
 from django.urls import path
 
-from . import views
+from . import dashboard_views, views
 
 urlpatterns = [
     path("<uuid:website_id>/audits/", views.LLMRankingAuditListView.as_view(), name="llm-ranking-list"),
@@ -32,5 +32,10 @@ urlpatterns = [
         "<uuid:website_id>/dashboard-summary/",
         views.DashboardSummaryView.as_view(),
         name="llm-ranking-dashboard-summary",
+    ),
+    path(
+        "<uuid:website_id>/visibility-dashboard/",
+        dashboard_views.VisibilityDashboardView.as_view(),
+        name="llm-ranking-visibility-dashboard",
     ),
 ]

@@ -121,17 +121,20 @@ class RunEmitter:
             self.research["gaps"] = gaps
             self._dirty = True
 
-    def record_capture(self, kind: str, capture_id: str, capture: dict) -> None:
+    def record_capture(self, kind: str, capture_id: str, capture: dict, *,
+                       task_id: str | None = None) -> None:
         """A capture the research swarm took: the research store (persisted at
         the next checkpoint) and research.recorded for live clients. kind is
-        "serp" or "page"; page captures are stored without their reader."""
+        "serp" or "page"; page captures are stored without their reader.
+        task_id is the swarm task that took it (None when no task did); the
+        client orders the Google tabs it opens by it."""
         clean = strip_nul({k: copy.deepcopy(v) for k, v in capture.items() if k != "reader"})
         with self._lock:
             bucket = "serp" if kind == "serp" else "pages"
             self.research.setdefault(bucket, {})[capture_id] = clean
             self._dirty = True
             self.emit_before_end(EventType.RESEARCH_RECORDED, kind=kind, capture_id=capture_id,
-                                 capture=copy.deepcopy(clean))
+                                 capture=copy.deepcopy(clean), task_id=task_id)
 
     def research_copy(self) -> dict:
         """A deep copy of the research store, taken under the lock (tasks

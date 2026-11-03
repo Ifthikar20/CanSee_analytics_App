@@ -84,6 +84,9 @@ class ProviderResult:
     # Server-side web searches the upstream ran and bills per search
     # (Anthropic's web_search tool); priced into the recorded cost.
     web_search_requests: int = 0
+    # True when the answer came from a web search that carried the user's
+    # location (the region passed to query()).
+    searched: bool = False
 
     @property
     def total_tokens(self) -> int:
