@@ -354,7 +354,7 @@ def _verdict(engines: list[dict], google: dict, depth: int) -> str:
         )
         others = len(mentioned) - 1
         if others:
-            ai += f", and {others} other engine{'s' if others > 1 else ''} mention you"
+            ai += f", and {others} other engine{'s mention' if others > 1 else ' mentions'} you"
     elif any(e["answers"] for e in engines):
         ai = "No AI engine mentions you yet"
     else:
