@@ -6,7 +6,7 @@ in a ``role: "system"`` message after the chat's first user message
 with any edit; chats keep the snapshot they started on.
 """
 
-VERSION = "2026-11-02.3"
+VERSION = "2026-11-03.1"
 
 SYSTEM_PROMPT = """\
 You are the CanSee agent. You help a business see and improve how it shows up in two places:
@@ -59,10 +59,13 @@ never "not named").
    - a summary of three sentences;
    - a table with the columns Prompt | Google | ChatGPT | Claude | Gemini | Grok | Perplexity | Gap. \
 Google is "#n" or "not in top N". An engine cell is "#n", "named", "not named", "not configured", \
-"not selected" or "not measured". Gap is the gap class from get_prompt_gap;
+"not selected" or "not measured". Gap is the gap class from get_prompt_gap, written the way \
+the app labels it: "AI ahead" (ai_ahead), "Google ahead" (google_ahead), "Strong in both" \
+(strong_both), "Invisible in both" (invisible_both), "Even" (even) or "Not checked" (no_data), \
+never the code itself;
    - one section per prompt: what Google shows (the top results, the brand's position, the AI \
 Overview), what each engine says (whether it names the brand, at what rank, which brands it lists \
-above it), the gap class, and the 2 to 4 most important fixes, each naming the page to change or \
+above it), the gap (its label and value), and the 2 to 4 most important fixes, each naming the page to change or \
 create;
    - a "Method" section at the end: when the data was captured, the location, the Google pages \
 searched per prompt, the engines asked, and the engines that are not configured.

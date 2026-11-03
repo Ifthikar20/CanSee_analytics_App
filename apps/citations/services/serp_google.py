@@ -195,10 +195,15 @@ def search(
     if which == PROVIDER_SCRAPERAPI:
         endpoint, key = SCRAPERAPI_ENDPOINT, settings.SCRAPERAPI_KEY
         # The structured endpoint takes the country, not the interface
-        # language, and always returns one page of results.
-        params = {"api_key": key, "query": query[:500]}
-        if gl:
-            params["country_code"] = gl.strip().lower()[:2]
+        # language, and always returns one page of results. Without a
+        # country ScraperAPI picks a proxy anywhere, and Google then answers
+        # for that country and language (dates came back in Bengali), so
+        # "global" searches as the US, as SerpAPI does by default.
+        params = {
+            "api_key": key,
+            "query": query[:500],
+            "country_code": (gl or "us").strip().lower()[:2],
+        }
         timeout = SCRAPERAPI_TIMEOUT if timeout is None else timeout
     else:
         endpoint, key = SEARCH_ENDPOINT, settings.SERPAPI_KEY
