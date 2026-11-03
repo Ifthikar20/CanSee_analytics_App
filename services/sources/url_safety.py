@@ -105,7 +105,9 @@ def assert_url_safe(url: str, *, allowed_ports: tuple[int, ...] | None = None) -
     # records and we treat the URL as unsafe if ANY is private.
     addresses = _resolve_addresses(hostname)
     if not addresses:
-        raise UnsafeURLError(f"Could not resolve hostname '{hostname}'.")
+        raise UnsafeURLError(
+            f"We couldn't find a website at {hostname}. Check the address and try again."
+        )
     for ip in addresses:
         if not _is_public_address(ip):
             raise UnsafeURLError(
