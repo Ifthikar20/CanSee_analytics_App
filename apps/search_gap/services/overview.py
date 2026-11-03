@@ -29,8 +29,11 @@ from apps.search_gap.services.scoring import (
     Answer,
     ai_score,
     classify,
+    classify_range,
     overall,
+    overall_range,
     search_score,
+    search_score_ceiling,
 )
 
 # Display order on every screen.
@@ -100,6 +103,9 @@ def _google(check) -> dict:
         "url": check.url,
         "title": check.title,
         "score": search_score(check.position),
+        # Missed within the depth read: the real position is past it, so the
+        # score is a range up to this (0 when nothing past the depth scores).
+        "score_max": None if check.position else search_score_ceiling(check.depth),
     }
 
 
@@ -122,9 +128,18 @@ def _latest_checks(website, brand_prompts) -> dict:
 
 def _classify_engines(engines: list[dict], google: dict) -> dict:
     search = google["score"] if google["status"] == "ok" else None
-    for e in engines:
-        e["class"] = classify(e["score"], search)
-    gap = overall([e["score"] for e in engines], search)
+    search_max = google.get("score_max") if google["status"] == "ok" else None
+    if search_max:
+        # Not in the top {depth}: the Google side is a range, not a 0.
+        for e in engines:
+            e["class"] = classify_range(e["score"], search_max)
+        gap = overall_range([e["score"] for e in engines], search_max)
+    else:
+        for e in engines:
+            e["class"] = classify(e["score"], search)
+        gap = overall([e["score"] for e in engines], search)
+        gap.update({"search_score_max": None, "value_min": None,
+                    "definite": gap["value"] is not None})
     gap["by_engine"] = {e["key"]: e["class"] for e in engines}
     return gap
 
@@ -336,10 +351,23 @@ def build_overview(website) -> dict:
             "invisible_both": classes.get("invisible_both", 0),
             "even": classes.get("even", 0),
             "no_data": classes.get("no_data", 0),
+            # Checked on both sides, but the Google side is a range that
+            # spans two classes (for example not in the top 10).
+            "not_definite": sum(
+                1 for r in rows
+                if r["gap"]["search_score_max"] and r["gap"]["ai_score"] is not None
+                and not r["gap"]["definite"]
+            ),
         },
-        "prompts": sorted(rows, key=lambda r: -abs(r["gap"]["value"] or 0)),
+        "prompts": sorted(rows, key=lambda r: -abs(_gap_size(r["gap"]))),
         "leaderboard": _leaderboard(rows_latest, website.name),
     }
+
+
+def _gap_size(gap: dict) -> int:
+    if gap["value"] is not None:
+        return gap["value"]
+    return gap["value_min"] or 0
 
 
 def _verdict(engines: list[dict], google: dict, depth: int) -> str:
