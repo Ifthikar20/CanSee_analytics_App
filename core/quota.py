@@ -67,10 +67,25 @@ class DailyQuota:
         """
         Reserve ``n`` calls. Returns False (and does NOT increment) when
         the call would exceed the daily cap.
+
+        Atomic: callers on several threads or processes at once (country
+        check workers, research agents) each count, and never both take
+        the last call. A read-then-write would let them all read the same
+        count and write back one increment between them.
         """
         key = self._key(user_id)
-        used = int(cache.get(key) or 0)
-        if used + n > self.limit(user_id):
+        limit = self.limit(user_id)
+        cache.add(key, 0, timeout=_TTL_SECONDS)
+        try:
+            used = cache.incr(key, n)
+        except ValueError:
+            # The bucket expired between add() and incr().
+            cache.add(key, 0, timeout=_TTL_SECONDS)
+            used = cache.incr(key, n)
+        if used > limit:
+            try:
+                cache.decr(key, n)
+            except ValueError:
+                pass  # the bucket expired meanwhile: nothing to give back
             return False
-        cache.set(key, used + n, timeout=_TTL_SECONDS)
         return True

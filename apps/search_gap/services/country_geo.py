@@ -18,10 +18,7 @@ ENGINE_LABELS = {
     "chatgpt": "ChatGPT", "claude": "Claude", "gemini": "Gemini",
     "grok": "Grok", "perplexity": "Perplexity",
 }
-PROVIDER_LABELS = {
-    serp_google.PROVIDER_SERPAPI: "SerpAPI",
-    serp_google.PROVIDER_SCRAPERAPI: "ScraperAPI",
-}
+PROVIDER_LABELS = serp_google.PROVIDER_LABELS
 
 
 def provider_key(engine: str) -> str:

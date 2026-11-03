@@ -80,12 +80,16 @@ SCRAPERAPI_COUNTRIES = frozenset("""
     il in is it jo jp ke kr li lt lv mt mx my ng nl no nz pa pe ph pk pl pt ro ru sa se sg si sk
     th tr tw ua ve vn za
 """.split())
-# Google domains ScraperAPI documents a ``tld`` for. A foreign domain needs
+# The ``tld`` for the countries ScraperAPI lists one for, as Google's real
+# search domain (the same as GOOGLE_DOMAINS): ScraperAPI's list says "in" and
+# "sa", but google.in is not Google's India domain (searches there come back
+# 404, and a 404 is billed). China has no Google search domain (google.cn
+# sends searches to google.com.hk), so it gets none. A foreign domain needs
 # both tld and country_code, so it is only sent when connecting from there.
 SCRAPERAPI_TLDS = {
     "gb": "co.uk", "ca": "ca", "de": "de", "es": "es", "fr": "fr", "it": "it", "jp": "co.jp",
-    "in": "in", "cn": "cn", "sg": "com.sg", "mx": "com.mx", "ae": "ae", "br": "com.br", "nl": "nl",
-    "au": "com.au", "tr": "com.tr", "sa": "sa", "se": "se", "pl": "pl",
+    "in": "co.in", "sg": "com.sg", "mx": "com.mx", "ae": "ae", "br": "com.br", "nl": "nl",
+    "au": "com.au", "tr": "com.tr", "sa": "com.sa", "se": "se", "pl": "pl",
 }
 # SerpAPI google_domain per country (google.com, the default, is left out).
 GOOGLE_DOMAINS = {
@@ -134,6 +138,24 @@ def is_configured() -> bool:
 def _provider_in_use() -> str:
     # geo_plan's ``provider`` argument shadows the function inside it.
     return provider()
+
+
+# Results pages (10 results each) a provider reads reliably. ScraperAPI's
+# pages past the first are not Google's: live on 2026-11-03, page 2 of "best
+# note taking app for teams" (start=10, with or without hl/gl, and through
+# the generic endpoint or page 1's own next-page link alike) listed results
+# for the bare word "best", while Google's own page 2 stayed on topic. So
+# with ScraperAPI only page 1 (the top 10) is measured. SerpAPI pages
+# correctly.
+RELIABLE_PAGES = {PROVIDER_SERPAPI: 10, PROVIDER_SCRAPERAPI: 1}
+PROVIDER_LABELS = {PROVIDER_SERPAPI: "SerpAPI", PROVIDER_SCRAPERAPI: "ScraperAPI"}
+
+
+def max_reliable_pages(provider: str | None = None) -> int:
+    """How many results pages ``provider`` (default: the one in use) reads
+    reliably; a rank past them cannot be measured with it."""
+    which = _provider_in_use() if provider is None else provider
+    return RELIABLE_PAGES.get(which, RELIABLE_PAGES[PROVIDER_SERPAPI])
 
 
 def cost_per_search_usd(which: str | None = None) -> Decimal:

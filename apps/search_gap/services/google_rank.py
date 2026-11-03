@@ -3,8 +3,10 @@
 SerpAPI returns 10 organic results per call (Google stopped honouring
 ``num=100``), so a check pages through results until the site appears or
 ``SEARCH_GAP_MAX_DEPTH`` is reached. A page-one rank costs one call; "not
-in the top 100" costs ten. Recent checks are reused and each website has
-a rolling daily cap, so the bill stays bounded.
+in the top 100" costs ten. ScraperAPI is read on page one only (its later
+pages are not Google's; serp_google.max_reliable_pages), so with it a miss
+is "not in the top 10". Recent checks are reused and each website has a
+rolling daily cap, so the bill stays bounded.
 """
 
 from __future__ import annotations
@@ -53,29 +55,45 @@ def locale(location: str) -> tuple[str, str]:
     return (code if len(code) == 2 and code.isalpha() else "", "en")
 
 
+def max_depth() -> int:
+    """How deep a rank check searches with the provider in use:
+    SEARCH_GAP_MAX_DEPTH, but never past the pages the provider reads
+    reliably (ScraperAPI: the top 10)."""
+    return min(int(settings.SEARCH_GAP_MAX_DEPTH),
+               serp_google.max_reliable_pages() * PAGE_SIZE)
+
+
 def find_rank(query: str, apex: str, *, max_depth: int = 100, gl: str = "", hl: str = "",
               search=serp_google.search) -> dict:
     """Walk Google's organic results until ``apex`` appears.
 
     Returns ``{position, url, title, top_results, ai_overview,
-    ai_overview_deferred, pages_fetched, error}``. ``pages_fetched`` counts
-    successful (billed) calls only. ``ai_overview_deferred``: page one showed
-    an AI Overview whose content was not read. ``search`` is injectable so
-    tests never hit the network.
+    ai_overview_deferred, pages_fetched, depth, error}``. ``pages_fetched``
+    counts successful (billed) calls only. ``depth`` is how deep the search
+    really looked: ``max_depth``, capped at the pages the provider reads
+    reliably, or only the pages read when a later page failed.
+    ``ai_overview_deferred``: page one showed an AI Overview whose content
+    was not read. ``search`` is injectable so tests never hit the network.
     """
+    pages = max(1, math.ceil(max(1, int(max_depth)) / PAGE_SIZE))
+    # Never past the pages the provider reads reliably: ScraperAPI's later
+    # pages answer a different query, so a rank or a miss there is not real.
+    pages = min(pages, serp_google.max_reliable_pages())
     out = {
         "position": None, "url": "", "title": "", "top_results": [],
-        "ai_overview": {}, "ai_overview_deferred": False, "pages_fetched": 0, "error": "",
+        "ai_overview": {}, "ai_overview_deferred": False, "pages_fetched": 0,
+        "depth": pages * PAGE_SIZE, "error": "",
     }
-    pages = max(1, math.ceil(max(1, int(max_depth)) / PAGE_SIZE))
     for page in range(pages):
         start = page * PAGE_SIZE
         payload = search(query, max_results=PAGE_SIZE, start=start, gl=gl, hl=hl)
         if payload.get("error"):
-            # A failure past page one keeps what was learned; on page one
-            # there is nothing to keep.
+            # A failure past page one keeps what was learned (searched only
+            # as deep as the pages read); on page one there is nothing to keep.
             if page == 0:
                 out["error"] = payload["error"]
+            else:
+                out["depth"] = page * PAGE_SIZE
             break
         out["pages_fetched"] += 1
         if page == 0:
@@ -160,8 +178,7 @@ def check(brand_prompt, *, force: bool = False, now=None):
     query = brand_prompt.prompt.text.strip()
     gl, hl = locale(brand_prompt.location)
     apex = site_apex(website.url)
-    depth = settings.SEARCH_GAP_MAX_DEPTH
-    found = find_rank(query, apex, max_depth=depth, gl=gl, hl=hl)
+    found = find_rank(query, apex, max_depth=settings.SEARCH_GAP_MAX_DEPTH, gl=gl, hl=hl)
     if found["error"]:
         logger.warning("search_gap: Google check failed for %r: %s", query, found["error"])
 
@@ -171,7 +188,8 @@ def check(brand_prompt, *, force: bool = False, now=None):
         brand_prompt=brand_prompt,
         query=query[:500],
         location=brand_prompt.location or "",
-        depth=depth,
+        # How deep it really looked ("Not in top 10" with ScraperAPI).
+        depth=found.get("depth") or max_depth(),
         position=found["position"],
         url=found["url"][:2000],
         title=found["title"][:500],

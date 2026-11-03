@@ -188,9 +188,15 @@ def _spec(task_id: str, category: str, prompt_key: str, worker: str, label: str,
 
 
 def build_expansion(website, prompts: list[ResolvedPrompt], options: PlanOptions, *,
-                    engines: list[dict], serp_configured: bool, now_iso: str) -> Expansion:
+                    engines: list[dict], serp_configured: bool, now_iso: str,
+                    serp_pages: int | None = None) -> Expansion:
     """The plan, categories and task specs for ``prompts`` (algorithm in
-    design section 6a). ``engines`` is research.engine_catalog()."""
+    design section 6a). ``engines`` is research.engine_catalog().
+    ``serp_pages`` is how many Google results pages the provider reads
+    reliably (serp_google.max_reliable_pages; ScraperAPI: 1): no page past
+    it is planned."""
+    google_pages = options.google_pages if serp_pages is None else min(options.google_pages,
+                                                                       serp_pages)
     catalog = {e["key"]: e for e in engines}
     order = [e["key"] for e in engines]
     wanted = [k for k in order if options.engines is None or k in set(options.engines)]
@@ -213,7 +219,7 @@ def build_expansion(website, prompts: list[ResolvedPrompt], options: PlanOptions
         key = prompt.key
         google_ids: list[str] = []
         if serp_configured:
-            for page in range(1, options.google_pages + 1):
+            for page in range(1, google_pages + 1):
                 task_id = f"google.{key}.page{page}"
                 google_ids.append(task_id)
                 tasks.append(_spec(task_id, SwarmCategory.GOOGLE.value, key, WorkerType.SERP_PAGE,
@@ -322,7 +328,7 @@ def build_expansion(website, prompts: list[ResolvedPrompt], options: PlanOptions
             }
             for p in prompts
         ],
-        "google_pages": options.google_pages,
+        "google_pages": google_pages,
         "engines": list(options.engines) if options.engines else None,
         "competitor_pages": options.competitor_pages,
         "competitors": prefer,

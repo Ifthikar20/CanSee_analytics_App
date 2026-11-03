@@ -34,7 +34,6 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 
-from django.conf import settings
 from django.db import close_old_connections, connections
 from django.utils import timezone
 
@@ -382,6 +381,7 @@ def _record_rank_checks(run: SwarmRun, specs: list[dict]) -> dict[str, bool]:
     or 20 says nothing about the positions further down, as for
     google_search)."""
     from apps.agent.tools.research import PAGE_SIZE, _record_rank_check
+    from apps.search_gap.services.google_rank import max_depth
 
     ran = {s["id"] for s in specs}
     out: dict[str, bool] = {}
@@ -397,7 +397,7 @@ def _record_rank_checks(run: SwarmRun, specs: list[dict]) -> dict[str, bool]:
         positions = [p for c in captures for p in c.get("brand_positions") or []]
         exhausted = not captures[-1].get("results")
         definite = (positions or exhausted
-                    or PAGE_SIZE * len(captures) >= settings.SEARCH_GAP_MAX_DEPTH)
+                    or PAGE_SIZE * len(captures) >= max_depth())
         brand_prompt = run.brand_prompt(key) if definite else None
         if brand_prompt is None:
             out[key] = False

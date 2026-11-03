@@ -10,7 +10,6 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from datetime import timedelta
 
-from django.conf import settings
 from django.db.models import F, FloatField, Sum
 from django.utils import timezone
 
@@ -24,7 +23,7 @@ from apps.prompt_library.services.prompt_stats import (
     results_by_prompt,
 )
 from apps.search_gap.services import advice
-from apps.search_gap.services.google_rank import is_same_site, site_apex
+from apps.search_gap.services.google_rank import is_same_site, max_depth, site_apex
 from apps.search_gap.services.scoring import (
     ANSWER_WINDOW,
     Answer,
@@ -82,7 +81,8 @@ def _engine(provider: str, results: list, configured: bool) -> tuple[dict, objec
 
 
 def _google(check) -> dict:
-    depth = check.depth if check else settings.SEARCH_GAP_MAX_DEPTH
+    # Unchecked: the depth a check would search now (ScraperAPI: the top 10).
+    depth = check.depth if check else max_depth()
     base = {
         "status": "not_checked", "position": None, "page": None, "url": "",
         "title": "", "score": None, "checked_at": None, "depth": depth, "error": "",

@@ -175,6 +175,14 @@ def run(job: TaskJob) -> WorkerOutput:
 
     if not serp_google.is_configured():
         return skipped("not_configured", "Google results are not configured.")
+    reliable = serp_google.max_reliable_pages()
+    if page > reliable:
+        # A plan made before the cap (a re-run) may still hold this page.
+        return skipped("not_configured", (
+            f"Google results past page {reliable} are not reliable through "
+            f"{serp_google.PROVIDER_LABELS.get(serp_google.provider(), 'this provider')}, "
+            "so this page was not searched."
+        ))
     job.check()
     if not _serp_quota().consume(str(swarm_run.website.id)):
         return skipped("daily_limit", "This project used its daily Google search allowance.")

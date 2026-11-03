@@ -16,7 +16,6 @@ import uuid
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timedelta
 
-from django.conf import settings
 from django.db import close_old_connections, connections
 from django.db.models import Q
 from django.utils import timezone
@@ -200,13 +199,14 @@ def _record_rank_check(website, brand_prompt, *, query: str, location: str, page
     count the pages this search paid for."""
     from apps.citations.services import serp_google
     from apps.search_gap.models import GoogleRankCheck
+    from apps.search_gap.services.google_rank import max_depth
 
     first = pages[0]
     found = next((r for p in pages for r in p["results"] if r["is_yours"]), None)
     overview = first.get("ai_overview") or {}
     depth = len(pages) * PAGE_SIZE
     if exhausted and found is None:
-        depth = max(depth, settings.SEARCH_GAP_MAX_DEPTH)
+        depth = max(depth, max_depth())
     return GoogleRankCheck.objects.create(
         website=website,
         brand_prompt=brand_prompt,
@@ -352,7 +352,7 @@ def _fetch_page(ctx: ToolContext, *, query: str, page: int, location: str, gl: s
 def google_search(ctx: ToolContext, args) -> ToolResult:
     from apps.agent.tools.data import ai_overview_summary
     from apps.citations.services import serp_google
-    from apps.search_gap.services.google_rank import locale
+    from apps.search_gap.services.google_rank import locale, max_depth
 
     em = ctx.emitter
     brand_prompt, query = _search_target(ctx, args)
@@ -372,7 +372,10 @@ def google_search(ctx: ToolContext, args) -> ToolResult:
                         summary="Google search not configured")
 
     gl, hl = locale(location)
-    pages_wanted = min(args.pages, agent_conf().serp_max_pages)
+    pages_allowed = min(args.pages, agent_conf().serp_max_pages)
+    # Never past the pages the provider reads reliably (ScraperAPI: page 1).
+    reliable = serp_google.max_reliable_pages()
+    pages_wanted = min(pages_allowed, reliable)
     quota = _serp_quota()
     earlier = _recent_captures(ctx, query, location)
     captures: list[dict] = []
@@ -419,9 +422,9 @@ def google_search(ctx: ToolContext, args) -> ToolResult:
                 "Not saved as the prompt's Google rank: the prompt is tracked "
                 f"{_where(tracked_location)}, and this search ran {_where(location)}."
             )
-        elif positions or exhausted or searched >= settings.SEARCH_GAP_MAX_DEPTH:
+        elif positions or exhausted or searched >= max_depth():
             # Only a definite answer replaces the prompt's rank: a position
-            # found, or a miss over Google's full depth.
+            # found, or a miss over the full depth a check measures.
             check = _record_rank_check(ctx.website, brand_prompt, query=query,
                                        location=location, pages=captures, fetched=fetched,
                                        exhausted=exhausted)
@@ -430,8 +433,8 @@ def google_search(ctx: ToolContext, args) -> ToolResult:
             rank_note = (
                 "Not saved as the prompt's Google rank: the brand is not in the top "
                 f"{searched}, and a miss there says nothing about positions "
-                f"{searched + 1}-{settings.SEARCH_GAP_MAX_DEPTH}. The full "
-                f"top-{settings.SEARCH_GAP_MAX_DEPTH} check runs from the prompt page or on "
+                f"{searched + 1}-{max_depth()}. The full "
+                f"top-{max_depth()} check runs from the prompt page or on "
                 "its schedule."
             )
 
@@ -470,6 +473,13 @@ def google_search(ctx: ToolContext, args) -> ToolResult:
                      "shown again without a new search.")
     if args.prompt_id is not None and args.query and query_key(args.query) != query_key(query):
         notes.append("Searched the tracked prompt's own text; the query given was not used.")
+    if reliable < pages_allowed:
+        notes.append(
+            f"Only the top {reliable * PAGE_SIZE} were searched: Google results past page "
+            f"{reliable} are not reliable through "
+            f"{serp_google.PROVIDER_LABELS.get(serp_google.provider(), 'this provider')}, so a "
+            "rank deeper than that cannot be measured."
+        )
     if stopped_reason == "daily_limit":
         notes.append("The daily Google search allowance ran out; later pages were not searched.")
     elif stopped_reason == "error":

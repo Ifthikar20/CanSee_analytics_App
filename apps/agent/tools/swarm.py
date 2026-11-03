@@ -120,7 +120,7 @@ def _check_size(ctx: ToolContext, expansion, args, engines: list[dict],
     wanted = set(args.engines) if args.engines else None
     asked = len([k for k in configured if wanted is None or k in wanted])
     fits = plan.max_prompts_for(
-        engines_per_prompt=asked, google_pages=args.google_pages,
+        engines_per_prompt=asked, google_pages=expansion.plan["google_pages"],
         competitor_pages=args.competitor_pages, content_gaps=args.content_gaps,
         citations=args.citations, serp_configured=serp_configured, max_tasks=max_tasks,
     )
@@ -284,6 +284,7 @@ def research_swarm(ctx: ToolContext, args) -> ToolResult:
         expansion = plan.build_expansion(
             ctx.website, prompts, _options(args, ctx.website), engines=engines,
             serp_configured=serp_configured, now_iso=now_iso(),
+            serp_pages=serp_google.max_reliable_pages(),
         )
         _check_size(ctx, expansion, args, engines, serp_configured)
         specs = expansion.tasks

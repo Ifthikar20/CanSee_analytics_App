@@ -20,7 +20,7 @@ import threading
 import time
 import uuid
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import timedelta
 from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal, InvalidOperation
@@ -126,7 +126,8 @@ def limits() -> dict:
     return {
         "max_countries": settings.COUNTRY_CHECK_MAX_COUNTRIES,
         "max_prompts": settings.COUNTRY_CHECK_MAX_PROMPTS,
-        "max_pages": settings.COUNTRY_CHECK_MAX_PAGES,
+        # Never past the pages the provider reads reliably (ScraperAPI: the top 10).
+        "max_pages": min(settings.COUNTRY_CHECK_MAX_PAGES, serp_google.max_reliable_pages()),
         "max_google_pages": settings.COUNTRY_CHECK_MAX_GOOGLE_PAGES,
         "max_engine_answers": settings.COUNTRY_CHECK_MAX_ENGINE_ANSWERS,
     }
@@ -307,7 +308,11 @@ def validate_request(website, data) -> CheckPlan:
         isinstance(google_pages, bool) or not isinstance(google_pages, int)
         or not 1 <= google_pages <= lim["max_pages"]
     ):
-        raise _invalid("google_pages", f"Choose 1 to {lim['max_pages']} Google results pages.")
+        if lim["max_pages"] == 1:
+            message = "Only the first Google results page (the top 10) can be checked."
+        else:
+            message = f"Choose 1 to {lim['max_pages']} Google results pages."
+        raise _invalid("google_pages", message)
 
     return CheckPlan(
         countries=countries,
@@ -332,10 +337,13 @@ def parse_confirm(data) -> dict:
         out[name] = value
     try:
         usd = Decimal(str(raw.get("ai_usd_max")))
+        if not usd.is_finite() or usd < 0:
+            raise ValueError
+        # The run keeps it at 4 places; a number too large for that is not
+        # an amount anyone confirmed.
+        usd4(usd)
     except (InvalidOperation, ValueError):
         raise _invalid("confirm", message) from None
-    if not usd.is_finite() or usd < 0:
-        raise _invalid("confirm", message)
     out["ai_usd_max"] = usd
     return out
 
@@ -768,18 +776,27 @@ def execute_country(run_id, country: str) -> None:
     else:
         serp_workers = max(1, int(settings.COUNTRY_CHECK_SERP_CONCURRENCY))
         engine_workers = max(1, int(settings.COUNTRY_CHECK_ENGINE_CONCURRENCY))
-        with (
-            ThreadPoolExecutor(max_workers=serp_workers) as serp_pool,
-            ThreadPoolExecutor(max_workers=engine_workers) as engine_pool,
-        ):
+        serp_pool = ThreadPoolExecutor(max_workers=serp_workers)
+        engine_pool = ThreadPoolExecutor(max_workers=engine_workers)
+        try:
             futures = [serp_pool.submit(_run_cell_in_thread, job, c) for c in google]
             futures += [engine_pool.submit(_run_cell_in_thread, job, c) for c in engines]
-            for future in futures:
-                try:
-                    future.result()
-                except Exception:
-                    # A cell left running is ended by the stale sweep.
-                    logger.exception("country check %s: a %s worker failed", run_id, country)
+            wait(futures)
+        except BaseException:
+            # Raised in this thread while it waited: Celery's soft time limit.
+            # No further cell starts and the caller ends the unfinished ones
+            # (time_out_country); waiting on every queued cell here would run
+            # into the hard limit, which kills the worker mid-run.
+            for pool in (serp_pool, engine_pool):
+                pool.shutdown(wait=False, cancel_futures=True)
+            raise
+        for pool in (serp_pool, engine_pool):
+            pool.shutdown()
+        for future in futures:
+            if future.exception() is not None:
+                # A cell left running is ended by the stale sweep.
+                logger.error("country check %s: a %s worker failed", run_id, country,
+                             exc_info=future.exception())
 
     _set_country_status(run_id, country, DONE)
     finalize_if_done(run_id)
@@ -818,7 +835,9 @@ def _run_cell(job: _Job, cell) -> None:
         logger.exception("country check %s: cell %s failed", job.run.id, cell.id)
         fields = _error_fields(FAILED, "internal_error")
     fields["finished_at"] = timezone.now()
-    CountryCheckResult.objects.filter(id=cell.id).update(**fields)
+    # Only over our own "running": a cell the stale sweep or a timed-out
+    # country already ended keeps that end, as the finished run reports it.
+    CountryCheckResult.objects.filter(id=cell.id, status=RUNNING).update(**fields)
     CountryCheckRun.objects.filter(id=job.run.id).update(heartbeat_at=timezone.now())
 
 
