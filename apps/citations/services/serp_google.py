@@ -241,6 +241,15 @@ def search(
     if not isinstance(data, dict):
         return _empty("decode", provider=which)
 
+    # Google's first page for a real query always lists results. An empty one
+    # means the provider failed to read the page (a block or a layout it could
+    # not parse); reading it as "no results" would claim the brand is not
+    # ranked when nothing was measured. A later page may be empty: Google ran
+    # out of results.
+    if not start and not data.get("organic_results"):
+        logger.warning("serp_google (%s) %r -> empty first page", which, query)
+        return _empty("empty_results", provider=which)
+
     payload = _empty(provider=which)
     payload["organic"] = _parse_organic(
         data, max_results, start=start, page_relative=which == PROVIDER_SCRAPERAPI,

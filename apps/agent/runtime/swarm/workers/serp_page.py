@@ -29,7 +29,9 @@ QUESTION_CHARS = 200
 REUSED_NOTE = (
     "Google pages this chat captured within the hour were shown again instead of searched again."
 )
-_RETRY_CODES = ("network", "http_429")
+# empty_results: the provider read an empty first page, which a second read
+# usually fixes.
+_RETRY_CODES = ("network", "http_429", "empty_results")
 
 
 def _retryable(code: str) -> bool:

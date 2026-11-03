@@ -44,6 +44,7 @@ SERP_ERRORS = {
     "network": "Google search could not be reached.",
     "decode": "Google search returned an unreadable response.",
     "empty_query": "The search query was empty.",
+    "empty_results": "Google's results page came back empty, so this search could not be read.",
 }
 DEFERRED_OVERVIEW_NOTE = (
     "Google loaded its AI Overview separately and its content was not read, so whether it "
