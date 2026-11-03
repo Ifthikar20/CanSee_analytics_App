@@ -7,7 +7,8 @@ sample can be replayed. Strategies:
 * ``stratified`` — equal slots per :class:`IntentBucket`, with overflow
   buckets back-filling under-quota buckets.
 * ``recent``     — newest active prompts first.
-* ``top_demand`` — highest demand_score first.
+* ``top_demand`` — highest source score first (the stored ranking score;
+  the strategy keeps its API name, there is no demand signal).
 """
 from __future__ import annotations
 

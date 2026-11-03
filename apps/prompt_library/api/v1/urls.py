@@ -159,22 +159,6 @@ urlpatterns = [
         views.BrandPromptDetailView.as_view(),
         name="prompt-library-brand-prompt-detail",
     ),
-    # ── Test environments ──────────────────────────────────────────
-    path(
-        "websites/<uuid:website_id>/test-environments/",
-        views.TestEnvironmentListView.as_view(),
-        name="prompt-library-test-environments",
-    ),
-    path(
-        "websites/<uuid:website_id>/test-environments/<uuid:env_id>/",
-        views.TestEnvironmentDetailView.as_view(),
-        name="prompt-library-test-environment-detail",
-    ),
-    path(
-        "websites/<uuid:website_id>/test-environments/<uuid:env_id>/prompts/",
-        views.TestEnvironmentPromptsView.as_view(),
-        name="prompt-library-test-environment-prompts",
-    ),
     # ── Benchmark packs (Prompts page → Benchmark material) ────────
     path(
         "websites/<uuid:website_id>/benchmarks/",

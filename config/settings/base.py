@@ -37,7 +37,6 @@ THIRD_PARTY_APPS = [
     "django_filters",
     "django_celery_beat",
     "django_celery_results",
-    "channels",
     "drf_spectacular",
     "django_structlog",
     "axes",
@@ -82,9 +81,6 @@ CITATION_EXTRACTION_ENABLED = True
 # the auto-extraction dispatched after Brand Input ingests.
 CLAIM_VERIFICATION_ENABLED = True
 BRAND_VAULT_EXTRACTION_ENABLED = True
-
-# Phase 4: Content Studio. Brief generation runs after each audit by default.
-CONTENT_STUDIO_BRIEF_GENERATION_ENABLED = True
 
 # Brand Security: deployment-wide kill switch for the LLM judge step on
 # nuanced detectors. Per-website opt-out lives on BrandSecurityConfig.
@@ -192,7 +188,6 @@ MIDDLEWARE = [
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
     "axes.middleware.AxesMiddleware",
-    "core.middleware.correlation.CorrelationMiddleware",
     "django_structlog.middlewares.RequestMiddleware",
 ]
 
@@ -201,7 +196,7 @@ ROOT_URLCONF = "config.urls"
 TEMPLATES = [
     {
         "BACKEND": "django.template.backends.django.DjangoTemplates",
-        "DIRS": [BASE_DIR / "templates"],
+        "DIRS": [],
         "APP_DIRS": True,
         "OPTIONS": {
             "context_processors": [
@@ -215,7 +210,6 @@ TEMPLATES = [
 ]
 
 WSGI_APPLICATION = "config.wsgi.application"
-ASGI_APPLICATION = "config.asgi.application"
 
 # ── DATABASE ──
 DATABASES = {
@@ -245,16 +239,6 @@ CACHES = {
         "KEY_PREFIX": "gp",
         "TIMEOUT": 300,
     }
-}
-
-# ── CHANNELS ──
-CHANNEL_LAYERS = {
-    "default": {
-        "BACKEND": "channels_redis.core.RedisChannelLayer",
-        "CONFIG": {
-            "hosts": [env("REDIS_URL", default="redis://localhost:6379/0")],
-        },
-    },
 }
 
 # ── CELERY ──
@@ -401,6 +385,8 @@ PROMPT_SYNTHESIS_PROVIDER = env(
     "PROMPT_SYNTHESIS_PROVIDER",
     default=("deepseek" if env("DEEPSEEK_API_KEY", default="") else "anthropic"),
 )
+# Google Programmable Search (Custom Search JSON API): competitor discovery
+# and run enrichment in apps.llm_ranking.
 GOOGLE_SEARCH_API_KEY = env("GOOGLE_SEARCH_API_KEY", default="")
 GOOGLE_SEARCH_ENGINE_ID = env("GOOGLE_SEARCH_ENGINE_ID", default="")
 # Master paywall switch. When False, authenticated users are never
@@ -410,11 +396,7 @@ GOOGLE_SEARCH_ENGINE_ID = env("GOOGLE_SEARCH_ENGINE_ID", default="")
 # on; no code change needed.
 PAYWALL_ENABLED = env.bool("PAYWALL_ENABLED", default=False)
 
-# ── Polar.sh usage metering (apps.metering) ──
-# Metering-first integration: every recorded AI call is mirrored to Polar
-# as an immutable `llm_usage` event via a transactional outbox. Billing
-# (checkout/subscriptions) stays on the existing Stripe code until the
-# Phase 2 cutover.
+# ── Internal admin ops API ──
 # Shared secret for the ftb-min admin server's internal ops API
 # (/api/v1/internal/admin/). Empty = the surface is disabled (all 404s).
 # Only the admin server may hold this; it must never reach a browser.
@@ -424,9 +406,12 @@ ADMIN_OPS_KEY = env("ADMIN_OPS_KEY", default="")
 # Production: exactly the admin server's address, e.g. ["10.0.1.7/32"].
 ADMIN_OPS_ALLOWED_CIDRS = env.list("ADMIN_OPS_ALLOWED_CIDRS", default=[])
 
+# ── Polar.sh billing and usage metering (apps.billing, apps.metering) ──
+# Every recorded AI call is mirrored to Polar as an immutable `llm_usage`
+# event via a transactional outbox; checkout and subscriptions run on
+# Polar too.
 POLAR_ACCESS_TOKEN = env("POLAR_ACCESS_TOKEN", default="")
 POLAR_ENVIRONMENT = env("POLAR_ENVIRONMENT", default="sandbox")  # sandbox | production
-POLAR_ORGANIZATION_ID = env("POLAR_ORGANIZATION_ID", default="")
 # Meter ids from the Polar dashboard (or `manage.py polar_bootstrap`).
 POLAR_METER_TOKENS_ID = env("POLAR_METER_TOKENS_ID", default="")
 POLAR_METER_SPEND_ID = env("POLAR_METER_SPEND_ID", default="")
@@ -491,6 +476,9 @@ ASSISTANT_MAINTENANCE_MESSAGE = env(
     "ASSISTANT_MAINTENANCE_MESSAGE",
     default="Ask Cansee is temporarily unavailable.",
 )
+# Ingest each completed prompt run into the assistant's knowledge base
+# (apps.assistant.tasks.ingest_audit_knowledge).
+ASSISTANT_KNOWLEDGE_INGEST_ENABLED = env.bool("ASSISTANT_KNOWLEDGE_INGEST_ENABLED", default=True)
 
 # ── RAG vector index (optional) ──
 # "python" (default): retriever.py scores every (user, website) chunk in
@@ -521,7 +509,6 @@ INTELLIGENCE_AUTH_TOKEN = env("INTELLIGENCE_AUTH_TOKEN", default="")
 SOURCES_SERVICE_URL = env("SOURCES_SERVICE_URL", default="")
 SOURCES_AUTH_TOKEN = env("SOURCES_AUTH_TOKEN", default="")
 
-SENDGRID_API_KEY = env("SENDGRID_API_KEY", default="")
 GOOGLE_OAUTH_CLIENT_ID = env("GOOGLE_OAUTH_CLIENT_ID", default="")
 GOOGLE_OAUTH_CLIENT_SECRET = env("GOOGLE_OAUTH_CLIENT_SECRET", default="")
 MICROSOFT_OAUTH_CLIENT_ID = env("MICROSOFT_OAUTH_CLIENT_ID", default="")
@@ -554,14 +541,6 @@ WORKOS_CLIENT_ID = env("WORKOS_CLIENT_ID", default="")
 # which is the SPA's origin.
 BACKEND_PUBLIC_URL = env("BACKEND_PUBLIC_URL", default="http://localhost:8000")
 SENTRY_DSN = env("SENTRY_DSN", default="")
-DATAFORSEO_LOGIN = env("DATAFORSEO_LOGIN", default="")
-DATAFORSEO_PASSWORD = env("DATAFORSEO_PASSWORD", default="")
-X_BEARER_TOKEN = env("X_BEARER_TOKEN", default="")  # X (Twitter) API for trending topics
-# Brand Security uses X_BEARER_TOKEN via TWITTER_BEARER_TOKEN alias so the
-# security clients read a single well-known env var. Feature-flagged so the
-# UI can render the X source toggle as "not configured" when disabled.
-TWITTER_BEARER_TOKEN = env("TWITTER_BEARER_TOKEN", default=X_BEARER_TOKEN)
-FEATURE_X_SCANNER = env.bool("FEATURE_X_SCANNER", default=False)
 SERPAPI_KEY = env("SERPAPI_KEY", default="")
 
 # ── Search vs AI gap (apps.search_gap) ─────────────────────────────────
@@ -596,17 +575,7 @@ BRAND_RESEARCH_COMMUNITY_ENABLED = env.bool("BRAND_RESEARCH_COMMUNITY_ENABLED", 
 # turn off under cost pressure. Off means the lane reports as skipped.
 BRAND_RESEARCH_ENGINES_ENABLED = env.bool("BRAND_RESEARCH_ENGINES_ENABLED", default=True)
 
-# ── OpenClaw AI Agent ──
-OPENCLAW_GATEWAY_URL = env("OPENCLAW_GATEWAY_URL", default="")
-OPENCLAW_AUTH_TOKEN = env("OPENCLAW_AUTH_TOKEN", default="")
-
-# ── INTEGRATION CREDENTIALS ──
-# Managed centrally via core.integrations.registry — setting names referenced there.
-HUBSPOT_CLIENT_ID = env("HUBSPOT_CLIENT_ID", default="")
-HUBSPOT_CLIENT_SECRET = env("HUBSPOT_CLIENT_SECRET", default="")
-SEMRUSH_API_KEY = env("SEMRUSH_API_KEY", default="")
-SLACK_CLIENT_ID = env("SLACK_CLIENT_ID", default="")
-SLACK_CLIENT_SECRET = env("SLACK_CLIENT_SECRET", default="")
+# ── Chat bots ──
 # Slack app (events + slash commands + chat.postMessage replies)
 SLACK_SIGNING_SECRET = env("SLACK_SIGNING_SECRET", default="")
 SLACK_BOT_TOKEN = env("SLACK_BOT_TOKEN", default="")
@@ -614,9 +583,8 @@ SLACK_BOT_TOKEN = env("SLACK_BOT_TOKEN", default="")
 DISCORD_PUBLIC_KEY = env("DISCORD_PUBLIC_KEY", default="")
 DISCORD_APPLICATION_ID = env("DISCORD_APPLICATION_ID", default="")
 DISCORD_BOT_TOKEN = env("DISCORD_BOT_TOKEN", default="")
-MAILCHIMP_API_KEY = env("MAILCHIMP_API_KEY", default="")
-CANVA_CLIENT_ID = env("CANVA_CLIENT_ID", default="")
-CANVA_CLIENT_SECRET = env("CANVA_CLIENT_SECRET", default="")
+
+# ── AI engines (besides OPENAI_API_KEY / ANTHROPIC_API_KEY above) ──
 GEMINI_API_KEY = env("GEMINI_API_KEY", default="")
 PERPLEXITY_API_KEY = env("PERPLEXITY_API_KEY", default="")
 XAI_API_KEY = env("XAI_API_KEY", default="")
@@ -627,28 +595,9 @@ XAI_API_KEY = env("XAI_API_KEY", default="")
 # Off by default because web-grounded calls cost more and are slower.
 LLM_WEBSEARCH_ENABLED = env.bool("LLM_WEBSEARCH_ENABLED", default=False)
 
-# Google Programmable Search (Custom Search JSON API). Used by the
-# Model Test pipeline to fetch real publisher URLs for the citations
-# UI — see apps/llm_ranking/services/google_search.py.
-# Google Programmable Search (Custom Search JSON API).
-#
-# Historically configured as GOOGLE_SEARCH_API_KEY + GOOGLE_SEARCH_ENGINE_ID
-# in some deployments; current code reads GOOGLE_API_KEY + GOOGLE_CSE_ID.
-# Fall back to the legacy names so an existing .env doesn't break, but
-# prefer the new names if both are set.
-GOOGLE_API_KEY = env("GOOGLE_API_KEY", default="") \
-    or env("GOOGLE_SEARCH_API_KEY", default="")
-GOOGLE_CSE_ID = env("GOOGLE_CSE_ID", default="") \
-    or env("GOOGLE_SEARCH_ENGINE_ID", default="")
-# Per-user daily cap on Google Custom Search calls. Same flat number
-# for every user (free + paid). Resets at UTC midnight.
-GOOGLE_CSE_DAILY_LIMIT_PER_USER = env.int("GOOGLE_CSE_DAILY_LIMIT_PER_USER", default=100)
-# Per-user daily cap on G-Eval judge calls (subjective_impression.py).
-# One call scores all 7 sub-metrics for one citation in one shot.
-CLAUDE_JUDGE_DAILY_LIMIT_PER_USER = env.int("CLAUDE_JUDGE_DAILY_LIMIT_PER_USER", default=200)
-# Per-user daily cap on GEO content rewrites (geo_rewrite.py). Lower
-# because rewrites pull a whole document through the model.
-CLAUDE_REWRITE_DAILY_LIMIT_PER_USER = env.int("CLAUDE_REWRITE_DAILY_LIMIT_PER_USER", default=30)
+# Claude-clustered sentiment themes in apps.llm_ranking.services.geo_deep_dive.
+GEO_SENTIMENT_THEMES_ENABLED = env.bool("GEO_SENTIMENT_THEMES_ENABLED", default=True)
+
 # Finite monthly AI-spend safety ceiling (USD) for enterprise / custom-priced
 # accounts, which have no price to derive a cap from. Prevents the
 # ENTERPRISE-default Organization plan from leaving org users effectively
@@ -714,14 +663,6 @@ GA4_HOSTED_PROPERTY_ID = env("GA4_HOSTED_PROPERTY_ID", default="")
 CLOUDFLARE_SNAPSHOT_TTL_SECONDS = env.int("CLOUDFLARE_SNAPSHOT_TTL_SECONDS", default=120)
 CLOUDFLARE_FETCH_TIMEOUT_SECONDS = env.float("CLOUDFLARE_FETCH_TIMEOUT_SECONDS", default=10.0)
 
-# ── Social Leads (Facebook, LinkedIn, X) ──
-FACEBOOK_APP_ID = env("FACEBOOK_APP_ID", default="")
-FACEBOOK_APP_SECRET = env("FACEBOOK_APP_SECRET", default="")
-LINKEDIN_CLIENT_ID = env("LINKEDIN_CLIENT_ID", default="")
-LINKEDIN_CLIENT_SECRET = env("LINKEDIN_CLIENT_SECRET", default="")
-TIKTOK_APP_ID = env("TIKTOK_APP_ID", default="")
-TIKTOK_APP_SECRET = env("TIKTOK_APP_SECRET", default="")
-
 # Beta gate — set SIGNUPS_ENABLED=true in env to re-enable public registration.
 SIGNUPS_ENABLED = env.bool("SIGNUPS_ENABLED", default=False)
 
@@ -770,7 +711,7 @@ LOGGING = {
         "apps": {"handlers": ["console"], "level": "INFO", "propagate": False},
         "audit": {"handlers": ["console"], "level": "INFO", "propagate": False},
         "security": {"handlers": ["console"], "level": "INFO", "propagate": False},
-        # Covers getLogger("billing") across apps/billing (Stripe events
+        # Covers getLogger("billing") across apps/billing (Polar events
         # log at INFO; without this entry they were dropped).
         "billing": {"handlers": ["console"], "level": "INFO", "propagate": False},
         # Covers core.resilience (circuit-breaker state changes),

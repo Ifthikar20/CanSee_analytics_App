@@ -4,14 +4,13 @@
 #
 #  One script. Multiple subcommands. Replaces deploy.sh,
 #  deploy_and_test.sh, deploy_and_monitor.sh, dev.sh, migrate_all.sh,
-#  health_check.py, seed_data.py, eval_ranking.py.
+#  health_check.py, eval_ranking.py.
 #
 #  Usage:
 #    bash scripts/deploy.sh                  # alias for 'deploy'
 #    bash scripts/deploy.sh deploy [flags]   # production deploy
 #    bash scripts/deploy.sh dev [flags]      # local Django + Celery
 #    bash scripts/deploy.sh migrate [flags]  # local Django migrations
-#    bash scripts/deploy.sh seed             # seed dev DB
 #    bash scripts/deploy.sh eval             # NDCG@5 / MRR ranking eval
 #    bash scripts/deploy.sh health           # container DB+cache probe
 #    bash scripts/deploy.sh install-hooks    # bind git pre-commit
@@ -191,8 +190,8 @@ dep_validate_env() {
   # PROVIDER — third-party / feature-degrades on absence.
   # OPTIONAL — billing, OAuth, etc.
   local CRITICAL_STR="DJANGO_SECRET_KEY JWT_SIGNING_KEY DB_PASSWORD FIELD_ENCRYPTION_KEY"
-  local PROVIDER_STR="ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY PERPLEXITY_API_KEY GOOGLE_API_KEY|GOOGLE_SEARCH_API_KEY GOOGLE_CSE_ID|GOOGLE_SEARCH_ENGINE_ID"
-  local OPTIONAL_STR="DEEPSEEK_API_KEY SERPAPI_KEY POLAR_ACCESS_TOKEN POLAR_PRODUCT_PRO_MONTHLY_ID POLAR_PRODUCT_PRO_ANNUAL_ID POLAR_WEBHOOK_SECRET SENDGRID_API_KEY GOOGLE_OAUTH_CLIENT_ID GOOGLE_CSE_DAILY_LIMIT_PER_USER CLAUDE_JUDGE_DAILY_LIMIT_PER_USER CLAUDE_REWRITE_DAILY_LIMIT_PER_USER INTELLIGENCE_AUTH_TOKEN SOURCES_AUTH_TOKEN"
+  local PROVIDER_STR="ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY PERPLEXITY_API_KEY GOOGLE_SEARCH_API_KEY GOOGLE_SEARCH_ENGINE_ID"
+  local OPTIONAL_STR="DEEPSEEK_API_KEY SERPAPI_KEY POLAR_ACCESS_TOKEN POLAR_PRODUCT_PRO_MONTHLY_ID POLAR_PRODUCT_PRO_ANNUAL_ID POLAR_WEBHOOK_SECRET GOOGLE_OAUTH_CLIENT_ID INTELLIGENCE_AUTH_TOKEN SOURCES_AUTH_TOKEN"
 
   # macOS ships bash 3.2 which mis-parses heredocs inside command
   # substitution when the body contains ')' (every case pattern).
@@ -205,7 +204,7 @@ set -e
 cd "$REMOTE_DIR"
 
 # Slot lists arrive as QUOTED string assignments so the '|' chars
-# in alias slots (GOOGLE_API_KEY|GOOGLE_SEARCH_API_KEY) are just
+# in alias slots (NAME_A|NAME_B: either name satisfies) are just
 # data, not pipeline operators. The for-loops below reference
 # these variables at runtime; word-splitting on whitespace gives
 # us one slot per loop iteration, and the embedded '|' survives
@@ -496,8 +495,7 @@ dep_smoke_test() {
     "/api/v1/auth/me/|401|/auth/me/ (JWT-gated)"
     "/api/v1/auth/session/|401|/auth/session/"
     "/api/v1/llm-ranking/00000000-0000-0000-0000-000000000000/preview-prompts/|401|/llm-ranking/.../preview-prompts/"
-    "/api/v1/llm-ranking/00000000-0000-0000-0000-000000000000/geo/rewrite/|401|/llm-ranking/.../geo/rewrite/ (NEW)"
-    "/api/v1/llm-ranking/00000000-0000-0000-0000-000000000000/geo/judge/|401|/llm-ranking/.../geo/judge/ (NEW)"
+    "/api/v1/search-gap/websites/00000000-0000-0000-0000-000000000000/overview/|401|/search-gap/.../overview/"
     "/login|200|/login (SPA route)"
     "/paywall|200|/paywall (SPA route)"
     "/app-onboarding|200|/app-onboarding (SPA route)"
@@ -699,57 +697,6 @@ cmd_migrate() {
 }
 
 # ════════════════════════════════════════════════════════════════════
-# Subcommand: seed (dev DB)
-# ════════════════════════════════════════════════════════════════════
-cmd_seed() {
-  cd "$REPO_DIR"
-  for cand in .venv venv env; do
-    [[ -f "$REPO_DIR/$cand/bin/activate" ]] && source "$REPO_DIR/$cand/bin/activate" && break
-  done
-  step "Seeding dev DB"
-  DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE:-config.settings.dev}" \
-    python <<'PYEOF'
-import os, sys, django
-sys.path.insert(0, os.getcwd())
-django.setup()
-from apps.accounts.models import User
-from apps.websites.models import Website, WebsiteSettings
-
-admin, c = User.objects.get_or_create(
-    email="admin@cansee.ai",
-    defaults={"full_name": "Admin User", "company_name": "Cansee",
-              "plan": "scale", "is_staff": True, "is_superuser": True,
-              "is_email_verified": True},
-)
-if c:
-    admin.set_password("AdminPass123!"); admin.save()
-    print(f"  created admin: {admin.email}")
-else:
-    print(f"  admin already exists: {admin.email}")
-
-demo, c = User.objects.get_or_create(
-    email="demo@example.com",
-    defaults={"full_name": "Demo User", "company_name": "Acme Corp",
-              "plan": "growth", "is_email_verified": True},
-)
-if c:
-    demo.set_password("DemoPass123!"); demo.save()
-    print(f"  created demo user: {demo.email}")
-
-site, c = Website.objects.get_or_create(
-    user=demo, url="https://demo.example.com",
-    defaults={"name": "Demo Website", "industry": "SaaS"},
-)
-if c:
-    WebsiteSettings.objects.get_or_create(website=site)
-    print(f"  created website: {site.name}")
-
-print("seed complete")
-PYEOF
-  ok "seed done"
-}
-
-# ════════════════════════════════════════════════════════════════════
 # Subcommand: eval (NDCG@5 / MRR over completed audits)
 # ════════════════════════════════════════════════════════════════════
 cmd_eval() {
@@ -888,7 +835,7 @@ HOOK
 # Help
 # ════════════════════════════════════════════════════════════════════
 usage() {
-  sed -n '3,33p' "$0"
+  sed -n '3,32p' "$0"
 }
 
 # ════════════════════════════════════════════════════════════════════
@@ -900,7 +847,6 @@ case "${1:-}" in
   deploy)        shift; cmd_deploy "$@" ;;
   dev)           shift; cmd_dev "$@" ;;
   migrate)       shift; cmd_migrate "$@" ;;
-  seed)          shift; cmd_seed ;;
   eval)          shift; cmd_eval ;;
   health)        shift; cmd_health ;;
   install-hooks) shift; cmd_install_hooks ;;

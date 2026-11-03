@@ -29,7 +29,8 @@ ${C}${B}Cansee — task runner${N}
 Usage: ${B}scripts/run.sh${N} ${G}<command>${N} [args...]
 
 ${B}Local commands${N} (run against your local Docker stack)
-  ${G}test-user${N} [email] [password]   Create a test user locally
+  ${G}create-user${N} <email> "<name>"   Create a user locally; prompts for the password
+                                 (add --org SLUG to join an organization)
   ${G}migrate${N}                        Apply pending migrations
   ${G}makemigrations${N} [app]           Generate new migrations (review before commit)
   ${G}showmigrations${N} [app]           Show applied / pending migrations
@@ -43,12 +44,13 @@ ${B}Prod commands${N} (SSH into the EC2 host)
   ${G}prod-showmigrations${N} [app]      Show migration status on prod
   ${G}prod-shell${N}                     Open a Django shell on prod
   ${G}prod-psql${N}                      Open a psql shell on the prod DB
-  ${G}prod-test-user${N} [email] [pw]    Create a test user on prod (use with care)
+  ${G}prod-create-user${N} <email> "<name>"  Create a user on prod; prompts for the password
+                                 (add --org SLUG to join an organization)
   ${G}prod-logs${N} [request-id|-s svc]  Tail / grep prod logs (alias for scripts/logs.sh)
   ${G}prod-status${N}                    docker compose ps on prod
 
 ${B}Examples${N}
-  scripts/run.sh test-user me@example.com Password@20
+  scripts/run.sh create-user jane@example.com "Jane Doe"
   scripts/run.sh migrate
   scripts/run.sh prod-logs 530fb63c-56be-421c-ab7f-ca7ec0c72450
   scripts/run.sh prod-psql
@@ -92,9 +94,14 @@ case "$cmd" in
     ;;
 
   # Local
-  test-user)
-    manage_local shell -c "exec(open('scripts/create_test_user.py').read())" "$@" 2>/dev/null || \
-      python scripts/create_test_user.py "$@"
+  create-user)
+    [[ $# -ge 2 ]] || { echo "Usage: scripts/run.sh create-user <email> \"<full name>\" [--org SLUG]" >&2; exit 1; }
+    # create_user prompts for the password, so keep a TTY (no -T).
+    if docker compose ps web 2>/dev/null | grep -q "Up"; then
+      docker compose exec web python manage.py create_user "$@"
+    else
+      python manage.py create_user "$@"
+    fi
     ;;
   migrate)            manage_local migrate --noinput ;;
   makemigrations)     manage_local makemigrations "$@" ;;
@@ -115,11 +122,16 @@ case "$cmd" in
     ssh -i "$PEM_KEY" -t "$EC2_USER@$EC2_HOST" \
       "cd $REMOTE_DIR && docker compose -f $COMPOSE_FILE exec db bash -c 'psql -U \$POSTGRES_USER -d \$POSTGRES_DB'"
     ;;
-  prod-test-user)
-    echo "${Y}About to create a user on PROD: ${1:-<random email>}${N}"
+  prod-create-user)
+    [[ $# -ge 2 ]] || { echo "Usage: scripts/run.sh prod-create-user <email> \"<full name>\" [--org SLUG]" >&2; exit 1; }
+    echo "${Y}About to create a user on PROD: $1${N}"
     read -r -p "Continue? (y/N) " ans
     [[ "$ans" == "y" || "$ans" == "Y" ]] || { echo "Aborted."; exit 1; }
-    ssh_remote "cd $REMOTE_DIR && docker compose -f $COMPOSE_FILE exec -T web python scripts/create_test_user.py $*"
+    # -t keeps a terminal end to end, so the password prompt runs inside
+    # the container and the password is never a command-line argument.
+    printf -v quoted '%q ' "$@"
+    ssh -i "$PEM_KEY" -t "$EC2_USER@$EC2_HOST" \
+      "cd $REMOTE_DIR && docker compose -f $COMPOSE_FILE exec web python manage.py create_user $quoted"
     ;;
   prod-logs)          exec "$SCRIPT_DIR/logs.sh" "$@" ;;
   prod-status)        ssh_remote "cd $REMOTE_DIR && docker compose -f $COMPOSE_FILE ps" ;;

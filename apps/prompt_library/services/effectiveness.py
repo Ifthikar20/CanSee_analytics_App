@@ -9,9 +9,10 @@ Effectiveness rolls four normalised axes into a 0-1 weighted overall:
 
 Overall = 0.40*v + 0.30*c + 0.20*cl + 0.10*b
 
-A prompt needs ``MIN_RUNS_STABLE`` (3) result rows before its score is
-considered stable; below that we still compute the components but flag
-``stable=False`` so the UI can show an "Untested" badge.
+A prompt needs ``MIN_RUNS_STABLE`` (3) answered result rows before its
+score is considered stable; below that we still compute the components
+but flag ``stable=False`` so the UI can show an "Untested" badge. Failed
+calls are not runs.
 
 Result rows are matched to a Prompt via the
 ``LLMRankingResult.source_prompt`` foreign key. Older rows that predate
@@ -92,7 +93,9 @@ def compute_effectiveness(prompt) -> dict:
     """
     from apps.llm_ranking.models import LLMRankingResult
 
-    qs = LLMRankingResult.objects.filter(source_prompt=prompt)
+    # Only answered queries are runs: a failed call says nothing about
+    # whether the prompt surfaces the brand.
+    qs = LLMRankingResult.objects.filter(source_prompt=prompt, query_succeeded=True)
     total_runs = qs.count()
     if total_runs == 0:
         return {

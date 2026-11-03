@@ -49,28 +49,6 @@ services:
     volumes:
       - frontend_dist:/app/dist
 
-  openclaw:
-    build:
-      context: ../docker/openclaw
-      dockerfile: Dockerfile.openclaw
-    env_file: ../.env.prod
-    environment:
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
-      OPENCLAW_AUTH_TOKEN: ${OPENCLAW_AUTH_TOKEN:-cansee-openclaw-token}
-    volumes:
-      - openclaw_data:/home/user/.openclaw
-    deploy:
-      resources:
-        limits:
-          memory: 400M
-    healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:18789/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 30s
-    restart: "no"  # Disabled: OpenClaw gateway not yet functional, was crash-looping
-
   # Internal services: reachable only on the compose network via their
   # aliases; no published ports, no nginx routes, no public DNS. Auth is
   # a static bearer token from .env.prod shared with web/celery. Django
@@ -129,8 +107,6 @@ services:
       DB_HOST: db
       REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/1
-      OPENCLAW_GATEWAY_URL: http://openclaw:18789
-      OPENCLAW_AUTH_TOKEN: ${OPENCLAW_AUTH_TOKEN:-cansee-openclaw-token}
     volumes:
       # collectstatic writes here, and nginx serves the same volume at
       # /static. Without this mount the two are different filesystems:
@@ -226,4 +202,3 @@ volumes:
   redis_data:
   static_files:
   frontend_dist:
-  openclaw_data:

@@ -1,9 +1,7 @@
 """Raise Brand Security findings from audit responses already on record.
 
-The external-source security agents each re-query providers with their own
-``SafetyPrompt``. That costs a second round of API calls and, more
-importantly, judges answers nobody ever sees: the responses on the
-dashboard and the prompt detail page are a different set entirely.
+Findings are judged on the answers users actually see on the dashboard
+and the prompt detail page, without a second round of provider calls.
 
 This module reads ``LLMRankingResult`` rows the audits already produced
 and raises ``SafetyAlert`` rows linked back to the exact response via
@@ -101,17 +99,29 @@ class _JudgeGate:
 
 
 def _retrieve_ground_truth(website, query: str) -> list[dict]:
-    """The client's own statements relevant to ``query``, as chunk dicts."""
+    """The client's own statements relevant to ``query``, as chunk dicts.
+
+    Only Brand Input counts: the knowledge base also mirrors AI answers,
+    findings and audit context, none of which is the client's word.
+    """
     try:
+        from apps.rag.models import KnowledgeSource
         from apps.rag.services.retriever import retrieve
         hits = retrieve(
             user=website.user, website=website,
             query=(query or "")[:300], top_k=_GROUND_TRUTH_TOP_K,
+            source_apps=[KnowledgeSource.SOURCE_APP_BRAND_INPUT],
+            kinds=list(KnowledgeSource.BRAND_INPUT_KINDS),
         )
     except Exception:
         # Retrieval must never break the scan — the finding is simply
         # skipped (fact checks are meaningless without ground truth).
         return []
+    reason = getattr(hits, "reason", None)
+    if reason:
+        # e.g. embeddings_not_configured: no ground truth, so fact-check
+        # findings are skipped rather than judged against nothing.
+        logger.debug("brand security ground truth unavailable for %s: %s", website.id, reason)
     return [
         {
             "chunk_id": h.chunk_id,
@@ -307,8 +317,9 @@ def audit_results_for_website(website, *, audit=None, limit: int = 400, since=No
 
     Returns the number of alerts created.
     """
-    from apps.brand_vault.services.security.agents._helpers import brand_terms
     from apps.llm_ranking.models import LLMRankingAudit, LLMRankingResult
+
+    from .brand_terms import brand_terms
 
     audits = LLMRankingAudit.objects.filter(
         website=website, status=LLMRankingAudit.STATUS_COMPLETED,
@@ -329,7 +340,7 @@ def audit_results_for_website(website, *, audit=None, limit: int = 400, since=No
         return 0
 
     terms = [brand] + [
-        t for t in brand_terms(website, {})
+        t for t in brand_terms(website)
         if t and t.lower() != brand.lower()
     ]
 

@@ -24,9 +24,9 @@ class Plan(models.TextChoices):
 # ── Feature limits per plan ──────────────────────────────────────────
 #
 # ``max_prompts_per_audit`` is the headline LLM-ranking gate — every
-# call to ``LLMRankingService.generate_prompts`` reads this off the
-# user's current plan and caps the prompt list accordingly. Bumping a
-# user's tier widens the cap on the next audit immediately.
+# audit reads it off the user's current plan (max_prompts_for_user) and
+# caps the prompt list accordingly. Bumping a user's tier widens the cap
+# on the next audit immediately.
 PLAN_LIMITS = {
     # Free: what an account WITHOUT an active/trialing subscription gets.
     # The AI allowance is a small acquisition cost (settings.
@@ -48,19 +48,6 @@ PLAN_LIMITS = {
         # Dedicated prompt allowance per account per calendar month —
         # every prompt queued into an audit draws it down. -1 = unlimited.
         "monthly_prompts": 10,
-        "providers_allowed": ["claude", "gpt4"],
-        "pipeline_builder": False,
-        "trend_intelligence": False,
-        "sso": False,
-        "api_access": False,
-        "white_label": False,
-        "dedicated_support": False,
-        "tabs": [
-            "dashboard", "projects", "analytics", "leads",
-            "heatmaps", "keywords",
-            "llm_ranking",
-            "integrations", "billing", "settings",
-        ],
     },
     # Pro carries the full self-serve feature set at $45/mo. The AI spend
     # wall (65% of price -> $29.25/mo of model cost) is what protects
@@ -79,19 +66,6 @@ PLAN_LIMITS = {
         "max_prompts_per_audit": 15,
         "max_audits_per_month": 30,           # daily cadence cap
         "monthly_prompts": 100,
-        "providers_allowed": ["claude", "gpt4", "gemini", "perplexity"],
-        "pipeline_builder": True,
-        "trend_intelligence": True,
-        "sso": False,
-        "api_access": True,
-        "white_label": False,
-        "dedicated_support": False,
-        "tabs": [
-            "dashboard", "projects", "analytics", "leads",
-            "heatmaps", "keywords",
-            "llm_ranking",
-            "integrations", "billing", "settings",
-        ],
     },
     Plan.BUSINESS: {
         "segment": Segment.ENTERPRISE,
@@ -109,19 +83,6 @@ PLAN_LIMITS = {
         # Per-SEAT default for enterprise orgs; each org can carry a
         # negotiated override (Organization.monthly_prompt_allowance).
         "monthly_prompts": 200,
-        "providers_allowed": ["claude", "gpt4", "gemini", "perplexity"],
-        "pipeline_builder": True,
-        "trend_intelligence": True,
-        "sso": True,
-        "api_access": True,
-        "white_label": True,
-        "dedicated_support": True,
-        "tabs": [
-            "dashboard", "projects", "analytics", "leads",
-            "heatmaps", "keywords",
-            "llm_ranking",
-            "integrations", "billing", "settings",
-        ],
     },
 }
 
@@ -135,10 +96,8 @@ PLAN_LIMITS[Plan.ENTERPRISE] = PLAN_LIMITS[Plan.BUSINESS]
 PLAN_LIMITS[Plan.SCALE] = PLAN_LIMITS[Plan.BUSINESS]
 
 
-# The RBAC feature lists and the integrations registry still key their
-# tier tables on the historical starter/growth/scale names. This maps
-# ANY plan value (live or legacy) onto those table keys so a plan="pro"
-# or plan="business" user resolves entitlements correctly.
+# Fallback for plan values that are not PLAN_LIMITS keys themselves
+# (e.g. "team"); see legacy_plan_key().
 LEGACY_TIER_KEY = {
     "pro": "growth",
     "business": "scale",
@@ -150,11 +109,6 @@ LEGACY_TIER_KEY = {
     "growth": "growth",
     "scale": "scale",
 }
-
-
-def legacy_tier_key(plan: str) -> str:
-    """Map a plan value onto the starter/growth/scale tier-table keys."""
-    return LEGACY_TIER_KEY.get(plan, "growth")
 
 
 def max_prompts_for_user(user) -> int:
@@ -253,48 +207,6 @@ FREEMAIL_DOMAINS = frozenset({
     "zoho.com", "fastmail.com", "hey.com",
     "mail.ru", "yandex.com", "yandex.ru", "qq.com", "naver.com", "163.com",
 })
-
-
-class AuditStatus(models.TextChoices):
-    PENDING = "pending", "Pending"
-    RUNNING = "running", "Running"
-    COMPLETED = "completed", "Completed"
-    FAILED = "failed", "Failed"
-
-
-class IssueSeverity(models.TextChoices):
-    CRITICAL = "critical", "Critical"
-    WARNING = "warning", "Warning"
-    INFO = "info", "Info"
-
-
-class LeadStatus(models.TextChoices):
-    NEW = "new", "New"
-    CONTACTED = "contacted", "Contacted"
-    QUALIFIED = "qualified", "Qualified"
-    CUSTOMER = "customer", "Customer"
-    LOST = "lost", "Lost"
-
-
-class ContentType(models.TextChoices):
-    BLOG = "blog", "Blog Post"
-    SOCIAL = "social", "Social Media"
-    EMAIL = "email", "Email"
-    VIDEO = "video", "Video"
-
-
-class ActionStatus(models.TextChoices):
-    TODO = "todo", "To Do"
-    IN_PROGRESS = "in_progress", "In Progress"
-    DONE = "done", "Done"
-    SKIPPED = "skipped", "Skipped"
-
-
-class ThreatLevel(models.TextChoices):
-    LOW = "low", "Low"
-    MEDIUM = "medium", "Medium"
-    HIGH = "high", "High"
-    CRITICAL = "critical", "Critical"
 
 
 class SubscriptionStatus(models.TextChoices):

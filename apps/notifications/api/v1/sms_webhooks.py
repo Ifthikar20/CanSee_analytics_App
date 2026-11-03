@@ -1,8 +1,8 @@
 """Inbound SMS webhook (Twilio).
 
 Two-way texting: a subscriber can reply to an alert with a plain-English
-question and get an answer from the same assistant that backs the Slack
-and Discord bots and the Ask page.
+question and get an answer from the same assistant that backs the Ask
+page. When the assistant cannot answer, the reply says so.
 
 Order of business on every inbound message:
 
@@ -46,6 +46,7 @@ REPLIES_OFF = (
     "Replies are turned off for this number. You'll still get alerts. "
     "Reply STOP to unsubscribe."
 )
+AI_UNAVAILABLE = "Cansee couldn't answer right now: AI isn't available."
 
 
 def _xml(body: str) -> HttpResponse:
@@ -75,7 +76,7 @@ def _find_subscription(from_number: str):
 
 def _answer_for(subscription, question: str) -> str:
     """Ask the assistant, scoped to this subscriber's first website."""
-    from apps.assistant.services.orchestrator import answer
+    from apps.assistant.services.orchestrator import AssistantUnavailable, answer
     from apps.websites.models import Website
 
     website = (
@@ -84,19 +85,21 @@ def _answer_for(subscription, question: str) -> str:
     if website is None:
         return NO_WEBSITE
 
-    result = answer(
-        user=subscription.user,
-        website=website,
-        question=(
-            f"{question}\n\n"
-            "Answer in under 280 characters of plain text. No Markdown, no "
-            "tables, no bullet lists — this is being read as a text message."
-        ),
-    )
-    text = (result.get("answer") or "").strip()
-    if not text:
-        return "I couldn't work that out just now. Try again in a moment."
-    return text[:SMS_ANSWER_CHARS]
+    try:
+        result = answer(
+            user=subscription.user,
+            website=website,
+            question=(
+                f"{question}\n\n"
+                "Answer in under 280 characters of plain text. No Markdown, no "
+                "tables, no bullet lists — this is being read as a text message."
+            ),
+        )
+    except AssistantUnavailable as exc:
+        if exc.code == AssistantUnavailable.NOT_CONFIGURED:
+            return AI_UNAVAILABLE
+        return exc.message[:SMS_ANSWER_CHARS]
+    return (result.get("answer") or "").strip()[:SMS_ANSWER_CHARS]
 
 
 @csrf_exempt

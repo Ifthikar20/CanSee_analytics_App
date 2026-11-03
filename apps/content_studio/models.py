@@ -1,12 +1,12 @@
 """Content Studio models.
 
-Models drive the content authoring loop:
+Content Studio is retired: nothing creates or reads these rows any more.
+The models and migrations stay so existing rows and the migration graph
+remain valid.
 
-* :class:`ContentBrief` — a ranked content gap pulled from the recommendation
-  engine (visibility, accuracy, citation).
-* :class:`ContentDraft` — the LLM-drafted artefact for a brief, with voice
-  and accuracy quality scores attached. Terminal state is ``approved`` —
-  the final publish content the customer takes to their own CMS.
+* :class:`ContentBrief` — a ranked content gap (visibility, accuracy,
+  citation).
+* :class:`ContentDraft` — the drafted artefact for a brief.
 """
 from __future__ import annotations
 

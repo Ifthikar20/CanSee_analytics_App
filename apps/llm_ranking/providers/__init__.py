@@ -32,7 +32,7 @@ PROVIDERS: dict[str, type[LLMProvider]] = {
 # in each list is the default when only a provider key is supplied. Each
 # variant tuple is (label, model_id, is_default).
 #
-# Adding a model here exposes it in the Model Test picker. Removing one
+# Adding a model here makes it selectable for a saved prompt. Removing one
 # does not break historical runs (results store the model_id verbatim).
 MODEL_VARIANTS: dict[str, list[tuple[str, str, bool]]] = {
     # Refreshed 2026-08-24 against each vendor's live /models listing
@@ -72,7 +72,7 @@ MODEL_VARIANTS: dict[str, list[tuple[str, str, bool]]] = {
         ("Grok 4.1 Fast", "grok-4.1-fast", False),
     ],
     # DeepSeek is excluded from the main audit registry (PROVIDERS) but
-    # surfaced in the Model Test picker because it's a cheap, useful
+    # selectable for saved prompts because it's a cheap, useful
     # baseline for "did the model mention us" probes. The variants
     # registry, list_model_variants(), and get_provider_for_variant()
     # all consult TOOLING_PROVIDERS for these so the audit router
@@ -88,12 +88,12 @@ def list_model_variants() -> list[dict]:
     """Return a flat list of variants for the picker UI.
 
     Each entry includes the provider key, the canonical variant id (used
-    as the wire-format choice in Model Test runs), the model id sent to
+    as the wire-format choice in BrandPrompt.model_variants), the model id sent to
     the SDK, a friendly label, and whether the underlying provider is
     configured. Variants are excluded when the provider class isn't in
     either PROVIDERS or TOOLING_PROVIDERS (defensive — should not
     happen). DeepSeek is sourced from TOOLING_PROVIDERS so it appears
-    in Model Test but stays out of the main audit router.
+    in the picker but stays out of the main audit router.
     """
     from django.conf import settings
     out: list[dict] = []
@@ -120,7 +120,7 @@ def parse_variant(variant_id: str) -> tuple[str, str] | None:
     Returns None when the variant is malformed or references a provider
     that no longer exists. The caller should treat None as an unknown
     variant and surface a clear error to the user. Accepts any provider
-    that's in PROVIDERS *or* TOOLING_PROVIDERS so Model Test can route
+    that's in PROVIDERS *or* TOOLING_PROVIDERS so a prompt scan can route
     to DeepSeek (which is tooling-only).
     """
     if not variant_id or ":" not in variant_id:
@@ -135,25 +135,14 @@ def parse_variant(variant_id: str) -> tuple[str, str] | None:
     return provider, model_id
 
 
-def default_variant_for(provider_key: str) -> str | None:
-    """Return the wire-format id of the default variant for a provider."""
-    variants = MODEL_VARIANTS.get(provider_key) or []
-    for _label, model_id, is_default in variants:
-        if is_default:
-            return f"{provider_key}:{model_id}"
-    if variants:
-        return f"{provider_key}:{variants[0][1]}"
-    return None
-
-
 def get_provider_for_variant(variant_id: str) -> LLMProvider | None:
     """Instantiate a configured provider bound to the variant's model id.
 
     Mutates the instance's `.model` so the upstream SDK call routes to
     the requested variant. Returns None when the provider is unknown,
     the variant is malformed, or the API key isn't configured. Looks
-    up the class in PROVIDERS first, then TOOLING_PROVIDERS, so Model
-    Test can dispatch DeepSeek without polluting the audit router.
+    up the class in PROVIDERS first, then TOOLING_PROVIDERS, so a prompt
+    scan can dispatch DeepSeek without polluting the audit router.
     """
     parsed = parse_variant(variant_id)
     if parsed is None:

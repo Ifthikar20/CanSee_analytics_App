@@ -13,7 +13,8 @@ app.autodiscover_tasks()
 # ── Queue topology ──
 # Slow third-party API calls must not block pixel/analytics aggregation.
 #   default      — analytics, pixel, accounts (fast, in-process work)
-#   integrations — HubSpot, Semrush, Google Ads, OAuth token refresh
+#   integrations — third-party HTTP (OAuth token refresh, Search Console,
+#                  SerpAPI, Polar, report digests) and long batch deletes
 #   webhooks     — outbound webhook delivery (user-controlled URLs, slow, isolated)
 #   ai           — LLM ranking
 app.conf.task_default_queue = "default"
@@ -34,7 +35,6 @@ app.conf.task_routes = {
     # belongs with the other digest senders. The exact-name route wins over
     # the brand_vault glob above.
     "apps.brand_vault.tasks.run_brand_pulse": {"queue": "integrations"},
-    "apps.content_studio.tasks.*": {"queue": "ai"},
     # notifications: chat commands may call an LLM; report digests hit
     # third-party webhooks
     "apps.notifications.tasks.answer_chat_command": {"queue": "ai"},
@@ -143,11 +143,6 @@ app.conf.beat_schedule = {
     "brand-pulse-digest": {
         "task": "apps.brand_vault.tasks.run_brand_pulse",
         "schedule": crontab(minute=20, hour=9),
-    },
-    # ── Content Studio ──
-    "generate-briefs-daily": {
-        "task": "apps.content_studio.tasks.generate_briefs_daily",
-        "schedule": crontab(minute=15, hour=6),
     },
     # ── Search Console ──
     # Runs before compute-demand-scores (05:00) so fresh GSC_AGGREGATE

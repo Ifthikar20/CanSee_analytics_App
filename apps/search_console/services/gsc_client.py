@@ -1,8 +1,7 @@
 """
 Google Search Console (Search Analytics) API client.
 
-Thin OAuth-bearer client over the Webmasters v3 API, following the
-conventions of apps/llm_ranking/services/google_search.py: module-level
+Thin OAuth-bearer client over the Webmasters v3 API: module-level
 functions, quota guard, narrow exception handling, stats accounting.
 
 Cost/failure guards:

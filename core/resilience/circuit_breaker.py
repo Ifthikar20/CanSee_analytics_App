@@ -1,7 +1,7 @@
 """
 Generic circuit breaker for outbound calls to third-party APIs.
 
-Use one instance per upstream dependency (HubSpot, Semrush, Google Ads, etc.).
+Use one instance per upstream dependency (Polar, Search Console, GA4, etc.).
 Trips open after `failure_threshold` failures inside `window_seconds`, blocks
 calls for `recovery_timeout` seconds, then admits a single probe call.
 
@@ -10,14 +10,14 @@ Redis is unreachable the breaker fails open (allows the call) so a cache
 outage cannot itself take the platform down.
 
 Usage:
-    breaker = CircuitBreaker(name="hubspot", failure_threshold=5, recovery_timeout=60)
+    breaker = CircuitBreaker(name="polar", failure_threshold=5, recovery_timeout=60)
 
     if not breaker.allow():
-        raise CircuitBreakerOpen("hubspot")
+        raise CircuitBreakerOpen("polar")
 
     try:
-        result = call_hubspot()
-    except TransientHubspotError:
+        result = call_polar()
+    except TransientPolarError:
         breaker.record_failure()
         raise
     else:
@@ -26,7 +26,7 @@ Usage:
 Or via the context-manager helper:
 
     with breaker.guard():
-        call_hubspot()
+        call_polar()
 """
 from __future__ import annotations
 

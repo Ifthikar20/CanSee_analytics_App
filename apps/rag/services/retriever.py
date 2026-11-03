@@ -9,6 +9,11 @@ allowance wall), never for filtering. With per-website corpora bounded
 in the low thousands of chunks, brute-force scoring in Python is
 comfortably under 100ms.
 
+Only chunks embedded by a real model are scored. Chunks stored without
+a vector (pending) and legacy word-hash vectors are never compared.
+When the query cannot be embedded, or no chunk has a vector yet, the
+result is empty and carries a reason instead of a guess.
+
 When the corpus grows larger, swap the candidate selection for a
 pgvector / ANN index without changing the call sites.
 """
@@ -20,11 +25,19 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from urllib.parse import urlsplit
 
-from django.db.models import Q
+from django.db.models import Count, Q
 from django.utils import timezone
 
 from apps.rag.models import KnowledgeChunk, KnowledgeSource
-from apps.rag.services.embedder import cosine_similarity, embed_one
+from apps.rag.services.embedder import (
+    REASON_NOT_CONFIGURED,
+    REASON_PENDING,
+    UNEMBEDDED_MODEL_NAMES,
+    EmbeddingUnavailable,
+    cosine_similarity,
+    embed_one,
+    embeddings_configured,
+)
 
 logger = logging.getLogger("apps")
 
@@ -58,6 +71,21 @@ class Hit:
     recorded_at: datetime | None = None
 
 
+class RetrievalHits(list):
+    """The hits from :func:`retrieve`, best first.
+
+    ``reason`` is None after a normal search; an empty list then means
+    nothing matched (or there is nothing to search). Otherwise retrieval
+    could not run and ``reason`` says why: one of the embedder's reason
+    codes (``embeddings_not_configured``, ``ai_allowance_exhausted``,
+    ``embeddings_failed``) or ``embeddings_pending``.
+    """
+
+    def __init__(self, hits=(), reason: str | None = None):
+        super().__init__(hits)
+        self.reason = reason
+
+
 def retrieve(
     *,
     user,
@@ -69,7 +97,7 @@ def retrieve(
     source_ids: list[str] | None = None,
     source_apps: list[str] | None = None,
     since: datetime | None = None,
-) -> list[Hit]:
+) -> RetrievalHits:
     """Return the top ``top_k`` chunks for the query, scoped to the website.
 
     ``user`` is kept for spend accounting on the query embedding, not
@@ -87,44 +115,9 @@ def retrieve(
     evergreen ``brand_input``, which keeps the raw cosine score.
     """
     if not query.strip():
-        return []
+        return RetrievalHits()
 
-    # ── Optional vector-index path (RAG_VECTOR_BACKEND) ──────────────
-    # The index only knows (website, embedding) - the narrowing filters
-    # below live in Postgres. So the backend path engages only for the
-    # unfiltered case, which is what the assistant's knowledge provider
-    # uses; filtered calls keep the exact Python path. Any backend error
-    # degrades to the Python path rather than failing retrieval.
-    from apps.rag.services.vector_backends import get_backend
-
-    backend = get_backend()
-    if backend is not None and not (kinds or source_ids or source_apps or since):
-        try:
-            backend_hits = _retrieve_via_backend(
-                backend, user=user, website=website, query=query,
-                top_k=top_k, min_score=min_score,
-            )
-            if backend_hits:
-                return backend_hits
-            # Zero hits falls through to the Python path rather than
-            # returning empty. The dangerous case this guards: the flag
-            # is on but the index was never backfilled (or a collection
-            # was lost), in which case trusting the index would silently
-            # empty the whole knowledge base - the same failure mode as
-            # the embedder's dimension mismatch. When the corpus is
-            # genuinely empty the Python path is a cheap no-op anyway.
-            logger.debug("vector backend returned no hits; using python path")
-        except Exception:
-            logger.warning(
-                "vector backend retrieval failed; falling back to python path",
-                exc_info=True,
-            )
-
-    qs = (
-        KnowledgeChunk.objects
-        .filter(website=website)
-        .select_related("source")
-    )
+    qs = KnowledgeChunk.objects.filter(website=website)
     if kinds:
         qs = qs.filter(source__kind__in=kinds)
     if source_ids:
@@ -136,20 +129,59 @@ def retrieve(
             Q(recorded_at__gte=since)
             | Q(recorded_at__isnull=True, created_at__gte=since)
         )
-    candidates = list(qs.only(
+    searchable_qs = qs.exclude(embedding_model__in=UNEMBEDDED_MODEL_NAMES)
+
+    counts = qs.aggregate(
+        total=Count("id"),
+        searchable=Count("id", filter=~Q(embedding_model__in=UNEMBEDDED_MODEL_NAMES)),
+    )
+    if not counts["total"]:
+        return RetrievalHits()
+    if not counts["searchable"]:
+        reason = REASON_PENDING if embeddings_configured() else REASON_NOT_CONFIGURED
+        return RetrievalHits(reason=reason)
+
+    try:
+        query_vec, _model, _dim = embed_one(
+            query, user=user, website=website,
+            metadata={"role": "retrieval_query"},
+        )
+    except EmbeddingUnavailable as exc:
+        return RetrievalHits(reason=exc.reason)
+
+    # ── Optional vector-index path (RAG_VECTOR_BACKEND) ──────────────
+    # The index only knows (website, embedding) - the narrowing filters
+    # above live in Postgres. So the backend path engages only for the
+    # unfiltered case, which is what the assistant's knowledge provider
+    # uses; filtered calls keep the exact Python path. Any backend error
+    # degrades to the Python path rather than failing retrieval.
+    from apps.rag.services.vector_backends import get_backend
+
+    backend = get_backend()
+    if backend is not None and not (kinds or source_ids or source_apps or since):
+        try:
+            backend_hits = _retrieve_via_backend(
+                backend, website=website, query_vec=query_vec,
+                top_k=top_k, min_score=min_score,
+            )
+            if backend_hits:
+                return RetrievalHits(backend_hits)
+            # Zero hits falls through to the Python path rather than
+            # returning empty: the flag may be on while the index was
+            # never backfilled (or a collection was lost), and trusting
+            # the index would then silently empty the knowledge base.
+            logger.debug("vector backend returned no hits; using python path")
+        except Exception:
+            logger.warning(
+                "vector backend retrieval failed; falling back to python path",
+                exc_info=True,
+            )
+
+    candidates = list(searchable_qs.select_related("source").only(
         "id", "embedding", "embedding_dim", "text", "section_label",
         "metadata", "recorded_at", "created_at",
         "source__id", "source__url", "source__kind", "source__source_app",
     ))
-    if not candidates:
-        return []
-
-    query_vec, _model, _dim = embed_one(
-        query, user=user, website=website,
-        metadata={"role": "retrieval_query"},
-    )
-    if not query_vec:
-        return []
 
     now = timezone.now()
     scored: list[tuple[float, KnowledgeChunk]] = []
@@ -164,25 +196,26 @@ def retrieve(
             scored.append((score, chunk))
 
     scored.sort(key=lambda t: t[0], reverse=True)
-    hits: list[Hit] = []
-    for score, chunk in scored[:top_k]:
-        hits.append(Hit(
-            chunk_id=str(chunk.id),
-            source_id=str(chunk.source_id),
-            source_url=chunk.source.url,
-            source_kind=chunk.source.kind,
-            section_label=chunk.section_label,
-            text=chunk.text,
-            score=float(score),
-            source_app=chunk.source.source_app,
-            metadata=chunk.metadata or {},
-            recorded_at=chunk.recorded_at,
-        ))
-    return hits
+    return RetrievalHits(_hit(chunk, score) for score, chunk in scored[:top_k])
+
+
+def _hit(chunk: KnowledgeChunk, score: float) -> Hit:
+    return Hit(
+        chunk_id=str(chunk.id),
+        source_id=str(chunk.source_id),
+        source_url=chunk.source.url,
+        source_kind=chunk.source.kind,
+        section_label=chunk.section_label,
+        text=chunk.text,
+        score=float(score),
+        source_app=chunk.source.source_app,
+        metadata=chunk.metadata or {},
+        recorded_at=chunk.recorded_at,
+    )
 
 
 def _retrieve_via_backend(
-    backend, *, user, website, query: str, top_k: int, min_score: float,
+    backend, *, website, query_vec: list[float], top_k: int, min_score: float,
 ) -> list[Hit]:
     """Candidate selection through the vector index; everything else is
     unchanged. The index returns (chunk_id, cosine) pairs; the rows are
@@ -193,13 +226,6 @@ def _retrieve_via_backend(
     Over-fetches 3x top_k because recency decay can reorder past the
     cut and min_score can eliminate candidates.
     """
-    query_vec, _model, _dim = embed_one(
-        query, user=user, website=website,
-        metadata={"role": "retrieval_query"},
-    )
-    if not query_vec:
-        return []
-
     ranked = backend.query(
         website_id=website.id, vector=query_vec, top_k=top_k * 3,
     )
@@ -211,6 +237,7 @@ def _retrieve_via_backend(
         for c in (
             KnowledgeChunk.objects
             .filter(website=website, id__in=[cid for cid, _ in ranked])
+            .exclude(embedding_model__in=UNEMBEDDED_MODEL_NAMES)
             .select_related("source")
         )
     }
@@ -226,21 +253,7 @@ def _retrieve_via_backend(
             scored.append((score, chunk))
 
     scored.sort(key=lambda t: t[0], reverse=True)
-    return [
-        Hit(
-            chunk_id=str(chunk.id),
-            source_id=str(chunk.source_id),
-            source_url=chunk.source.url,
-            source_kind=chunk.source.kind,
-            section_label=chunk.section_label,
-            text=chunk.text,
-            score=float(score),
-            source_app=chunk.source.source_app,
-            metadata=chunk.metadata or {},
-            recorded_at=chunk.recorded_at,
-        )
-        for score, chunk in scored[:top_k]
-    ]
+    return [_hit(chunk, score) for score, chunk in scored[:top_k]]
 
 
 def _recency_weight(chunk: KnowledgeChunk, now: datetime) -> float:
@@ -275,23 +288,8 @@ def _hit_origin(hit: Hit) -> str:
     )
 
 
-def retrieve_context_block(
-    *,
-    user,
-    website,
-    query: str,
-    top_k: int = DEFAULT_TOP_K,
-    max_chars: int = 3000,
-    kinds: list[str] | None = None,
-    source_apps: list[str] | None = None,
-    since: datetime | None = None,
-) -> str:
-    """Return retrieved chunks formatted as a system-prompt-ready block."""
-    hits = retrieve(
-        user=user, website=website, query=query,
-        top_k=top_k, kinds=kinds,
-        source_apps=source_apps, since=since,
-    )
+def format_context_block(hits: list[Hit], *, max_chars: int = 3000) -> str:
+    """Format hits as a system-prompt-ready block, or "" when there are none."""
     if not hits:
         return ""
     lines = ["=== KNOWLEDGE BASE ==="]
@@ -304,4 +302,30 @@ def retrieve_context_block(
             break
         lines.append(block)
         used += len(block) + 1
+    if len(lines) == 1:
+        return ""
     return "\n".join(lines)
+
+
+def retrieve_context_block(
+    *,
+    user,
+    website,
+    query: str,
+    top_k: int = DEFAULT_TOP_K,
+    max_chars: int = 3000,
+    kinds: list[str] | None = None,
+    source_apps: list[str] | None = None,
+    since: datetime | None = None,
+) -> str:
+    """Return retrieved chunks formatted as a system-prompt-ready block.
+
+    "" when nothing was retrieved, including when retrieval could not run
+    (see ``RetrievalHits.reason``).
+    """
+    hits = retrieve(
+        user=user, website=website, query=query,
+        top_k=top_k, kinds=kinds,
+        source_apps=source_apps, since=since,
+    )
+    return format_context_block(hits, max_chars=max_chars)

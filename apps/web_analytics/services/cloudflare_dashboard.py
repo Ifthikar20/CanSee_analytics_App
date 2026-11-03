@@ -248,9 +248,10 @@ query ($zone: String!, $since: Time!, $now: Time!) {
 """
 
 
-def _trend(current: float, previous: float) -> float:
+def _trend(current: float, previous: float) -> float | None:
+    # Nothing in the previous window means the change is unknown, not 0%.
     if not previous:
-        return 0
+        return None
     return round((current - previous) / previous * 100, 1)
 
 
@@ -270,14 +271,13 @@ def _overview(period: str, **values) -> dict:
         "period": period,
         "total_visitors": 0,
         "total_pageviews": 0,
-        "hot_leads": 0,
-        "visitor_growth_pct": 0,
-        "pageviews_trend": 0,
-        # No session model at the edge; the frontend hides these tiles.
-        "avg_session": "0:00",
-        "session_trend": 0,
-        "bounce_rate": 0,
-        "bounce_trend": 0,
+        "visitor_growth_pct": None,
+        "pageviews_trend": None,
+        # No session model at the edge, so these stay None.
+        "avg_session": None,
+        "session_trend": None,
+        "bounce_rate": None,
+        "bounce_trend": None,
         "realtime": 0,
         "data_source": SOURCE_NAME,
     }

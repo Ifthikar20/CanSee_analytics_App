@@ -1,7 +1,9 @@
 """
-Billing API views — hardened for production.
+Billing API views (Polar-backed).
 
-All views handle Stripe unavailability gracefully by returning cached data.
+Plan, subscription and usage reads come from the local Subscription row and
+the AI usage ledger; checkout, plan changes and the billing portal go
+through Polar. Invoices are shown in Polar's billing portal (PortalView).
 """
 
 import logging
@@ -11,7 +13,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from apps.billing.models import Invoice, Subscription
+from apps.billing.models import Subscription
 from apps.billing.services.plan_service import PlanService
 
 logger = logging.getLogger("billing")
@@ -196,9 +198,8 @@ class PlansView(APIView):
 class CheckoutView(APIView):
     """Create a Polar checkout session for the Pro plan.
 
-    The old Stripe checkout and the BILLING_DEV_MODE mock path are gone:
-    subscribing always goes through Polar's hosted checkout (sandbox
-    accepts Stripe test cards, so dev/demo flows use real checkout too).
+    Subscribing always goes through Polar's hosted checkout; the Polar
+    sandbox accepts test cards, so dev flows use the real checkout too.
     """
     permission_classes = [IsAuthenticated]
 
@@ -463,34 +464,6 @@ class ChangePlanView(APIView):
             "success": True,
             "data": {"subscription": subscription_state(sub)},
         })
-
-
-class InvoiceListView(APIView):
-    """List all invoices for the current user."""
-    permission_classes = [IsAuthenticated]
-
-    def get(self, request):
-        try:
-            subscription = request.user.subscription
-            invoices = Invoice.objects.filter(subscription=subscription).order_by("-created_at")[:20]
-            data = [
-                {
-                    "id": str(inv.id),
-                    "amount_paid": inv.amount_paid,
-                    "currency": inv.currency,
-                    "status": inv.status,
-                    "invoice_pdf": inv.invoice_pdf,
-                    "period_start": inv.period_start.isoformat() if inv.period_start else None,
-                    "period_end": inv.period_end.isoformat() if inv.period_end else None,
-                    "created_at": inv.created_at.isoformat(),
-                }
-                for inv in invoices
-            ]
-        except Subscription.DoesNotExist:
-            data = []
-        return Response({"success": True, "data": data})
-
-
 
 
 class AITokenUsageView(APIView):

@@ -1,35 +1,35 @@
 """Business-grounded sample-prompt generation.
 
-The old sample generator substituted the website's industry into generic
-templates and, when the industry was blank, defaulted it to the literal
-string "software" — so a freshly-added car / finance / agency site got a
-list of nonsense SaaS prompts.
+Reads the site (when the website has no description yet), then asks
+Claude for buyer-intent prompts written for what the business actually
+does, inferring the right category noun from the real description.
 
-This reads the site first (if it has not been classified yet), then asks
-Claude for buyer-intent prompts written for what the business ACTUALLY
-does, inferring the right category noun from the real description. It
-falls back to the deterministic template library only with a REAL
-industry, and never to a hardcoded "software" default.
+What the scan reads is used for this request only; it is never saved onto
+the website. Without a Claude key ``SynthesisNotConfigured`` is raised and
+a failed call raises ``SynthesisFailed``: no template list is substituted.
 """
 import json
 import logging
 import re
 
+from apps.prompt_library.services.context_generator import (
+    SynthesisFailed,
+    SynthesisNotConfigured,
+)
 from core.llm import ClaudeUtility
 
 logger = logging.getLogger("apps")
 
 
-def _scan_and_persist(website) -> tuple[str, str, list[str]]:
-    """Ensure the site has been read. Returns (industry, description, products).
+def _site_context(website) -> tuple[str, str, list[str]]:
+    """Return (industry, description, products) for prompt drafting.
 
-    When the website already carries an industry and a description we trust
-    them and skip the scan. Otherwise we scan the homepage and persist
-    whatever we learn so future runs (and audits) reuse it.
+    The website's own fields win. When the description is missing the
+    homepage is scanned and its findings are used in memory only.
     """
     industry = (website.industry or "").strip()
     description = (website.description or "").strip()
-    if industry and description:
+    if description:
         return industry, description, []
 
     from apps.llm_ranking.services.domain_scanner import scan_domain
@@ -43,39 +43,20 @@ def _scan_and_persist(website) -> tuple[str, str, list[str]]:
         logger.info("Sample-prompt scan unsuccessful for %s", website.url)
         return industry, description, []
 
-    new_industry = industry or (scan.get("industry") or "").strip()
-    new_description = description or (scan.get("description") or "").strip()
-    products = list(scan.get("products") or [])[:8]
-
-    fields = []
-    if new_industry and not industry:
-        website.industry = new_industry[:100]
-        fields.append("industry")
-    if new_description and not description:
-        website.description = new_description
-        fields.append("description")
-    if fields:
-        try:
-            website.save(update_fields=[*fields, "updated_at"])
-        except Exception:
-            website.save()
-
-    return new_industry, new_description, products
+    return (
+        industry or (scan.get("industry") or "").strip(),
+        (scan.get("description") or "").strip(),
+        list(scan.get("products") or [])[:8],
+    )
 
 
-def _llm_prompts(*, business_name, industry, description, products, count,
-                 user, website) -> list[dict]:
+def _llm_prompts(*, provider, business_name, industry, description, products,
+                 count, user, website) -> list[dict]:
     """Ask Claude for buyer-intent prompt questions grounded in the business.
 
-    Returns register-ready dicts ({"text", "type"}), or [] on any failure so
-    the caller can fall back to templates.
+    Returns register-ready dicts ({"text", "type"}). Raises
+    ``SynthesisFailed`` when the call fails or yields no usable prompt.
     """
-    if not (description or business_name):
-        return []
-    provider = ClaudeUtility(model="claude-haiku-4-5", max_tokens=1200)
-    if not provider.is_configured():
-        return []
-
     bullets = ""
     if products:
         bullets = "\nProducts / offerings:\n- " + "\n- ".join(products[:6])
@@ -109,18 +90,16 @@ def _llm_prompts(*, business_name, industry, description, products, count,
         user=user, website=website,
     )
     if not result.succeeded:
-        logger.debug("Sample-prompt LLM generation skipped: %s", result.error)
-        return []
+        logger.warning("Sample-prompt generation failed for %s: %s", website.id, result.error)
+        raise SynthesisFailed()
 
     match = re.search(r"\[.*\]", result.text, re.DOTALL)
-    if not match:
-        return []
     try:
-        data = json.loads(match.group())
+        data = json.loads(match.group()) if match else None
     except Exception:
-        return []
+        data = None
     if not isinstance(data, list):
-        return []
+        raise SynthesisFailed()
 
     seen: set[str] = set()
     items: list[dict] = []
@@ -139,35 +118,32 @@ def _llm_prompts(*, business_name, industry, description, products, count,
         items.append({"text": text, "type": "custom"})
         if len(items) >= count:
             break
+    if not items:
+        raise SynthesisFailed()
     return items
 
 
 def build_sample_prompts(website, *, count: int, user) -> dict:
     """Read the site if needed, then generate business-grounded prompts.
 
-    Returns {"items": [...], "industry": str, "source": "llm"|"template"|"none"}.
-    ``source == "none"`` means we could not learn enough about the site to
-    build anything relevant — the caller should ask the user for a
-    description rather than emit a generic list.
+    Returns {"items": [...], "industry": str, "source": "llm"|"none"}.
+    ``source == "none"`` means there is no description to work from (none
+    saved and none readable on the site) — the caller should ask the user
+    for one rather than emit a generic list. Raises
+    ``SynthesisNotConfigured`` without a Claude key and ``SynthesisFailed``
+    when the call fails.
     """
-    industry, description, products = _scan_and_persist(website)
+    provider = ClaudeUtility(model="claude-haiku-4-5", max_tokens=1200)
+    if not provider.is_configured():
+        raise SynthesisNotConfigured()
+
+    industry, description, products = _site_context(website)
+    if not description:
+        return {"items": [], "industry": industry, "source": "none"}
 
     items = _llm_prompts(
-        business_name=website.name or "", industry=industry,
+        provider=provider, business_name=website.name or "", industry=industry,
         description=description, products=products, count=count,
         user=user, website=website,
     )
-    if items:
-        return {"items": items, "industry": industry, "source": "llm"}
-
-    # Deterministic fallback — but ONLY with a real industry. We never emit
-    # the old generic "software" template set for a non-software site.
-    if industry:
-        from apps.llm_ranking.services.prompt_library import PromptLibrary
-        base = PromptLibrary.generate(
-            industry=industry, business_name=website.name or "", max_prompts=count,
-        )
-        items = [{"text": p["text"], "type": p.get("intent", "custom")} for p in base]
-        return {"items": items, "industry": industry, "source": "template"}
-
-    return {"items": [], "industry": "", "source": "none"}
+    return {"items": items, "industry": industry, "source": "llm"}

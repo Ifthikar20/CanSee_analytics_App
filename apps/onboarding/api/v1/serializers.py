@@ -23,10 +23,6 @@ class OnboardingSaveSerializer(serializers.Serializer):
     url = serializers.URLField(max_length=2000)
     business_name = serializers.CharField(max_length=200)
     industry = serializers.CharField(max_length=100, required=False, default="", allow_blank=True)
-    # Optional UUID of an `apps.prompt_library.Industry` row. When supplied,
-    # it takes precedence over the legacy free-text ``industry`` field —
-    # the typeahead in the new onboarding flow sends this id.
-    industry_id = serializers.UUIDField(required=False, allow_null=True)
     description = serializers.CharField(max_length=600, required=False, default="", allow_blank=True)
     keywords = serializers.ListField(
         child=serializers.CharField(max_length=100),

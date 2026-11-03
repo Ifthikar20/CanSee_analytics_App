@@ -1,27 +1,26 @@
 """
 Per-user daily call-budget primitive backed by the Django cache.
 
-Used by feature services in apps/llm_ranking/services/ (Google CSE,
-G-Eval judge, GEO content rewrite) to apply a flat per-user daily cap
-on third-party API calls. Each service owns its own ``namespace`` so
-budgets don't bleed across features.
+Used by feature services (Perplexity search, Search Console, GA4) to
+apply a flat daily cap on third-party API calls. Each service owns its
+own ``namespace`` so budgets don't bleed across features.
 
 Pattern:
 
     from core.quota import DailyQuota
 
-    cse_quota = DailyQuota(
-        namespace="gcse",
-        setting_name="GOOGLE_CSE_DAILY_LIMIT_PER_USER",
-        default_limit=100,
+    search_quota = DailyQuota(
+        namespace="pplx_search",
+        setting_name="PERPLEXITY_SEARCH_DAILY_LIMIT_PER_USER",
+        default_limit=200,
     )
 
-    if not cse_quota.consume(user_id):
+    if not search_quota.consume(user_id):
         return REFUSED
     ... make API call ...
 
-    cse_quota.remaining(user_id)   # how many calls left today
-    cse_quota.limit(user_id)        # what the cap is
+    search_quota.remaining(user_id)   # how many calls left today
+    search_quota.limit(user_id)        # what the cap is
 
 The counter key is ``<namespace>:quota:<user_id|'anon'>:<YYYYMMDD>``
 in the project cache (Redis in prod, locmem in tests). TTL is 26h so

@@ -56,9 +56,6 @@ tests/
 *.swo
 .DS_Store
 
-# Docker
-.dockerignore
-
 # Node (for pixel JS build)
 node_modules/
 package-lock.json

@@ -17,8 +17,8 @@ see "Manual deploy" below.
 - **App directory on host:** `/opt/cansee/ftb-api-26`
 - **Orchestration:** `docker/docker-compose.prod.yml`
 - **Services:** `db` (Postgres 16), `redis`, `web` (Django/Gunicorn),
-  `celery` (worker + beat in one container), `frontend` (Vue build artifact),
-  `nginx` (TLS termination + static), `openclaw` (currently `restart: "no"`),
+  `celery` (worker + beat in one container), `frontend` (Vue build artifact
+  from `ghcr.io/ifthikar20/cansee-ui`), `nginx` (TLS termination + static),
   `intelligence` and `sources` (internal FastAPI sidecars, rebuilt by the
   deploy build step; see docs/ARCHITECTURE.md "Internal services").
 - **Edge:** Cloudflare (SSL: Full Strict) → nginx container on ports 80/443.
@@ -112,7 +112,8 @@ All commands run from `/opt/cansee/ftb-api-26` on the host.
 | Tail celery logs | `docker compose -f docker/docker-compose.prod.yml logs -f celery` |
 | Restart web only | `docker compose -f docker/docker-compose.prod.yml restart web` |
 | Run a migration manually | `docker compose -f docker/docker-compose.prod.yml exec web python manage.py migrate` |
-| Django shell | `docker compose -f docker/docker-compose.prod.yml exec web python manage.py shell_plus` |
+| Django shell | `docker compose -f docker/docker-compose.prod.yml exec web python manage.py shell` |
+| Create a user (prompts for the password) | `docker compose -f docker/docker-compose.prod.yml exec web python manage.py create_user <email> "<full name>"` |
 | Postgres shell | `docker compose -f docker/docker-compose.prod.yml exec db psql -U postgres cansee` |
 | Container status | `docker compose -f docker/docker-compose.prod.yml ps` |
 

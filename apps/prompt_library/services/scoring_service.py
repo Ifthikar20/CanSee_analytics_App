@@ -1,15 +1,16 @@
-"""Demand-score computation — refreshed nightly.
+"""Source score — the library's ranking score, refreshed nightly.
 
-Score blends three signals:
+It is not a demand measurement: no search-volume or popularity signal
+feeds it. The score blends three properties of the prompt row:
 
-* source weight — primary-source mining (Reddit / SerpAPI) ranks above
-  pure LLM synthesis, which can drift toward generic phrasing.
+* source weight — primary-source mining (Reddit / SerpAPI / Search
+  Console) ranks above pure LLM synthesis.
 * recency      — exponentially decays with age in days.
-* variation count — prompts with more paraphrases tend to capture a
-  wider set of phrasings and therefore real-world demand.
+* variation count — prompts with stored paraphrases rank higher.
 
-The output is clipped to ``[0, 100]`` so the UI can render it as a
-percent-style badge without further normalisation.
+The value lives in the ``Prompt.demand_score`` column for schema
+compatibility and is exposed by the API as ``source_score``. It is
+clipped to ``[0, 100]``.
 """
 from __future__ import annotations
 
@@ -39,7 +40,7 @@ def _recency(prompt: Prompt) -> float:
     return math.exp(-math.log(2) * age_days / HALF_LIFE_DAYS)
 
 
-def compute_demand_score(prompt: Prompt) -> float:
+def compute_source_score(prompt: Prompt) -> float:
     weight = SOURCE_WEIGHTS.get(prompt.source, 0.5)
     recency = _recency(prompt)
     variation_count = prompt.variations.count() if prompt.pk else 0
@@ -49,12 +50,12 @@ def compute_demand_score(prompt: Prompt) -> float:
 
 
 def refresh_all_scores(batch_size: int = 500) -> int:
-    """Recompute and persist demand_score for every active prompt."""
+    """Recompute and persist the source score for every active prompt."""
     qs = Prompt.objects.filter(is_active=True).only("id", "source", "created_at", "demand_score")
     updated = 0
     batch: list[Prompt] = []
     for prompt in qs.iterator():
-        prompt.demand_score = compute_demand_score(prompt)
+        prompt.demand_score = compute_source_score(prompt)
         batch.append(prompt)
         if len(batch) >= batch_size:
             Prompt.objects.bulk_update(batch, ["demand_score"])

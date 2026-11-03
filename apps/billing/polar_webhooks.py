@@ -1,9 +1,8 @@
 """
 Polar webhook endpoint.
 
-Mirrors the hardened Stripe pipeline in webhooks.py: signature
-verification, idempotency via BillingEvent, atomic processing, and
-non-retryable errors answered with 200 so Polar stops redelivering.
+Signature verification, idempotency via BillingEvent, atomic processing,
+and non-retryable errors answered with 200 so Polar stops redelivering.
 
 Every event type we care about collapses to one action — re-sync the
 affected user's subscription state from Polar's customer-state API

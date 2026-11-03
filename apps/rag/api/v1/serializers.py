@@ -3,6 +3,7 @@ from urllib.parse import urlparse
 from rest_framework import serializers
 
 from apps.rag.models import KnowledgeChunk, KnowledgeSource
+from apps.rag.services.embedder import is_model_vector
 
 
 class KnowledgeSourceSerializer(serializers.ModelSerializer):
@@ -98,12 +99,17 @@ class HitSerializer(serializers.Serializer):
 
 class KnowledgeChunkSerializer(serializers.ModelSerializer):
     source_url = serializers.CharField(source="source.url", read_only=True)
+    # False while the chunk has no model vector, so search cannot reach it.
+    embedded = serializers.SerializerMethodField()
 
     class Meta:
         model = KnowledgeChunk
         fields = [
             "id", "source_id", "source_url", "chunk_index",
             "section_label", "text", "embedding_model", "embedding_dim",
-            "token_count", "created_at",
+            "embedded", "token_count", "created_at",
         ]
         read_only_fields = fields
+
+    def get_embedded(self, obj) -> bool:
+        return is_model_vector(obj.embedding_model)

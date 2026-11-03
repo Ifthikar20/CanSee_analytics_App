@@ -15,16 +15,6 @@ urlpatterns = [
         name="brand-security-overview",
     ),
     path(
-        "websites/<uuid:website_id>/agents/",
-        v.BrandSecurityAgentsView.as_view(),
-        name="brand-security-agents",
-    ),
-    path(
-        "websites/<uuid:website_id>/agents/<str:agent_id>/",
-        v.BrandSecurityAgentDetailView.as_view(),
-        name="brand-security-agent-detail",
-    ),
-    path(
         "websites/<uuid:website_id>/alerts/",
         v.BrandSecurityAlertsView.as_view(),
         name="brand-security-alerts",
@@ -43,15 +33,5 @@ urlpatterns = [
         "websites/<uuid:website_id>/pulse/",
         v.BrandPulseView.as_view(),
         name="brand-pulse-config",
-    ),
-    path(
-        "websites/<uuid:website_id>/prompts/",
-        v.BrandSecurityPromptsView.as_view(),
-        name="brand-security-prompts",
-    ),
-    path(
-        "prompts/<uuid:prompt_id>/",
-        v.BrandSecurityPromptDetailView.as_view(),
-        name="brand-security-prompt-detail",
     ),
 ]

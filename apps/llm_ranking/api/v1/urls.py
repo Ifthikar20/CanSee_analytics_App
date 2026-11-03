@@ -22,8 +22,6 @@ urlpatterns = [
     path("<uuid:website_id>/schedule/eta/", views.LLMRankingScheduleETAView.as_view(), name="llm-ranking-schedule-eta"),
     path("<uuid:website_id>/schedule/run-now/", views.LLMRankingScheduleRunNowView.as_view(), name="llm-ranking-schedule-run-now"),
     path("<uuid:website_id>/geo-tags/", views.LLMRankingGEOTagsView.as_view(), name="llm-ranking-geo-tags"),
-    # Model Test + GEO endpoints removed 2026-07 — the multi-provider
-    # probe use case moves under the Prompts page auto-measurement flow.
     # Dashboard Visibility Overview card
     path(
         "<uuid:website_id>/visibility-overview/",

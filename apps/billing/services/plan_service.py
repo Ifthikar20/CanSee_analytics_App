@@ -3,13 +3,44 @@ Plan metadata exposed via the API — derived from core.utils.constants
 so pricing/limits exist in exactly ONE place. (This module previously
 carried its own divergent price table; that drift is gone.)
 
+Feature lines list only what the code enforces or provides: the project
+cap, the monthly prompt allowance, the AI spend allowance and the org
+features. Built per request so they follow the settings they read.
+
 For feature-level gating, use constants.PLAN_LIMITS / plan_limits.py.
 """
+from django.conf import settings
+
+from core.ai_tracking import AI_SPEND_CAP_RATIO
 from core.utils.constants import PLAN_LIMITS, Plan
+
+
+def _count(n: int, noun: str) -> str:
+    if n < 0:
+        return f"Unlimited {noun}s"
+    return f"{n} {noun}{'' if n == 1 else 's'}"
+
+
+def _usd(amount: float) -> str:
+    return f"${amount:,.2f}".replace(".00", "")
+
+
+def _limits(limits: dict) -> dict:
+    return {
+        "projects": limits["projects"],
+        "monthly_prompts": limits["monthly_prompts"],
+    }
 
 
 def _free() -> dict:
     limits = PLAN_LIMITS[Plan.FREE]
+    features = [
+        _count(limits["projects"], "project"),
+        f"{_count(limits['monthly_prompts'], 'prompt')} a month",
+    ]
+    free_cap = float(getattr(settings, "AI_FREE_MONTHLY_CAP_USD", 0) or 0)
+    if free_cap > 0:
+        features.append(f"{_usd(free_cap)} of AI usage a month")
     return {
         "id": "free",
         "name": "Free",
@@ -17,27 +48,24 @@ def _free() -> dict:
         "price_monthly": 0,
         "price_yearly": 0,
         "trial_days": 0,
-        "features": [
-            "$1 of AI usage per month",
-            "1 website",
-            f"{limits['max_prompts_per_audit']} prompts per run",
-            f"{limits['max_audits_per_month']} prompt runs / month",
-            "Claude + GPT-4",
-            "Community support",
-        ],
-        "limits": {
-            "projects": limits["projects"],
-            "pageviews": limits["pageviews"],
-            "competitors": limits["competitors"],
-            "team_members": limits["team_members"],
-            "ai_credits": limits["ai_credits_monthly"],
-            "integrations": limits["integrations"],
-        },
+        "features": features,
+        "limits": _limits(limits),
     }
 
 
 def _pro() -> dict:
     limits = PLAN_LIMITS[Plan.PRO]
+    features = [
+        _count(limits["projects"], "project"),
+        f"{_count(limits['monthly_prompts'], 'prompt')} a month",
+        f"{_usd(limits['price_monthly'] * AI_SPEND_CAP_RATIO)} of AI usage a month",
+    ]
+    if limits["trial_days"]:
+        free_projects = PLAN_LIMITS[Plan.FREE]["projects"]
+        features.append(
+            f"{_count(free_projects, 'project')} during the "
+            f"{limits['trial_days']}-day trial"
+        )
     return {
         "id": "pro",
         "name": "Pro",
@@ -45,27 +73,8 @@ def _pro() -> dict:
         "price_monthly": limits["price_monthly"],
         "price_yearly": limits["price_yearly"],
         "trial_days": limits["trial_days"],
-        "popular": True,
-        "features": [
-            f"{limits['projects']} projects",
-            f"Up to {limits['pageviews']:,} pageviews/month",
-            "Prompt runs across Claude, GPT, Gemini and Perplexity",
-            f"{limits['max_prompts_per_audit']} prompts per run, daily scans",
-            f"{limits['competitors']} competitors tracked",
-            f"{limits['team_members']} team members",
-            f"{limits['integrations']} integrations (Slack/Discord)",
-            "Trend intelligence",
-            "API access",
-            "Email support",
-        ],
-        "limits": {
-            "projects": limits["projects"],
-            "pageviews": limits["pageviews"],
-            "competitors": limits["competitors"],
-            "team_members": limits["team_members"],
-            "ai_credits": limits["ai_credits_monthly"],
-            "integrations": limits["integrations"],
-        },
+        "features": features,
+        "limits": _limits(limits),
     }
 
 
@@ -79,30 +88,20 @@ def _business() -> dict:
         "price_yearly": limits["price_yearly"],
         "trial_days": limits["trial_days"],
         "features": [
-            "Everything in Pro",
-            "Unlimited projects and pageviews",
-            "Unlimited AI usage allowance",
-            "Unlimited team members",
-            "Unlimited competitor tracking",
-            "Unlimited integrations",
-            "SSO / SAML authentication",
-            "White-label reports",
-            "Organization-level billing",
-            "Dedicated support and SLA",
-            "Custom onboarding",
+            _count(limits["projects"], "project"),
+            "An organization workspace with team seats",
+            f"{_count(limits['monthly_prompts'], 'prompt')} a month per seat, "
+            "or the amount in your contract",
+            "AI usage allowance set in your contract",
+            "Single sign-on (SSO)",
         ],
-        "limits": {
-            "projects": limits["projects"],
-            "pageviews": limits["pageviews"],
-            "competitors": limits["competitors"],
-            "team_members": limits["team_members"],
-            "ai_credits": limits["ai_credits_monthly"],
-            "integrations": limits["integrations"],
-        },
+        "limits": _limits(limits),
     }
 
 
-PLANS = [_free(), _pro(), _business()]
+def _plans() -> list:
+    return [_free(), _pro(), _business()]
+
 
 # Legacy plan name → live-tier mapping
 _LEGACY_MAP = {
@@ -118,13 +117,13 @@ _LEGACY_MAP = {
 class PlanService:
     @staticmethod
     def get_all_plans() -> list:
-        return PLANS
+        return _plans()
 
     @staticmethod
     def get_plan(plan_id: str) -> dict | None:
         resolved = _LEGACY_MAP.get(plan_id, plan_id)
-        return next((p for p in PLANS if p["id"] == resolved), None)
+        return next((p for p in _plans() if p["id"] == resolved), None)
 
     @staticmethod
     def get_plan_for_segment(segment: str) -> dict | None:
-        return next((p for p in PLANS if p["segment"] == segment), None)
+        return next((p for p in _plans() if p["segment"] == segment), None)

@@ -1,9 +1,7 @@
 from django.conf import settings
 from django.contrib import admin
 from django.urls import include, path
-from drf_spectacular.views import SpectacularAPIView, SpectacularRedocView, SpectacularSwaggerView
 
-from apps.analytics.api.v1.tracking_views import TrackedLinkRedirectView
 from core.views.version import VersionView
 
 urlpatterns = [
@@ -44,7 +42,6 @@ urlpatterns = [
     path("api/v1/citations/", include("apps.citations.api.v1.urls")),
     path("api/v1/brand-vault/", include("apps.brand_vault.api.v1.urls")),
     path("api/v1/brand-security/", include("apps.brand_vault.api.v1.security_urls")),
-    path("api/v1/content-studio/", include("apps.content_studio.api.v1.urls")),
     path("api/v1/search-console/", include("apps.search_console.api.v1.urls")),
     path("api/v1/search-gap/", include("apps.search_gap.api.v1.urls")),
     path("api/v1/assistant/", include("apps.assistant.api.v1.urls")),
@@ -55,18 +52,23 @@ urlpatterns = [
 
     # Pixel ingestion (high throughput)
     path("api/v1/track/", include("apps.analytics.api.v1.pixel_urls")),
-
-    # Tracked link redirect (short URLs — no /api/ prefix intentional)
-    path("t/<str:tracking_key>/", TrackedLinkRedirectView.as_view(), name="tracked-link-redirect"),
-
-    # OpenAPI schema
-    path("api/schema/", SpectacularAPIView.as_view(), name="schema"),
-    path("api/schema/swagger/", SpectacularSwaggerView.as_view(url_name="schema"), name="swagger-ui"),
-    path("api/schema/redoc/", SpectacularRedocView.as_view(url_name="schema"), name="redoc"),
 ]
 
-# Add debug toolbar URLs in dev
 if settings.DEBUG:
+    # The OpenAPI schema and its viewers map every endpoint, so they are
+    # served in local development only.
+    from drf_spectacular.views import (
+        SpectacularAPIView,
+        SpectacularRedocView,
+        SpectacularSwaggerView,
+    )
+
+    urlpatterns += [
+        path("api/schema/", SpectacularAPIView.as_view(), name="schema"),
+        path("api/schema/swagger/", SpectacularSwaggerView.as_view(url_name="schema"), name="swagger-ui"),
+        path("api/schema/redoc/", SpectacularRedocView.as_view(url_name="schema"), name="redoc"),
+    ]
+
     try:
         import debug_toolbar  # noqa: F401
         urlpatterns += [path("__debug__/", include("debug_toolbar.urls"))]

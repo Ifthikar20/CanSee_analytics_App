@@ -1,11 +1,5 @@
-"""Shared source clients used by Brand Security agents.
+"""Shared source clients. ``reddit`` is used by Brand Research's community lane.
 
-Each module wraps one upstream (LLMs, Google SERP, Reddit, Google Trends,
-X/Twitter, generic web) behind a small function or two. Agents call these
-so multiple agents can share the same call surface without each one
-reinventing rate-limiting, timeouts, and empty-payload handling.
-
-Every source function must be tolerant of missing credentials and must
-never raise on network errors -- return ``[]`` and let the agent decide
-what to do.
+Source functions must tolerate missing credentials and never raise on
+network errors: they return ``[]``.
 """

@@ -39,8 +39,8 @@ class NotificationPreferenceSerializer(serializers.ModelSerializer):
         v = (value or "").strip()
         if v and not v.startswith(_SLACK_WEBHOOK_PREFIX):
             # Blocks blind SSRF: without this a user could point the
-            # webhook at http://169.254.169.254/... and have a hot-lead
-            # alert POST to internal/metadata hosts.
+            # webhook at http://169.254.169.254/... and have Cansee POST
+            # to internal/metadata hosts.
             raise serializers.ValidationError(
                 "Enter a valid Slack incoming-webhook URL "
                 "(https://hooks.slack.com/...)."

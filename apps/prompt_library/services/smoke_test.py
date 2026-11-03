@@ -58,6 +58,8 @@ def smoke_test_prompt(
     Returns a dict with ``ok``, ``provider``, ``filled_prompt``,
     ``response_text``, ``mentioned``, ``citations_count``,
     ``citations_sample``, ``latency_ms``, ``cost_usd``, and ``error``.
+    ``cost_usd`` is None: the cost is recorded in the usage ledger, not
+    computed here.
     """
     filled, missing = resolve_for_website(website, prompt)
 
@@ -71,7 +73,7 @@ def smoke_test_prompt(
         "citations_count": 0,
         "citations_sample": [],
         "latency_ms": 0,
-        "cost_usd": 0.0,
+        "cost_usd": None,
         "error": "",
     }
 

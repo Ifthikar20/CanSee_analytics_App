@@ -52,8 +52,6 @@ LOGGING["loggers"]["audit"]["level"] = "WARNING"  # noqa: F405
 CELERY_TASK_ALWAYS_EAGER = True
 CELERY_TASK_EAGER_PROPAGATES = True
 
-# Mock checkout so the paywall flow is walkable without Stripe keys.
-
 # Dev-only default so the ftb-min admin dashboard works out of the box
 # against the local container (prod must set ADMIN_OPS_KEY via env).
 if not ADMIN_OPS_KEY:  # noqa: F405

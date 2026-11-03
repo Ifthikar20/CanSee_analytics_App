@@ -145,9 +145,9 @@ printf '%s\n' "$body" | python3 -m json.tool 2>/dev/null || printf '%s\n' "$body
 if printf '%s' "$body" | grep -qiE "invalid email or password|validation_error"; then
   printf "\n${Y}Tip:${N} if this user doesn't exist, create them with:\n"
   if [[ "$env_choice" == "prod" ]]; then
-    printf "  ${D}scripts/run.sh prod-test-user %s '%s' --password '<your-pw>'${N}\n" "$email_arg" "Some Name"
+    printf "  ${D}scripts/run.sh prod-create-user %s '%s'${N}\n" "$email_arg" "Full Name"
   else
-    printf "  ${D}scripts/run.sh test-user %s '%s' --password '<your-pw>'${N}\n" "$email_arg" "Some Name"
+    printf "  ${D}scripts/run.sh create-user %s '%s'${N}\n" "$email_arg" "Full Name"
   fi
 fi
 exit 1

@@ -64,16 +64,3 @@ class SlackService:
         except Exception as e:
             logger.error(f"Slack chat.postMessage failed: {e}")
             return False
-
-    @staticmethod
-    def send_hot_lead_alert(*, user, lead) -> None:
-        try:
-            prefs = user.notification_preferences
-            if not prefs.hot_lead_slack or not prefs.slack_webhook_url:
-                return
-            SlackService.send_message(
-                webhook_url=prefs.slack_webhook_url,
-                text=f"Hot lead detected. Score: {lead.score}",
-            )
-        except Exception:
-            pass

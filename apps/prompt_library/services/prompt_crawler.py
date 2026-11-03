@@ -6,11 +6,11 @@ LLM provider and capture:
 
 * The model's full response (stored on an ad-hoc LLMRankingAudit/Result
   row so the detail-page aggregation picks it up alongside any
-  full-audit data).
-* A list of fan-out sub-queries (PromptFanout rows). When Claude is
-  available we ask it to decompose the prompt into 4-8 buyer-intent
-  sub-queries; otherwise a deterministic heuristic templates them
-  from the prompt's keywords so the UI still has something to show.
+  full-audit data). The audit is scored from its answers like a full
+  run; one with no answered query ends FAILED with NULL scores.
+* A list of fan-out sub-queries (PromptFanout rows). Claude decomposes
+  the prompt into 4-8 buyer-intent sub-queries; without Claude the
+  fan-out stays empty.
 
 The whole thing is invoked synchronously from a Celery task; views
 fire-and-forget via ``.delay()``. Failures on a single provider don't
@@ -33,7 +33,11 @@ from apps.llm_ranking.providers import (
     list_model_variants,
     parse_variant,
 )
-from apps.llm_ranking.services.ranking_service import _merge_citation_lists
+from apps.llm_ranking.services.ranking_service import (
+    SCORE_FIELDS,
+    LLMRankingService,
+    _merge_citation_lists,
+)
 from apps.prompt_library.models import (
     BrandPrompt,
     Prompt,
@@ -289,27 +293,9 @@ def crawl_prompt(
                 prompt=prompt,
                 text=q,
                 source=PromptFanout.SOURCE_CRAWLER,
-                confidence=0.7,
             )
             for q in fanouts
         ])
-
-    # Run the original prompt against each configured provider and
-    # log the responses as LLMRankingResult rows on a synthetic audit.
-    # The Prompt-detail page reads from LLMRankingResult, so this is
-    # what makes the visibility/sentiment numbers light up.
-    audit = LLMRankingAudit.objects.create(
-        website=website,
-        # Audit rows require a created_by; the crawl is run on behalf of
-        # the website's owner regardless of which user kicked the scan.
-        created_by=website.user,
-        business_name=brand_name,
-        status=LLMRankingAudit.STATUS_RUNNING,
-        prompt_source=getattr(LLMRankingAudit, "PROMPT_SOURCE_LIBRARY", "library"),
-        prompts=[prompt.text],
-        providers_queried=[],
-        started_at=timezone.now(),
-    )
 
     # Gap-fill mode: skip providers that already have a good answer, so
     # the page's automatic scan only queries what's missing. Full runs
@@ -406,6 +392,26 @@ def crawl_prompt(
                 continue
             run_specs.append((provider_key, provider_key, instance))
 
+    # Run the original prompt against each configured provider and
+    # log the responses as LLMRankingResult rows on a synthetic audit.
+    # The Prompt-detail page reads from LLMRankingResult, so this is
+    # what makes the visibility/sentiment numbers light up. No audit is
+    # created when there is nothing to ask.
+    audit = None
+    if run_specs:
+        audit = LLMRankingAudit.objects.create(
+            website=website,
+            # Audit rows require a created_by; the crawl is run on behalf of
+            # the website's owner regardless of which user kicked the scan.
+            created_by=website.user,
+            business_name=brand_name,
+            status=LLMRankingAudit.STATUS_RUNNING,
+            prompt_source=getattr(LLMRankingAudit, "PROMPT_SOURCE_LIBRARY", "library"),
+            prompts=[prompt.text],
+            providers_queried=[],
+            started_at=timezone.now(),
+        )
+
     for _skip_key, provider_key, instance in run_specs:
         # One query, one retry. A model that doesn't answer (transient
         # error, rate limit) gets a single second attempt, then we record
@@ -483,20 +489,27 @@ def crawl_prompt(
     # success, not a failure.
     have_coverage = bool(responses_logged or skipped_have_answer)
 
-    audit.providers_queried = queried_providers
-    audit.status = (
-        LLMRankingAudit.STATUS_COMPLETED if have_coverage
-        else LLMRankingAudit.STATUS_FAILED
-    )
-    audit.completed_at = timezone.now()
-    audit.save(update_fields=["providers_queried", "status", "completed_at"])
+    if audit is not None:
+        # The audit itself is scored only from the answers it holds.
+        scores = LLMRankingService.compute_overall_score(list(audit.results.all()))
+        for field, value in scores.items():
+            setattr(audit, field, value)
+        audit.providers_queried = queried_providers
+        audit.status = (
+            LLMRankingAudit.STATUS_COMPLETED if responses_logged
+            else LLMRankingAudit.STATUS_FAILED
+        )
+        audit.completed_at = timezone.now()
+        audit.save(update_fields=[
+            *SCORE_FIELDS, "providers_queried", "status", "completed_at",
+        ])
 
     # Brand Security reads the responses this crawl just stored. Async
     # because the auditor may escalate findings to the LLM judge, and that
     # latency does not belong inside a crawl. Full-audit completions get
     # the same treatment inline in ranking_service; this closes the gap
     # for per-prompt crawls and their 15-minute scheduled scans.
-    if audit.status == LLMRankingAudit.STATUS_COMPLETED:
+    if audit is not None and audit.status == LLMRankingAudit.STATUS_COMPLETED:
         try:
             from apps.brand_vault.tasks import audit_recent_results
             audit_recent_results.delay(str(website.id), str(audit.id))

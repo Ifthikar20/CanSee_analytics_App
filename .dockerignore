@@ -1,0 +1,62 @@
+# Build context for docker/Dockerfile, docker/Dockerfile.celery and
+# services/*/Dockerfile (all use the repo root). The web and celery images
+# run `COPY . .`, so anything not excluded here ships in the image.
+# Runtime needs: manage.py, config/, core/, apps/, services/, requirements/.
+
+# Secrets and local environment (including docker/.env, which compose reads
+# for interpolation). config/settings/base.py reads .env at startup if it
+# exists; containers get their env from compose instead.
+**/.env
+**/.env.*
+!**/.env*.example
+**/*.pem
+**/*.key
+**/*service*account*.json
+**/fb-project-*.json
+**/gcp-*.json
+
+# Version control and CI
+.git
+.gitignore
+.github
+
+# Local tooling, caches and build output
+.agent
+.claude
+.vscode
+.idea
+.venv
+venv
+env
+.ruff_cache
+.mypy_cache
+.pytest_cache
+.coverage
+coverage.xml
+htmlcov
+.chroma*
+**/__pycache__
+**/*.py[cod]
+**/node_modules
+frontend
+staticfiles
+media
+*.log
+db.sqlite3
+Makefile
+
+# Tests (kept local-only; see .gitignore)
+**/tests
+conftest.py
+
+# Docs and media
+docs
+infra
+**/*.md
+assets
+**/*.mp4
+
+# Host and developer scripts. Only create_prod_user.py runs inside the
+# web container (scripts/create_prod_user.sh execs it there).
+scripts/*
+!scripts/create_prod_user.py

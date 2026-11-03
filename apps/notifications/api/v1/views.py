@@ -174,33 +174,22 @@ class IntegrationConnectionListView(TenantScopedAPIView):
                 from apps.notifications.services.slack_service import SlackService
                 SlackService.send_message(
                     webhook_url=connection.webhook_url,
-                    text=(
-                        "Cansee connected. You'll receive daily growth "
-                        "reports, brand-security alerts, and hot lead "
-                        "alerts here."
-                    ),
+                    text="Cansee connected. You'll receive the daily report here.",
                 )
             elif connection.platform == "discord":
                 from apps.notifications.services.discord_service import DiscordService
                 DiscordService.send_message(
                     webhook_url=connection.webhook_url,
                     title="Cansee Connected",
-                    # Name only what actually sends today; trend digests and
-                    # milestones are stored preferences with no sender yet.
-                    description=(
-                        "You'll receive daily growth reports, brand-security "
-                        "alerts, and hot lead alerts here."
-                    ),
+                    # Name only what actually sends today: the daily report.
+                    description="You'll receive the daily report here.",
                 )
             elif connection.platform == "teams":
                 from apps.notifications.services.teams_service import TeamsService
                 TeamsService.send_message(
                     webhook_url=connection.webhook_url,
                     title="Cansee connected",
-                    text=(
-                        "You'll receive daily growth reports, brand-security "
-                        "alerts, and hot lead alerts here."
-                    ),
+                    text="You'll receive the daily report here.",
                 )
         except Exception as e:
             logger.warning(f"Test message failed for {connection.platform}: {e}")

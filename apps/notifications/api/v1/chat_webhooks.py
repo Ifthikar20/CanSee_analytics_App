@@ -1,7 +1,7 @@
 """
 Inbound chat-platform webhooks: Discord interactions + Slack events/commands.
 
-Hardened the same way as the Stripe webhook (apps/billing/webhooks.py):
+Hardening:
     1. Raw-body signature verification before any parsing
        - Discord: Ed25519 over timestamp + body (X-Signature-Ed25519)
        - Slack:   HMAC-SHA256 over "v0:{ts}:{body}" (X-Slack-Signature)

@@ -34,7 +34,6 @@ class CitationExtractionMethod(models.TextChoices):
     NATIVE = "native", "Native"
     GROUNDING = "grounding", "Grounding"
     REGEX = "regex", "Regex"
-    LLM_ASSISTED = "llm_assisted", "LLM Assisted"
 
 
 class Citation(TimestampMixin):
@@ -235,9 +234,11 @@ class SourceScanResult(TimestampMixin):
     # Platform-native metadata that has no column of its own: subreddit,
     # upvote score, comment count, thread age.
     platform_meta = models.JSONField(default=dict, blank=True)
-    # ok | blocked | error | skipped
+    # The direct fetch outcome: ok | blocked | error | skipped
     fetch_status = models.CharField(max_length=16, default="skipped")
-    # reddit | page
+    # reddit | yelp | page, or summary when the brands were extracted from
+    # a Perplexity summary because the page could not be read ("perplexity"
+    # on older rows).
     content_kind = models.CharField(max_length=16, blank=True)
     word_count = models.IntegerField(default=0)
     # Per-result extraction: [{"name", "sentiment" (-1..1), "mentions",

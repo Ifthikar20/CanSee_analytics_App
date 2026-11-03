@@ -1,198 +1,12 @@
-import logging
-
 from .config import (
     ApiKeyConfig,
     IntegrationConfig,
     OAuthConfig,
-    RateLimitConfig,
-    TierEntitlement,
 )
-
-logger = logging.getLogger("apps")
 
 # ──────────────────────────────────────────────
 # Integration Definitions — single source of truth
 # ──────────────────────────────────────────────
-
-HUBSPOT = IntegrationConfig(
-    name="hubspot",
-    display_name="HubSpot CRM",
-    auth_type="oauth2",
-    oauth=OAuthConfig(
-        client_id_setting="HUBSPOT_CLIENT_ID",
-        client_secret_setting="HUBSPOT_CLIENT_SECRET",
-        scopes=["crm.objects.contacts.write", "crm.objects.contacts.read"],
-        token_url="https://api.hubapi.com/oauth/v1/token",
-        authorize_url="https://app.hubspot.com/oauth/authorize",
-        token_expiry_seconds=21600,  # 6 hours
-    ),
-    starter=TierEntitlement(enabled=False),
-    growth=TierEntitlement(
-        enabled=True,
-        feature_key="hubspot_basic",
-        limits={"sync_direction": "outbound"},
-    ),
-    scale=TierEntitlement(
-        enabled=True,
-        feature_key="hubspot_advanced",
-        limits={"sync_direction": "bidirectional", "timeline_events": True,
-                "segment_sync": True, "custom_field_mapping": True},
-    ),
-    rate_limit=RateLimitConfig(
-        requests_per_second=10.0,
-        celery_rate_limit="10/m",
-    ),
-    celery_queue="integrations",
-    webhook_events=["lead.scored", "lead.status_changed", "lead.created"],
-)
-
-GOOGLE_ADS = IntegrationConfig(
-    name="google_ads",
-    display_name="Google Ads",
-    auth_type="oauth2",
-    oauth=OAuthConfig(
-        client_id_setting="GOOGLE_OAUTH_CLIENT_ID",
-        client_secret_setting="GOOGLE_OAUTH_CLIENT_SECRET",
-        scopes=["https://www.googleapis.com/auth/adwords.readonly"],
-        token_url="https://oauth2.googleapis.com/token",
-        authorize_url="https://accounts.google.com/o/oauth2/v2/auth",
-    ),
-    starter=TierEntitlement(enabled=False),
-    growth=TierEntitlement(
-        enabled=True,
-        feature_key="google_ads",
-        limits={"campaign_level_only": True},
-    ),
-    scale=TierEntitlement(
-        enabled=True,
-        feature_key="google_ads_advanced",
-        limits={"per_lead_attribution": True, "ai_budget_recs": True,
-                "auction_insights": True},
-    ),
-    rate_limit=RateLimitConfig(
-        daily_quota=15000,
-        celery_rate_limit="1/m",
-    ),
-    celery_queue="integrations",
-)
-
-SEMRUSH = IntegrationConfig(
-    name="semrush",
-    display_name="Semrush",
-    auth_type="api_key",
-    api_key=ApiKeyConfig(
-        api_key_setting="SEMRUSH_API_KEY",
-    ),
-    starter=TierEntitlement(enabled=False),
-    growth=TierEntitlement(
-        enabled=True,
-        feature_key="competitor_intelligence",
-        limits={"competitors": 10, "refresh_frequency": "weekly"},
-    ),
-    scale=TierEntitlement(
-        enabled=True,
-        feature_key="competitor_intelligence_advanced",
-        limits={"competitors": 50, "refresh_frequency": "daily",
-                "on_demand_refresh": True},
-    ),
-    rate_limit=RateLimitConfig(
-        requests_per_second=8.0,
-        celery_rate_limit="8/s",
-    ),
-    celery_queue="integrations",
-)
-
-SLACK = IntegrationConfig(
-    name="slack",
-    display_name="Slack",
-    auth_type="oauth2",
-    oauth=OAuthConfig(
-        client_id_setting="SLACK_CLIENT_ID",
-        client_secret_setting="SLACK_CLIENT_SECRET",
-        scopes=["chat:write", "commands", "incoming-webhook"],
-        token_url="https://slack.com/api/oauth.v2.access",
-        authorize_url="https://slack.com/oauth/v2/authorize",
-    ),
-    starter=TierEntitlement(
-        enabled=True,
-        feature_key="slack_webhook",
-        limits={"webhook_only": True},
-    ),
-    growth=TierEntitlement(
-        enabled=True,
-        feature_key="slack_app",
-        limits={"interactive_buttons": True, "morning_brief": True},
-    ),
-    scale=TierEntitlement(
-        enabled=True,
-        feature_key="slack_advanced",
-        limits={"slash_commands": True, "team_channels": True,
-                "custom_routing": True},
-    ),
-    rate_limit=RateLimitConfig(
-        requests_per_second=1.0,  # 1 msg/sec/channel
-        celery_rate_limit="60/m",
-    ),
-    celery_queue="integrations",
-    webhook_events=["lead.scored", "lead.status_changed",
-                    "competitor.change_detected", "audit.completed"],
-)
-
-DISCORD = IntegrationConfig(
-    name="discord",
-    display_name="Discord",
-    auth_type="webhook_url",
-    starter=TierEntitlement(
-        enabled=True,
-        feature_key="discord_webhook",
-        limits={"webhook_only": True},
-    ),
-    growth=TierEntitlement(
-        enabled=True,
-        feature_key="discord_app",
-        limits={"bot_commands": True},
-    ),
-    scale=TierEntitlement(
-        enabled=True,
-        feature_key="discord_advanced",
-        limits={"slash_commands": True, "custom_routing": True},
-    ),
-    rate_limit=RateLimitConfig(
-        requests_per_second=2.5,
-        celery_rate_limit="60/m",
-    ),
-    celery_queue="integrations",
-    webhook_events=["lead.scored", "lead.status_changed",
-                    "competitor.change_detected", "audit.completed"],
-)
-
-WEBHOOKS = IntegrationConfig(
-    name="webhooks",
-    display_name="Outbound Webhooks",
-    auth_type="webhook_url",
-    starter=TierEntitlement(enabled=False),
-    growth=TierEntitlement(
-        enabled=True,
-        feature_key="webhooks_basic",
-        limits={"max_endpoints": 3, "events": ["lead.scored",
-                "lead.status_changed", "lead.created"]},
-    ),
-    scale=TierEntitlement(
-        enabled=True,
-        feature_key="webhooks_advanced",
-        limits={"max_endpoints": None, "events": "__all__",
-                "delivery_logs": True, "custom_headers": True},
-    ),
-    rate_limit=RateLimitConfig(
-        requests_per_second=100.0,
-        celery_rate_limit="100/m",
-    ),
-    celery_queue="webhooks",
-    webhook_events=[
-        "lead.scored", "lead.status_changed", "lead.created",
-        "competitor.change_detected", "audit.completed", "visitor.identified",
-    ],
-)
 
 GOOGLE_ANALYTICS = IntegrationConfig(
     name="ga",
@@ -205,9 +19,6 @@ GOOGLE_ANALYTICS = IntegrationConfig(
         token_url="https://oauth2.googleapis.com/token",
         authorize_url="https://accounts.google.com/o/oauth2/v2/auth",
     ),
-    starter=TierEntitlement(enabled=True, feature_key="basic_analytics"),
-    growth=TierEntitlement(enabled=True, feature_key="full_analytics"),
-    scale=TierEntitlement(enabled=True, feature_key="full_analytics"),
 )
 
 GA_HOSTED = IntegrationConfig(
@@ -218,9 +29,6 @@ GA_HOSTED = IntegrationConfig(
     # Cansee-owned GA4 pool property), not per-tenant tokens; the
     # tenant only pastes the generated gtag snippet on their site.
     api_key=ApiKeyConfig(api_key_setting="GA4_SA_CREDENTIALS_JSON"),
-    starter=TierEntitlement(enabled=True, feature_key="basic_analytics"),
-    growth=TierEntitlement(enabled=True, feature_key="full_analytics"),
-    scale=TierEntitlement(enabled=True, feature_key="full_analytics"),
 )
 
 CLOUDFLARE = IntegrationConfig(
@@ -230,9 +38,6 @@ CLOUDFLARE = IntegrationConfig(
     # server-side credentials, no OAuth, and Cloudflare tokens do not
     # expire, so there is no refresh_token_fn.
     auth_type="api_token",
-    starter=TierEntitlement(enabled=True, feature_key="basic_analytics"),
-    growth=TierEntitlement(enabled=True, feature_key="full_analytics"),
-    scale=TierEntitlement(enabled=True, feature_key="full_analytics"),
 )
 
 GOOGLE_SEARCH_CONSOLE = IntegrationConfig(
@@ -246,96 +51,6 @@ GOOGLE_SEARCH_CONSOLE = IntegrationConfig(
         token_url="https://oauth2.googleapis.com/token",
         authorize_url="https://accounts.google.com/o/oauth2/v2/auth",
     ),
-    starter=TierEntitlement(enabled=True, feature_key="basic_analytics"),
-    growth=TierEntitlement(enabled=True, feature_key="full_analytics"),
-    scale=TierEntitlement(enabled=True, feature_key="full_analytics"),
-)
-
-MAILCHIMP = IntegrationConfig(
-    name="mailchimp",
-    display_name="Mailchimp",
-    auth_type="api_key",
-    api_key=ApiKeyConfig(
-        api_key_setting="MAILCHIMP_API_KEY",
-    ),
-    starter=TierEntitlement(enabled=False),
-    growth=TierEntitlement(
-        enabled=True,
-        feature_key="mailchimp",
-        limits={"max_contacts": 5000, "campaigns_per_month": 10},
-    ),
-    scale=TierEntitlement(
-        enabled=True,
-        feature_key="mailchimp_advanced",
-        limits={"max_contacts": None, "campaigns_per_month": None, "automation": True},
-    ),
-    rate_limit=RateLimitConfig(
-        requests_per_second=10.0,
-        celery_rate_limit="10/s",
-    ),
-    celery_queue="integrations",
-    webhook_events=["campaign.sent"],
-)
-
-GOOGLE_DRIVE = IntegrationConfig(
-    name="google_drive",
-    display_name="Google Drive",
-    auth_type="oauth2",
-    oauth=OAuthConfig(
-        client_id_setting="GOOGLE_OAUTH_CLIENT_ID",
-        client_secret_setting="GOOGLE_OAUTH_CLIENT_SECRET",
-        scopes=[
-            "https://www.googleapis.com/auth/drive.file",
-            "https://www.googleapis.com/auth/spreadsheets",
-        ],
-        token_url="https://oauth2.googleapis.com/token",
-        authorize_url="https://accounts.google.com/o/oauth2/v2/auth",
-    ),
-    starter=TierEntitlement(enabled=False),
-    growth=TierEntitlement(
-        enabled=True,
-        feature_key="google_drive",
-        limits={"export_formats": ["leads", "campaigns"]},
-    ),
-    scale=TierEntitlement(
-        enabled=True,
-        feature_key="google_drive_advanced",
-        limits={"export_formats": ["leads", "campaigns", "analytics"], "auto_sync": True},
-    ),
-    rate_limit=RateLimitConfig(
-        requests_per_second=5.0,
-        celery_rate_limit="5/s",
-    ),
-    celery_queue="integrations",
-)
-
-CANVA = IntegrationConfig(
-    name="canva",
-    display_name="Canva",
-    auth_type="oauth2",
-    oauth=OAuthConfig(
-        client_id_setting="CANVA_CLIENT_ID",
-        client_secret_setting="CANVA_CLIENT_SECRET",
-        scopes=["design:content:read", "design:meta:read"],
-        token_url="https://api.canva.com/rest/v1/oauth/token",
-        authorize_url="https://www.canva.com/api/oauth/authorize",
-    ),
-    starter=TierEntitlement(enabled=False),
-    growth=TierEntitlement(
-        enabled=True,
-        feature_key="canva",
-        limits={"design_links": True},
-    ),
-    scale=TierEntitlement(
-        enabled=True,
-        feature_key="canva_advanced",
-        limits={"design_links": True, "design_import": True},
-    ),
-    rate_limit=RateLimitConfig(
-        requests_per_second=2.0,
-        celery_rate_limit="2/s",
-    ),
-    celery_queue="integrations",
 )
 
 
@@ -343,9 +58,8 @@ class IntegrationRegistry:
     """Central registry for all integration configurations.
 
     Usage:
-        registry = get_registry()
-        config = registry.get("hubspot")
-        if config.is_enabled_for(user.plan):
+        config = get_registry().get("gsc")
+        if config and config.is_configured():
             creds = config.get_credentials()
     """
 
@@ -358,60 +72,6 @@ class IntegrationRegistry:
     def get(self, name: str) -> IntegrationConfig | None:
         return self._integrations.get(name)
 
-    def all(self) -> dict[str, IntegrationConfig]:
-        return dict(self._integrations)
-
-    def enabled_for(self, plan: str) -> list[IntegrationConfig]:
-        """Return all integrations enabled for a plan tier."""
-        return [c for c in self._integrations.values() if c.is_enabled_for(plan)]
-
-    def configured(self) -> list[IntegrationConfig]:
-        """Return all integrations that have credentials configured."""
-        return [c for c in self._integrations.values() if c.is_configured()]
-
-    def feature_keys_for(self, plan: str) -> list[str]:
-        """Return all PLAN_FEATURES keys for a plan tier."""
-        keys = []
-        for config in self._integrations.values():
-            key = config.feature_key_for(plan)
-            if key:
-                keys.append(key)
-        return keys
-
-    def integration_choices(self) -> list[tuple[str, str]]:
-        """Return Django model choices for integration types."""
-        return [(c.name, c.display_name) for c in self._integrations.values()]
-
-    @staticmethod
-    def _effective_plan(user) -> str:
-        """Plan tier used for entitlement checks.
-
-        With the paywall disabled everyone is treated as the top tier
-        ("scale"), so integrations and limits are never plan-blocked.
-        Live plan names (pro/business) map onto the historical
-        starter/growth/scale keys the tier tables use.
-        """
-        from django.conf import settings
-
-        from core.utils.constants import legacy_tier_key
-        if not settings.PAYWALL_ENABLED:
-            return "scale"
-        return legacy_tier_key(getattr(user, "plan", "pro"))
-
-    def check_entitlement(self, user, integration_name: str) -> bool:
-        """Check if a user's plan allows an integration."""
-        config = self.get(integration_name)
-        if not config:
-            return False
-        return config.is_enabled_for(self._effective_plan(user))
-
-    def get_limit(self, user, integration_name: str, limit_name: str, default=None):
-        """Get a specific limit for a user's plan and integration."""
-        config = self.get(integration_name)
-        if not config:
-            return default
-        return config.get_limit(self._effective_plan(user), limit_name, default)
-
 
 # ── Singleton ──
 
@@ -423,10 +83,6 @@ def get_registry() -> IntegrationRegistry:
     global _registry
     if _registry is None:
         _registry = IntegrationRegistry()
-        for config in [
-            HUBSPOT, GOOGLE_ADS, SEMRUSH, SLACK, DISCORD, WEBHOOKS,
-            GOOGLE_ANALYTICS, GA_HOSTED, CLOUDFLARE, GOOGLE_SEARCH_CONSOLE,
-            MAILCHIMP, GOOGLE_DRIVE, CANVA,
-        ]:
+        for config in [GOOGLE_ANALYTICS, GA_HOSTED, CLOUDFLARE, GOOGLE_SEARCH_CONSOLE]:
             _registry.register(config)
     return _registry

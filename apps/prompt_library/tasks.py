@@ -30,7 +30,8 @@ def mine_daily_prompts(industry_slug: str | None = None) -> dict:
 
 @shared_task(name="apps.prompt_library.tasks.compute_demand_scores")
 def compute_demand_scores() -> int:
-    """Refresh demand_score for every active prompt."""
+    """Refresh the source score (stored in Prompt.demand_score) for every
+    active prompt. The task keeps its registered name for the beat schedule."""
     from apps.prompt_library.services.scoring_service import refresh_all_scores
 
     return refresh_all_scores()
@@ -130,9 +131,21 @@ def dispatch_scheduled_prompt_scans() -> None:
     """
     from django.utils import timezone
 
+    from apps.citations.services import serp_google
+    from apps.llm_ranking.services.audit_factory import configured_providers
     from apps.prompt_library.models import PromptCrawlRun, PromptSchedule
 
     now = timezone.now()
+    # Without an AI engine key a crawl could only record failures, so the
+    # AI side is skipped; the Google recheck still runs when SerpAPI is set.
+    engines_configured = bool(configured_providers())
+    google_configured = serp_google.is_configured()
+    if not engines_configured and not google_configured:
+        logger.warning(
+            "Skipping scheduled prompt scans: no AI engine or SerpAPI key configured.",
+        )
+        return
+
     due = (
         PromptSchedule.objects
         .filter(is_enabled=True, next_run_at__lte=now)
@@ -185,11 +198,11 @@ def dispatch_scheduled_prompt_scans() -> None:
                 continue
 
             # ── 3. Run the single-prompt crawl ────────────────────────
-            crawl_prompt_for_website.delay(str(website.id), str(prompt.id))
+            if engines_configured:
+                crawl_prompt_for_website.delay(str(website.id), str(prompt.id))
 
             # ── 4. Recheck Google on the same cadence (search vs AI gap)
-            from apps.citations.services import serp_google
-            if serp_google.is_configured():
+            if google_configured:
                 from apps.search_gap.tasks import check_google_rank
                 check_google_rank.delay(str(bp.id))
 

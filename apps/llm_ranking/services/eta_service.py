@@ -4,16 +4,15 @@ ETA estimation for LLM ranking audits.
 Two flavours:
 
   • ``estimate_audit_duration(website)`` — look at the last N completed
-    audits for this website, return the median per-cell duration. Used
-    to project how long a *running* audit has left or how long the
-    *next scheduled* audit will take.
+    audits for this website, return the median per-cell duration times
+    the cell count. None when there is no history to measure from.
 
   • ``schedule_eta(schedule)`` — wraps the above with the schedule's
-    next_run_at, projected query count, and whether the schedule is
-    currently in-flight.
+    next_run_at, the saved-prompt and configured-engine counts the next
+    run will use, and whether the schedule is currently in-flight.
 
 Median, not mean — a single 90-second outlier on a flaky API key
-would otherwise drag the projection up and demoralize the user.
+would otherwise drag the projection up.
 """
 from __future__ import annotations
 
@@ -21,11 +20,6 @@ import statistics
 
 from django.utils import timezone
 
-# Fallback when there's no history yet. Empirically, a healthy 4-provider
-# / 10-prompt audit completes in ~30s when keys are valid. Under hash-
-# fallback embeddings or 401-storming, this drops; either way, a 1.5s
-# baseline per cell is a safe over-estimate that won't underpromise.
-_FALLBACK_PER_CELL_SECONDS = 1.5
 _HISTORY_WINDOW = 8
 
 
@@ -34,17 +28,19 @@ def estimate_audit_duration(
     *,
     n_prompts: int,
     n_providers: int,
-) -> float:
+) -> float | None:
     """
     Return a projected total duration in seconds for an audit covering
     ``n_prompts × n_providers`` cells against this website.
 
     Uses the median per-cell duration from the last 8 completed audits
-    on this website. Falls back to a 1.5s constant when no history.
+    on this website. Returns None when there are no cells or no history.
     """
     from apps.llm_ranking.models import LLMRankingAudit
 
-    cells = max(1, n_prompts * n_providers)
+    cells = n_prompts * n_providers
+    if cells <= 0:
+        return None
     history = (
         LLMRankingAudit.objects
         .filter(
@@ -62,7 +58,7 @@ def estimate_audit_duration(
         if d and q and float(d) > 0 and int(q) > 0
     ]
     if not per_cell:
-        return cells * _FALLBACK_PER_CELL_SECONDS
+        return None
     return cells * statistics.median(per_cell)
 
 
@@ -73,25 +69,18 @@ def schedule_eta(schedule) -> dict:
     Returns a dict with:
       - next_run_at        ISO-8601 of the next dispatch
       - seconds_until_run  delta from now to next_run_at (negative if past)
-      - n_prompts          projected prompt count
-      - n_providers        configured provider count
-      - estimated_duration_seconds   median-based projection
+      - n_prompts          saved prompts the next run will ask
+      - n_providers        configured engine count
+      - estimated_duration_seconds   median-based projection, or None
       - in_flight          true if last_audit is still running
       - in_flight_audit_id last audit's UUID when in_flight
       - in_flight_progress {completed, total} when in_flight
     """
-    from django.conf import settings as dj_settings
-
     from apps.llm_ranking.models import LLMRankingAudit
-    from apps.llm_ranking.providers import PROVIDERS as PROV_REGISTRY
+    from apps.llm_ranking.services.audit_factory import configured_providers
 
-    n_prompts = _projected_prompt_count(schedule)
-    requested = schedule.providers or list(PROV_REGISTRY.keys())
-    n_providers = max(1, sum(
-        1 for k in requested
-        if k in PROV_REGISTRY
-        and getattr(dj_settings, PROV_REGISTRY[k].api_key_setting, "")
-    ))
+    n_prompts = _saved_prompt_count(schedule)
+    n_providers = len(configured_providers(schedule.providers or None))
 
     duration = estimate_audit_duration(
         schedule.website, n_prompts=n_prompts, n_providers=n_providers,
@@ -108,7 +97,7 @@ def schedule_eta(schedule) -> dict:
         "seconds_until_run": seconds_until_run,
         "n_prompts": n_prompts,
         "n_providers": n_providers,
-        "estimated_duration_seconds": round(duration, 1),
+        "estimated_duration_seconds": round(duration, 1) if duration is not None else None,
         "in_flight": False,
         "in_flight_audit_id": None,
         "in_flight_progress": None,
@@ -128,37 +117,22 @@ def schedule_eta(schedule) -> dict:
         }
         # When a run is in flight, surface its remaining-time estimate too.
         cells_left = max(0, (prev.total_queries or 0) - (prev.queries_completed or 0))
-        if cells_left and prev.total_queries:
-            per_cell = duration / max(1, n_prompts * n_providers)
+        if cells_left and duration is not None:
+            per_cell = duration / (n_prompts * n_providers)
             payload["in_flight_seconds_remaining"] = round(cells_left * per_cell, 1)
 
     return payload
 
 
-def _projected_prompt_count(schedule) -> int:
-    """Estimate how many prompts the next audit will produce. Mirrors
-    ``LLMRankingService.generate_prompts`` capping logic without
-    actually invoking it (which would hit Claude)."""
+def _saved_prompt_count(schedule) -> int:
+    """How many saved prompts the next scheduled run will ask."""
+    from apps.llm_ranking.services.audit_runner import (
+        NoSavedPromptsError,
+        gather_saved_prompts,
+    )
+
+    runner = schedule.created_by or schedule.website.user
     try:
-        from core.utils.constants import max_prompts_for_user
-        cap = max_prompts_for_user(schedule.created_by or schedule.website.user)
-    except Exception:
-        cap = 10
-    return max(1, min(cap, 10))
-
-
-def format_eta(seconds: float | None) -> str:
-    """Human-friendly ETA string. Used by the UI label fallback."""
-    if seconds is None:
-        return "—"
-    s = int(round(seconds))
-    if s < 0:
-        return "any moment"
-    if s < 90:
-        return f"in {s}s"
-    if s < 3600:
-        return f"in {s // 60}m"
-    if s < 86400:
-        return f"in {s // 3600}h"
-    days = s // 86400
-    return f"in {days}d"
+        return len(gather_saved_prompts(schedule.website, runner))
+    except NoSavedPromptsError:
+        return 0

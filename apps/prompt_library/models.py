@@ -66,6 +66,9 @@ class Prompt(TimestampMixin):
     source = models.CharField(max_length=20, choices=PromptSource.choices)
     source_url = models.URLField(blank=True, max_length=500)
     excerpt = models.TextField(blank=True)
+    # The library's ranking score (source type, recency, paraphrase count;
+    # see services/scoring_service.py). Not a demand measurement: the API
+    # exposes it as ``source_score``. The column keeps its original name.
     demand_score = models.FloatField(default=0.0, db_index=True)
     is_active = models.BooleanField(default=True)
     text_hash = models.CharField(max_length=64, db_index=True)
@@ -259,7 +262,8 @@ class PromptFanout(TimestampMixin):
     text = models.TextField()
     provider = models.CharField(max_length=24, blank=True)
     source = models.CharField(max_length=16, choices=SOURCE_CHOICES, default=SOURCE_CRAWLER)
-    confidence = models.FloatField(default=0.5)
+    # NULL: nothing computes a confidence for a sub-query.
+    confidence = models.FloatField(null=True, blank=True)
 
     class Meta:
         db_table = "prompt_library_promptfanout"
@@ -425,16 +429,9 @@ class PromptVariableSet(TimestampMixin):
 
 
 class TestEnvironment(TimestampMixin):
-    """A named bucket of saved BrandPrompts that can be loaded into the
-    Model Test page as a single batch.
-
-    Created either from the Model Test page ('Save current selection as env')
-    or from the Saved view bulk-action bar ('Add to env'). Visible on both
-    surfaces — the M2M is the single source of truth.
-
-    Soft-delete is not needed: removing an env is non-destructive because
-    the underlying BrandPrompt rows are unaffected. The env just stops
-    grouping them.
+    """A named bucket of saved BrandPrompts from the retired Model Test
+    page. No endpoint reads or writes it any more; the table is kept so
+    existing rows survive.
     """
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)

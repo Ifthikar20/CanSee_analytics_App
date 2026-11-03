@@ -5,18 +5,20 @@ Single entry point for the post-register flow: take a URL, return
 everything we know about the business so the user only has to confirm
 or tweak rather than type from scratch.
 
-Composes three existing services:
+Steps:
     1. ``apps.llm_ranking.services.domain_scanner.scan_domain``
-       — homepage scrape, products / features / selling points / topics
-    2. ``apps.onboarding.services.description_writer.polish_description``
-       — short Claude pass that rewrites the meta description into the
-       1-2 sentence "what we do" copy the user actually wants to see
-    3. ``apps.llm_ranking.services.competitor_discovery.discover_competitors``
-       — Google-Search-backed real competitor list
+       — homepage scrape: name, description, products / features /
+       selling points, and an industry hint ("" when unknown)
+    2. ``_polish_description`` — short Claude pass that rewrites the meta
+       description into 1-2 sentences; the scraped text is used as-is
+       without a Claude key
+    3. ``_llm_topics`` — Claude drafts buyer-intent topics. Without a
+       Claude key topics stay empty with ``topics_source="unavailable"``
+       and ``missing_keys``; nothing is substituted
+    4. ``_safe_discover_competitors`` — Claude, then Google Custom Search
 
-All three are best-effort. A failure in any one returns a degraded
-result rather than aborting; the frontend renders whatever fields came
-back so the user can fill the rest by hand.
+The scan only previews: nothing is saved onto a website here. A failure
+in any step leaves that field empty so the user can fill it by hand.
 """
 from __future__ import annotations
 
@@ -52,7 +54,13 @@ class OnboardingPayload:
     products: list[str] = field(default_factory=list)
     features: list[str] = field(default_factory=list)
     selling_points: list[str] = field(default_factory=list)
+    # Buyer-intent topics drafted by Claude. Empty when they could not be
+    # drafted; ``topics_source`` says why: "ai" (drafted), "unavailable"
+    # (no Claude key, see ``missing_keys``) or "failed" (the call failed
+    # or the site gave nothing to draft from).
     topics: list[str] = field(default_factory=list)
+    topics_source: str = ""
+    missing_keys: list[str] = field(default_factory=list)
     # Parallel array (same length as `topics`): for each topic, the
     # competitor brand names the audit will look for in LLM responses
     # to that query. Shown under each chip on step 2 so the user knows
@@ -82,7 +90,6 @@ def run_onboarding_scan(url: str) -> OnboardingPayload:
     payload.products = list(scan.get("products") or [])[:8]
     payload.features = list(scan.get("features") or [])[:8]
     payload.selling_points = list(scan.get("selling_points") or [])[:6]
-    payload.topics = list(scan.get("topics") or [])[:10]
 
     payload.description_short = _polish_description(
         business_name=payload.business_name,
@@ -92,20 +99,20 @@ def run_onboarding_scan(url: str) -> OnboardingPayload:
         products=payload.products,
     )
 
-    # Replace the heuristic topic list with an LLM-generated one. The
-    # heuristic generator hardcodes the word "tools" and regex-matches
-    # fragments around "for", producing nonsense topics for non-product
-    # businesses (services, agencies, healthcare, finance). The LLM
-    # picks the right category noun on its own AND names the brands the
-    # audit will measure against per topic.
-    llm_topic_rows = _llm_topics(
-        business_name=payload.business_name,
-        industry=payload.industry,
-        description=payload.description_short or payload.description_raw,
-        selling_points=payload.selling_points,
-        products=payload.products,
-    )
-    if llm_topic_rows:
+    # Topics come only from Claude, which also names the brands the audit
+    # will measure against per topic. Without it the list stays empty.
+    if not ClaudeUtility(model="claude-haiku-4-5").is_configured():
+        payload.topics_source = "unavailable"
+        payload.missing_keys = ["ANTHROPIC_API_KEY"]
+    else:
+        llm_topic_rows = _llm_topics(
+            business_name=payload.business_name,
+            industry=payload.industry,
+            description=payload.description_short or payload.description_raw,
+            selling_points=payload.selling_points,
+            products=payload.products,
+        )
+        payload.topics_source = "ai" if llm_topic_rows else "failed"
         payload.topics = [row["topic"] for row in llm_topic_rows]
         payload.topic_brands = [row.get("brands", []) for row in llm_topic_rows]
 
@@ -197,8 +204,8 @@ def _llm_topics(
         [{"topic": "best provider credentialing services for clinics",
           "brands": ["Verifiable", "Medallion", "Andros"]}, ...]
 
-    Returns [] on failure so the caller falls back to the heuristic
-    topic list (with no per-topic brands).
+    Returns [] when nothing could be drafted; the caller reports that
+    instead of substituting topics.
     """
     if not (business_name or description):
         return []

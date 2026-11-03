@@ -1,25 +1,22 @@
 """
 Embedding service for the RAG knowledge base.
 
-Primary: OpenAI ``text-embedding-3-small`` (1536 dim) via the OpenAI SDK
-that's already a project dependency. Cheap (~$0.02 per 1M tokens) and
-strong on English text.
+OpenAI ``text-embedding-3-small`` (1536 dim) via the OpenAI SDK, which
+retries transient API errors itself. When no key is configured, the
+account's AI allowance is spent, or the call still fails, no vector is
+produced: ``embed_texts`` raises :class:`EmbeddingUnavailable` with a
+stable reason code. Callers store text without a vector (marked
+``PENDING_MODEL``) or report the reason; nothing stands in for a real
+embedding. ``manage.py embed_pending_chunks`` embeds the pending chunks
+once embeddings work.
 
-Fallback: a deterministic 256-dim hash-based embedder. This isn't a real
-semantic model — it's intended for tests and for environments without an
-API key. Cosine similarity between hashed embeddings still ranks
-identical strings above unrelated ones, which is enough for unit tests
-to exercise the retrieval path.
-
-We log usage via ``core.ai_tracking.record_usage`` so embedding spend
-shows up alongside provider + extraction spend in the same dashboard.
+Usage is logged via ``core.ai_tracking.record_usage`` so embedding spend
+shows up alongside provider and extraction spend.
 """
 from __future__ import annotations
 
-import hashlib
 import logging
 import math
-import re
 
 from django.conf import settings
 
@@ -27,12 +24,44 @@ logger = logging.getLogger("apps")
 
 OPENAI_MODEL = "text-embedding-3-small"
 OPENAI_DIM = 1536
-FALLBACK_MODEL = "hash-256"
-FALLBACK_DIM = 256
+
+# KnowledgeChunk.embedding_model for a chunk stored without a vector.
+PENDING_MODEL = "pending"
+# Older builds stored 256-dim word-hash vectors under this model name.
+# They are not semantic: retrieval ignores them and embed_pending_chunks
+# replaces them.
+LEGACY_HASH_MODEL = "hash-256"
+# embedding_model values that name no real model: chunks needing a vector.
+UNEMBEDDED_MODEL_NAMES = (PENDING_MODEL, LEGACY_HASH_MODEL, "")
+
+# Reason codes carried by EmbeddingUnavailable and by the retriever.
+REASON_NOT_CONFIGURED = "embeddings_not_configured"
+REASON_ALLOWANCE = "ai_allowance_exhausted"
+REASON_FAILED = "embeddings_failed"
+# Chunks exist but none has a vector yet (retriever only).
+REASON_PENDING = "embeddings_pending"
 
 # Soft input limit per chunk — well below the ~8K token model cap so
 # even pathological inputs don't blow up the API call.
 _MAX_INPUT_CHARS = 8000
+
+
+class EmbeddingUnavailable(Exception):
+    """No embedding could be produced. ``reason`` is one of the codes above."""
+
+    def __init__(self, reason: str, detail: str = ""):
+        super().__init__(detail or reason)
+        self.reason = reason
+        self.detail = detail
+
+
+def embeddings_configured() -> bool:
+    return bool(getattr(settings, "OPENAI_API_KEY", "") or "")
+
+
+def is_model_vector(model_name: str) -> bool:
+    """True when ``model_name`` names a real embedding model."""
+    return (model_name or "") not in UNEMBEDDED_MODEL_NAMES
 
 
 def embed_texts(
@@ -44,60 +73,64 @@ def embed_texts(
 ) -> tuple[list[list[float]], str, int]:
     """Embed a batch of strings.
 
-    Returns ``(vectors, model_name, dim)``. Falls back to the
-    deterministic hash embedder when no OpenAI key is configured, the
-    account's monthly AI allowance is spent, or the upstream call fails —
-    callers don't need to special-case absence.
+    Returns ``(vectors, model_name, dim)`` with one vector per input.
+    Raises :class:`EmbeddingUnavailable` when no key is configured, the
+    account's monthly AI allowance is spent, or the API call fails.
     """
     if not texts:
         return [], "", 0
 
-    cleaned = [(_truncate(t) or " ") for t in texts]
     api_key = getattr(settings, "OPENAI_API_KEY", "") or ""
+    if not api_key:
+        raise EmbeddingUnavailable(REASON_NOT_CONFIGURED, "OPENAI_API_KEY is not set")
 
-    # Same spend wall as every chat-model call. Embeddings are cheap but
-    # they are still metered spend; an exhausted allowance degrades to
-    # the free hash embedder instead of quietly billing past the cap.
-    if api_key and user is not None:
+    # Same spend wall as every chat-model call: embeddings are cheap but
+    # still metered spend.
+    if user is not None:
         from core.llm import allowance_denial
+
         denial = allowance_denial(user)
         if denial:
             logger.info("Embedding request denied by spend wall: %s", denial)
-            api_key = ""
+            raise EmbeddingUnavailable(REASON_ALLOWANCE, denial)
 
-    if api_key:
-        try:
-            from openai import OpenAI
-            client = OpenAI(api_key=api_key)
-            resp = client.embeddings.create(model=OPENAI_MODEL, input=cleaned)
-            vectors = [d.embedding for d in resp.data]
-            try:
-                from core.ai_tracking import record_usage
-                usage = getattr(resp, "usage", None)
-                tokens_in = getattr(usage, "prompt_tokens", 0) if usage else 0
-                record_usage(
-                    module="rag",
-                    model_name=OPENAI_MODEL,
-                    input_tokens=tokens_in,
-                    output_tokens=0,
-                    user=user,
-                    website=website,
-                    metadata={"role": "embedding", **(metadata or {})},
-                )
-            except Exception:
-                pass
-            return vectors, OPENAI_MODEL, OPENAI_DIM
-        except Exception as exc:
-            logger.warning("OpenAI embedding failed, falling back to hash embedder: %s", exc)
+    cleaned = [(_truncate(t) or " ") for t in texts]
+    try:
+        from openai import OpenAI
 
-    # Deterministic fallback.
-    return [_hash_embed(t) for t in cleaned], FALLBACK_MODEL, FALLBACK_DIM
+        client = OpenAI(api_key=api_key)
+        resp = client.embeddings.create(model=OPENAI_MODEL, input=cleaned)
+    except Exception as exc:
+        logger.warning("OpenAI embedding failed: %s", exc)
+        raise EmbeddingUnavailable(REASON_FAILED, str(exc)[:300]) from exc
+
+    vectors = [d.embedding for d in resp.data]
+    if len(vectors) != len(cleaned):
+        raise EmbeddingUnavailable(REASON_FAILED, "embedding count mismatch")
+
+    try:
+        from core.ai_tracking import record_usage
+
+        usage = getattr(resp, "usage", None)
+        tokens_in = getattr(usage, "prompt_tokens", 0) if usage else 0
+        record_usage(
+            module="rag",
+            model_name=OPENAI_MODEL,
+            input_tokens=tokens_in,
+            output_tokens=0,
+            user=user,
+            website=website,
+            metadata={"role": "embedding", **(metadata or {})},
+        )
+    except Exception:
+        logger.debug("embedding usage record failed", exc_info=True)
+    return vectors, OPENAI_MODEL, OPENAI_DIM
 
 
 def embed_one(text: str, **kw) -> tuple[list[float], str, int]:
-    """Convenience wrapper for a single string."""
+    """Convenience wrapper for a single string. Raises like ``embed_texts``."""
     vectors, model, dim = embed_texts([text], **kw)
-    return (vectors[0] if vectors else []), model, dim
+    return vectors[0], model, dim
 
 
 def cosine_similarity(a: list[float], b: list[float]) -> float:
@@ -121,29 +154,3 @@ def _truncate(text: str) -> str:
     if len(text) > _MAX_INPUT_CHARS:
         return text[:_MAX_INPUT_CHARS]
     return text
-
-
-def _hash_embed(text: str) -> list[float]:
-    """
-    Deterministic hashed bag-of-words embedding.
-
-    Tokens are lowercased, stripped of punctuation, and each one
-    contributes ``+1`` to the bucket selected by SHA1(token) mod dim.
-    The vector is then L2-normalised so cosine similarity is meaningful.
-
-    This is NOT semantic — it gives near-zero similarity between
-    paraphrases. It's only here so the retrieval path is exercisable in
-    tests and dev environments without an OpenAI key.
-    """
-    tokens = [t for t in re.findall(r"[a-z0-9]+", text.lower()) if len(t) > 1]
-    if not tokens:
-        return [0.0] * FALLBACK_DIM
-    vec = [0.0] * FALLBACK_DIM
-    for tok in tokens:
-        h = hashlib.sha1(tok.encode("utf-8")).digest()
-        bucket = int.from_bytes(h[:4], "big") % FALLBACK_DIM
-        vec[bucket] += 1.0
-    norm = math.sqrt(sum(v * v for v in vec))
-    if norm == 0:
-        return vec
-    return [v / norm for v in vec]

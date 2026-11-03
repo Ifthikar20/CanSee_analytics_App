@@ -14,6 +14,9 @@ TENANT RULE: every provider takes the already-resolved (user, website)
 and filters on them. No provider accepts an id from the caller's input,
 and none iterates outside the given website.
 
+A provider returns its data lines, or a single sentence (a ``str``)
+saying the slice has no data yet. Only data lines count as grounding.
+
 Every provider is best-effort: an exception yields no lines rather than
 failing the answer.
 """
@@ -35,18 +38,30 @@ def _fmt_pct(value) -> str:
         return "n/a"
 
 
+def _fmt_value(value) -> str:
+    return "n/a" if value is None else str(value)
+
+
 # ── Traffic ──────────────────────────────────────────────────────────
 
-def traffic_lines(user, website) -> list[str]:
+def traffic_lines(user, website) -> list[str] | str:
     from apps.analytics.services.analytics_service import AnalyticsService
 
     wid = str(website.id)
     out: list[str] = []
     ov = AnalyticsService.get_overview(website_id=wid, period="30d")
+    visitors = ov.get("total_visitors") or 0
+    pageviews = ov.get("total_pageviews") or 0
+    if not visitors and not pageviews:
+        return "No visits have been recorded for this website in the last 30 days."
+    growth = ov.get("visitor_growth_pct")
     out.append(
-        f"Last 30 days: {ov.get('total_visitors', 0)} visitors, "
-        f"{ov.get('total_pageviews', 0)} pageviews, "
-        f"growth {ov.get('visitor_growth_pct', 0)}%."
+        f"Last 30 days: {visitors} visitors, {pageviews} pageviews"
+        + (
+            f", visitor growth {growth}% vs the previous 30 days."
+            if growth is not None
+            else "; no previous period to compare growth against."
+        )
     )
     day = AnalyticsService.get_overview(website_id=wid, period="24h")
     out.append(
@@ -75,22 +90,23 @@ def traffic_lines(user, website) -> list[str]:
 
 # ── AI visibility ────────────────────────────────────────────────────
 
-def visibility_lines(user, website) -> list[str]:
+def visibility_lines(user, website) -> list[str] | str:
     from apps.llm_ranking.services import visibility_series
 
     ov = visibility_series.build_overview_for_website(user, website) or {}
     if not ov.get("has_data"):
-        return ["No completed visibility audit yet, so there is no trend to report."]
+        return "No completed visibility audit yet, so there is no trend to report."
+    delta = ov.get("brand_delta_pct")
     return [
-        f"Brand visibility now: {_fmt_pct(ov.get('brand_current'))} "
-        f"(change {ov.get('brand_delta_pct', 0)}%).",
+        f"Brand visibility now: {_fmt_pct(ov.get('brand_current'))}"
+        + (f" (change {delta}%)." if delta is not None else " (no earlier months to compare)."),
         f"Competitor average: {_fmt_pct(ov.get('competitor_current'))}.",
     ]
 
 
 # ── Per-prompt metrics (the 'how are my prompts doing' answer) ───────
 
-def prompt_metrics_lines(user, website) -> list[str]:
+def prompt_metrics_lines(user, website) -> list[str] | str:
     """Per-prompt visibility computed from the stored audit answers.
 
     This is the metric users mean by "how are my prompts doing": for each
@@ -103,7 +119,7 @@ def prompt_metrics_lines(user, website) -> list[str]:
 
     rows = (
         LLMRankingResult.objects
-        .filter(audit__website=website, audit__created_by=user)
+        .filter(audit__website=website, audit__created_by=user, query_succeeded=True)
         .only("prompt", "provider", "is_mentioned", "mention_rank", "sentiment")
         .order_by("-created_at")[:400]
     )
@@ -125,7 +141,7 @@ def prompt_metrics_lines(user, website) -> list[str]:
         if r.sentiment:
             a["sentiments"].append(r.sentiment)
     if not agg:
-        return ["No audit answers stored yet, so per-prompt metrics are unavailable."]
+        return "No audit answers stored yet, so per-prompt metrics are unavailable."
 
     ranked = sorted(
         agg.items(), key=lambda kv: (kv[1]["hits"] / max(kv[1]["runs"], 1)), reverse=True,
@@ -151,7 +167,7 @@ def prompt_metrics_lines(user, website) -> list[str]:
 
 # ── Saved prompt library ─────────────────────────────────────────────
 
-def prompts_lines(user, website) -> list[str]:
+def prompts_lines(user, website) -> list[str] | str:
     from apps.prompt_library.models import BrandPrompt
 
     rows = list(
@@ -161,7 +177,7 @@ def prompts_lines(user, website) -> list[str]:
         .order_by("-created_at")[:_MAX_ROWS]
     )
     if not rows:
-        return ["The saved prompt library for this website is empty."]
+        return "The saved prompt library for this website is empty."
     active = [r for r in rows if not r.is_archived]
     out = [f"Saved prompts ({len(active)} active), most recent first:"]
     for bp in rows:
@@ -177,7 +193,7 @@ def prompts_lines(user, website) -> list[str]:
 
 # ── Search Console insights ──────────────────────────────────────────
 
-def search_insights_lines(user, website) -> list[str]:
+def search_insights_lines(user, website) -> list[str] | str:
     """Google Search Console: what people actually searched to find them."""
     from apps.search_console.models import GscDailyTotal, GscPageStat, GscQueryStat
 
@@ -203,18 +219,28 @@ def search_insights_lines(user, website) -> list[str]:
     for p in pages:
         out.append(f"- Landing page {p.page[:90]}: {p.clicks} clicks")
     if not out:
-        return ["Google Search Console is not connected (or has no data yet) for this website."]
+        return "Google Search Console is not connected (or has no data yet) for this website."
     return out
 
 
 # ── Brand security ───────────────────────────────────────────────────
 
-def security_lines(user, website) -> list[str]:
+def security_lines(user, website) -> list[str] | str:
     from apps.brand_vault.models import SafetyAlert
+    from apps.llm_ranking.models import LLMRankingAudit
 
     qs = SafetyAlert.objects.filter(website=website)
     open_qs = qs.filter(status=SafetyAlert.STATUS_OPEN)
     if not open_qs.exists():
+        # Findings come from stored answers; with none checked, "no open
+        # findings" would read as a clean result that was never measured.
+        checked = qs.exists() or LLMRankingAudit.objects.filter(
+            website=website,
+            status=LLMRankingAudit.STATUS_COMPLETED,
+            results__query_succeeded=True,
+        ).exists()
+        if not checked:
+            return "Brand security has not checked any AI answers for this website yet."
         return ["No open brand-security findings for this website."]
     by_sev = {s: open_qs.filter(severity=s).count() for s in ("high", "medium", "low")}
     out = [
@@ -232,7 +258,7 @@ def security_lines(user, website) -> list[str]:
 
 # ── Citations / sources ──────────────────────────────────────────────
 
-def citations_lines(user, website) -> list[str]:
+def citations_lines(user, website) -> list[str] | str:
     from apps.citations.models import SourceInfluenceSnapshot
 
     snap = (
@@ -240,7 +266,7 @@ def citations_lines(user, website) -> list[str]:
         .filter(website=website).order_by("-period_end").first()
     )
     if snap is None:
-        return ["No citation data captured yet for this website."]
+        return "No citation data captured yet for this website."
     out = [
         f"Citations ({snap.provider or 'all providers'}, period ending "
         f"{snap.period_end}): {snap.total_citations} total."
@@ -256,7 +282,7 @@ def citations_lines(user, website) -> list[str]:
 
 # ── Audits ───────────────────────────────────────────────────────────
 
-def audits_lines(user, website) -> list[str]:
+def audits_lines(user, website) -> list[str] | str:
     from apps.llm_ranking.models import LLMRankingAudit
 
     rows = list(
@@ -265,33 +291,14 @@ def audits_lines(user, website) -> list[str]:
         .order_by("-created_at")[:6]
     )
     if not rows:
-        return ["No visibility audits have been run for this website."]
+        return "No visibility audits have been run for this website."
     out = [f"Recent audits ({LLMRankingAudit.objects.filter(website=website).count()} total):"]
     for a in rows:
         out.append(
             f"- {a.created_at:%Y-%m-%d %H:%M} status={a.status} "
-            f"score={getattr(a, 'overall_score', None)} "
-            f"mention_rate={getattr(a, 'mention_rate', None)} "
+            f"score={_fmt_value(getattr(a, 'overall_score', None))} "
+            f"mention_rate={_fmt_value(getattr(a, 'mention_rate', None))} "
             f"results={a.results.count()}"
-        )
-    return out
-
-
-# ── Content studio ───────────────────────────────────────────────────
-
-def content_lines(user, website) -> list[str]:
-    from apps.content_studio.models import ContentBrief
-
-    rows = list(
-        ContentBrief.objects.filter(website=website).order_by("-created_at")[:8]
-    )
-    if not rows:
-        return ["No content briefs generated for this website yet."]
-    out = ["Content briefs (newest first):"]
-    for b in rows:
-        out.append(
-            f"- {(getattr(b, 'title', '') or 'Untitled')[:90]} "
-            f"[{getattr(b, 'status', '')}]"
         )
     return out
 
@@ -319,22 +326,38 @@ def usage_lines(user, website) -> list[str]:
 
 # ── Knowledge base ───────────────────────────────────────────────────
 
-def knowledge_lines(user, website) -> list[str]:
+def knowledge_lines(user, website) -> list[str] | str:
     from apps.rag.models import KnowledgeSource
+    from apps.rag.services.ingest_service import pending_chunks
 
     # Website-scoped: the knowledge base belongs to the project, not the
     # person who added it, so the assistant reports the shared corpus.
     qs = KnowledgeSource.objects.filter(website=website)
     total = qs.count()
     if not total:
-        return ["The knowledge base for this website is empty."]
+        return "The knowledge base for this website is empty."
     by_app: dict[str, int] = {}
     for src in qs.only("source_app"):
         by_app[src.source_app] = by_app.get(src.source_app, 0) + 1
-    return [
+    out = [
         f"Knowledge base: {total} source(s) — "
         + ", ".join(f"{k}: {v}" for k, v in sorted(by_app.items())) + "."
     ]
+    pending = pending_chunks(website_id=website.id).count()
+    if pending:
+        out.append(
+            f"{pending} knowledge-base passage(s) have no embedding yet, so "
+            "search cannot reach them."
+        )
+    return out
+
+
+@dataclass(frozen=True)
+class Section:
+    label: str
+    lines: list[str]
+    # False when the provider only said the slice has no data yet.
+    has_data: bool
 
 
 @dataclass(frozen=True)
@@ -381,9 +404,6 @@ PROVIDERS: tuple[ContextProvider, ...] = (
     ContextProvider("audits", "AUDITS", audits_lines, keywords=(
         "audit", "scan", "run", "last run", "history", "score",
     )),
-    ContextProvider("content", "CONTENT BRIEFS", content_lines, keywords=(
-        "content", "brief", "draft", "article", "blog", "write", "gap",
-    )),
     ContextProvider("usage", "AI USAGE", usage_lines, default=True, keywords=(
         "usage", "token", "cost", "spend", "bill", "billing", "plan",
         "allowance", "quota", "credit",
@@ -416,18 +436,20 @@ def select_providers(question: str) -> list[ContextProvider]:
     return [p for _, p in scored[:5]]
 
 
-def build_sections(user, website, question: str) -> list[tuple[str, list[str]]]:
-    """Run the selected providers. Returns [(label, lines), ...]."""
-    sections: list[tuple[str, list[str]]] = []
+def build_sections(user, website, question: str) -> list[Section]:
+    """Run the selected providers. A failed provider adds no section."""
+    sections: list[Section] = []
     for provider in select_providers(question):
         try:
-            lines = provider.fn(user, website) or []
+            out = provider.fn(user, website)
         except Exception:
             logger.warning(
                 "assistant provider %s failed for website %s",
                 provider.key, getattr(website, "id", None), exc_info=True,
             )
             continue
-        if lines:
-            sections.append((provider.label, lines))
+        if isinstance(out, str):
+            sections.append(Section(provider.label, [out], has_data=False))
+        elif out:
+            sections.append(Section(provider.label, list(out), has_data=True))
     return sections

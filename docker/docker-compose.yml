@@ -3,10 +3,10 @@ version: "3.9"
 # LOCAL DEVELOPMENT CONVENIENCE FILE ONLY.
 # Real local dev uses docker-compose.dev.yml (+ .dev.override.yml); production
 # uses docker-compose.prod.yml. This file loads ../.env (config.settings.dev:
-# DEBUG=True, ALLOWED_HOSTS=*, CORS wildcard, BILLING_DEV_MODE=True), so its
-# published ports are bound to 127.0.0.1 ONLY and the settings module is pinned
-# to dev explicitly, so a stray `docker compose up` can never expose dev-mode
-# services to the network or be mistaken for a production bring-up.
+# DEBUG=True, ALLOWED_HOSTS=*, CORS wildcard), so its published ports are bound
+# to 127.0.0.1 ONLY and the settings module is pinned to dev explicitly, so a
+# stray `docker compose up` can never expose dev-mode services to the network
+# or be mistaken for a production bring-up.
 
 services:
   db:
@@ -49,8 +49,8 @@ services:
       redis:
         condition: service_healthy
     ports:
-      # Bound to localhost so dev-mode services (DEBUG, permissive CORS,
-      # BILLING_DEV_MODE) are never exposed to the network.
+      # Bound to localhost so dev-mode services (DEBUG, permissive CORS)
+      # are never exposed to the network.
       - "127.0.0.1:8000:8000"
     volumes:
       - static_files:/app/staticfiles

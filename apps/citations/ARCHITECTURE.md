@@ -37,9 +37,6 @@ retries.
     citations list) emitted by Gemini's tool-grounded responses.
   * `RegexExtractor` is the universal fallback — runs a conservative
     URL regex over the response body and assigns lower confidence (0.6).
-  * `LLMAssistedExtractor` is a no-op stub today; the orchestrator
-    reserves a slot for it in the Anthropic / OpenAI strategy so the
-    full chain is exercised in tests.
 * `extraction_service` — orchestrates the strategy for a result, dedupes
   by normalized URL keeping the highest-confidence candidate, classifies
   each URL, and persists `Citation` rows via `update_or_create`.
@@ -82,9 +79,6 @@ guard applies.
 
 ## Extension Points
 
-* Wire a real meta-prompt into `LLMAssistedExtractor` and flip the flag
-  from `extraction_service._strategy_for_provider` for Anthropic /
-  OpenAI when the response yields zero URLs but is non-trivial.
 * Replace the curated news-domain list with a SerpAPI-driven
   classifier. The cache table accepts `classified_by="llm"` /
   `"manual"` so the upgrade is additive.

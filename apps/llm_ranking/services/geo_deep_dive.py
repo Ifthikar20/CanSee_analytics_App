@@ -8,8 +8,10 @@ audits:
 - position_by_provider: rank-bucket distribution per LLM
 - sentiment_by_provider: positive/neutral/negative split per LLM
 - sentiment_themes: optional LLM-clustered themes from positive vs.
-  negative quote contexts. Cached for THEMES_CACHE_TTL seconds since each
-  call costs tokens.
+  negative quote contexts. The model only labels themes and assigns quote
+  numbers; counts are computed from those assignments and a sample quote
+  is kept only when it appears verbatim in the input. Cached for
+  THEMES_CACHE_TTL seconds since each call costs tokens.
 
 All inputs come from LLMRankingResult rows already persisted by the audit
 pipeline — no new data collection.
@@ -221,12 +223,12 @@ def _sentiment_themes(audit_ids: list, flt: dict | None = None) -> dict:
     """Cluster positive and negative quote contexts into named themes.
 
     Returns {"positive": [...], "negative": [...]}. Each list is at most
-    three themes shaped {label, count, sample_quote}. Empty if the feature
+    three themes shaped {label, count, sample_quote}; ``count`` is the
+    number of input quotes assigned to the theme. Empty if the feature
     is disabled, the provider isn't configured, or there are too few
     quotes to cluster meaningfully.
     """
-    enabled = getattr(settings, "GEO_SENTIMENT_THEMES_ENABLED", True)
-    if not enabled:
+    if not settings.GEO_SENTIMENT_THEMES_ENABLED:
         return {"positive": [], "negative": []}
 
     cache_key = _themes_cache_key(audit_ids, flt)
@@ -248,9 +250,10 @@ def _cluster_one(audit_ids: list, flt: dict | None, sentiment_label: str) -> lis
         .filter(is_mentioned=True, sentiment=sentiment_label)
         .exclude(mention_context="")
     )
-    quotes = list(
-        qs.order_by("-confidence_score").values_list("mention_context", flat=True)[:MAX_QUOTES_PER_CALL]
-    )
+    raw_quotes = qs.order_by("-created_at").values_list(
+        "mention_context", flat=True,
+    )[:MAX_QUOTES_PER_CALL]
+    quotes = [q.strip()[:280] for q in raw_quotes if q.strip()]
     if len(quotes) < MIN_QUOTES_FOR_THEMES:
         return []
 
@@ -262,14 +265,14 @@ def _cluster_one(audit_ids: list, flt: dict | None, sentiment_label: str) -> lis
     if provider is None or not provider.is_configured():
         return []
 
-    joined = "\n".join(f"- {q.strip()[:280]}" for q in quotes if q.strip())
+    numbered = "\n".join(f"{i}. {q}" for i, q in enumerate(quotes, start=1))
     user_prompt = (
-        f"Cluster the following {sentiment_label} brand mentions into at "
-        f"most 3 distinct themes. Return ONLY a JSON array (no preamble), "
+        f"Group the following numbered {sentiment_label} brand mentions into "
+        "at most 3 distinct themes. Return ONLY a JSON array (no preamble), "
         "where each element has: label (short noun phrase, max 6 words), "
-        "count (rough number of quotes in this theme), sample (a verbatim "
-        "quote from the list). Quotes:\n"
-        f"{joined}"
+        "quotes (array of the numbers of the quotes that belong to this "
+        "theme), sample (one quote copied exactly from the list). Quotes:\n"
+        f"{numbered}"
     )
     result = provider.query(
         user_prompt,
@@ -279,10 +282,21 @@ def _cluster_one(audit_ids: list, flt: dict | None, sentiment_label: str) -> lis
     if not result.succeeded:
         logger.info("theme clustering failed (%s): %s", sentiment_label, result.error[:120])
         return []
-    return _parse_themes(result.text)
+    return _parse_themes(result.text, quotes)
 
 
-def _parse_themes(text: str) -> list[dict]:
+def _collapse_ws(text: str) -> str:
+    return " ".join((text or "").split())
+
+
+def _parse_themes(text: str, quotes: list[str]) -> list[dict]:
+    """Turn the model's theme assignments into computed themes.
+
+    ``count`` is the number of distinct valid quote numbers assigned to the
+    theme; themes with none are dropped. ``sample_quote`` is the model's
+    sample when it appears verbatim in one of the input quotes, otherwise
+    the first assigned quote.
+    """
     match = re.search(r"\[.*\]", text or "", re.DOTALL)
     if not match:
         return []
@@ -292,6 +306,7 @@ def _parse_themes(text: str) -> list[dict]:
         return []
     if not isinstance(data, list):
         return []
+    normalised = [_collapse_ws(q) for q in quotes]
     cleaned: list[dict] = []
     for entry in data[:3]:
         if not isinstance(entry, dict):
@@ -299,12 +314,20 @@ def _parse_themes(text: str) -> list[dict]:
         label = str(entry.get("label", "")).strip()[:80]
         if not label:
             continue
-        try:
-            count = int(entry.get("count", 0))
-        except (TypeError, ValueError):
-            count = 0
-        sample = str(entry.get("sample", "")).strip()[:280]
-        cleaned.append({"label": label, "count": count, "sample_quote": sample})
+        indexes: list[int] = []
+        for raw in entry.get("quotes") or []:
+            try:
+                number = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if 1 <= number <= len(quotes) and number - 1 not in indexes:
+                indexes.append(number - 1)
+        if not indexes:
+            continue
+        sample = _collapse_ws(str(entry.get("sample", "")))
+        if not sample or not any(sample in quote for quote in normalised):
+            sample = normalised[indexes[0]]
+        cleaned.append({"label": label, "count": len(indexes), "sample_quote": sample[:280]})
     return cleaned
 
 
