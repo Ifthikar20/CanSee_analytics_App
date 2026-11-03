@@ -426,6 +426,14 @@ dep_deploy() {
   build_number=$(ssh_remote "cd $REMOTE_DIR && git rev-list --count HEAD")
   build_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
+  # The agent service runs the web image behind the compose profile
+  # "agent" (COMPOSE_PROFILES=agent in docker/.env). Detect it from the
+  # resolved config: naming a profiled service would start it even with
+  # the profile off.
+  local services agent_svc=""
+  services=$(remote_compose "config --services")
+  if grep -qx agent <<<"$services"; then agent_svc="agent"; fi
+
   step "Rebuild backend (web + celery + intelligence + sources)"
   remote_compose "build --build-arg CACHE_DATE=$cache_bust \
     --build-arg GIT_SHA=$new_sha \
@@ -439,6 +447,14 @@ dep_deploy() {
   remote_compose "pull frontend"
   remote_compose "rm -f frontend" >/dev/null 2>&1 || true
   remote_compose "run --rm frontend"
+  # nginx.conf is a single-file bind mount: git replaces the file with a new
+  # inode, which a reload keeps ignoring. When docker/nginx changed since
+  # the previous deploy (or that cannot be told), restart instead.
+  local nginx_changed=1
+  if [[ -n "$PRIOR_SHA" && "$PRIOR_SHA" != "unknown" ]] \
+     && ssh_remote "cd $REMOTE_DIR && git diff --quiet $PRIOR_SHA $new_sha -- docker/nginx"; then
+    nginx_changed=0
+  fi
   # `up -d` rather than `restart`: dep_deploy only brings up web/celery/
   # intelligence/sources, so on a freshly provisioned box no nginx container
   # exists yet and `docker compose restart nginx` exits non-zero -- which
@@ -446,16 +462,27 @@ dep_deploy() {
   # `up -d` is idempotent: it creates the container when absent and is a
   # no-op when it is already running and unchanged.
   remote_compose "up -d nginx"
-  # Reload so in-flight workers re-stat the new index.html. Fall back to a
-  # restart if the container was only just created and cannot reload yet.
-  remote_compose "exec -T nginx nginx -s reload" || remote_compose "restart nginx"
-  ok "Frontend bundle refreshed and nginx reloaded"
+  if [[ "$nginx_changed" == "1" ]]; then
+    remote_compose "restart nginx"
+    ok "Frontend bundle refreshed and nginx restarted (docker/nginx changed)"
+  else
+    # Reload so in-flight workers re-stat the new index.html. Fall back to a
+    # restart if the container was only just created and cannot reload yet.
+    remote_compose "exec -T nginx nginx -s reload" || remote_compose "restart nginx"
+    ok "Frontend bundle refreshed and nginx reloaded"
+  fi
 
   step "Apply migrations & collect static"
   remote_compose "exec -T web python manage.py migrate --noinput"
   remote_compose "exec -T web python manage.py collectstatic --noinput" \
     >/dev/null 2>&1 || true
   ok "Migrations applied"
+
+  if [[ -n "$agent_svc" ]]; then
+    step "Recreate agent (in-flight runs end as interrupted)"
+    remote_compose "up -d --no-deps agent"
+    ok "Agent service recreated on the new image"
+  fi
 }
 
 dep_validate_deploy() {

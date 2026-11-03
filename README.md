@@ -20,6 +20,7 @@ their `*_SERVICE_URL` variables are unset, Django runs the same code in-process.
 |---|---|
 | `apps/llm_ranking` | Prompt runs across the AI engines: answers, mentions, scores |
 | `apps/search_gap` | Google rank per tracked prompt (SerpAPI) next to AI placement |
+| `apps/agent` | The agent workspace: chats, SEO/GEO research tools, writing agents, reports (see Agent service) |
 | `apps/prompt_library` | Tracked prompts, industries, prompt suggestions |
 | `apps/citations` | Sources the AI answers cite |
 | `apps/brand_vault` | Brand facts and brand checks |
@@ -94,6 +95,54 @@ With `DEBUG=True` the OpenAPI schema is served at `/api/schema/`, with Swagger U
   answers 404 for both missing and foreign ids.
 - LLM calls go through a provider class built on `core/llm/base.py`, which records token
   usage and cost for every call.
+
+## Agent service
+
+The agent workspace (`apps/agent`, mounted at `/api/v1/agent/`) is a chat agent on
+Claude Opus 5.5 that researches SEO and GEO visibility, compares the two and drafts
+landing pages, AEO articles and ad campaigns. It ships switched off.
+
+**Two processes.** Gunicorn serves the ordinary endpoints (chats, artifacts, reports,
+brand context, suggestions, activity, status). Everything under `/api/v1/agent/live/`
+(starting and cancelling runs, the event stream and long-poll, page browsing) is served
+by a separate `agent` service: the web image under uvicorn, one worker, settings
+`config.settings.agent` (`AGENT_PROCESS=True`, `CONN_MAX_AGE=0`), ASGI app
+`config.agent_asgi` (plain Django; it starts the run heartbeat at boot, so `status/`
+reports the service as live from the start). Runs execute on a
+thread pool inside that process. nginx routes the `live/` prefix there with buffering
+off and answers `503 agent_unavailable` (JSON) when the service is down or not
+enabled. A gunicorn worker that receives a `live/` request answers the same 503.
+
+**Switches.** `AGENT_ENABLED` (default off) gates every agent endpoint except
+`status/`, which reports what is configured: the switch, the agent process, the model,
+which AI engines and SerpAPI have keys, and the user's AI allowance. Without
+`ANTHROPIC_API_KEY` no run starts (`503 agent_not_configured`); without `SERPAPI_KEY`
+Google research reports `serp_not_configured`; an engine without a key is reported as
+not configured. Nothing is filled in with sample data. The `AGENT_*` settings in
+`config/settings/base.py` (model, effort, token and cost ceilings, concurrency,
+SerpAPI pages, browse limits, stream and heartbeat timing) are all env-overridable.
+
+**Turning it on (owner steps).**
+1. Size the host: a t3.medium is recommended (the 2 GB t3.small is already full), and
+   add a 2 GB swapfile (`scripts/deploy.sh` prints the commands when swap is missing).
+2. In `docker/.env` on the host: `COMPOSE_PROFILES=agent`.
+3. In `.env.prod`: `AGENT_ENABLED=true` and `ANTHROPIC_API_KEY`.
+4. Check that Cloudflare caches nothing under `/api/` (event streams must pass through).
+5. Deploy. `scripts/deploy.sh` detects the profile, recreates the agent after
+   migrations (in-flight runs end as `interrupted`), and restarts nginx when
+   `docker/nginx` changed.
+6. After the first deploy, check the routing:
+   `docker compose -f docker/docker-compose.prod.yml exec nginx nginx -T | grep agent/live`.
+
+Celery beat runs `apps.agent.tasks.sweep_stale_agent_runs` every minute, so a run
+whose process died (deploy, crash) ends as `interrupted` instead of staying "running";
+the agent process also ends such a run as soon as a reader asks for it. A daily
+`apps.agent.tasks.purge_expired_agent_chats` deletes chats idle for longer than
+`AGENT_CHAT_RETENTION_DAYS` (0, the default, keeps every chat; artifacts and reports
+made in a deleted chat stay).
+
+In dev, `runserver` is the agent process (`config/settings/dev.py`); the test suite
+runs turns inline against a fake Anthropic client and never calls the real API.
 
 ## Deploy
 
