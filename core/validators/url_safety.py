@@ -30,6 +30,11 @@ Limitations:
 The existing ``core.validators.url_validator.validate_website_url`` is
 left in place for API form validation but is too loose to be relied on
 as a fetch guard.
+
+services/sources/url_safety.py is a Django-free copy of this module for
+the sources service. Change both together;
+apps/agent/tests/test_fix_be_platform_sources_ssrf.py checks them side by
+side.
 """
 from __future__ import annotations
 

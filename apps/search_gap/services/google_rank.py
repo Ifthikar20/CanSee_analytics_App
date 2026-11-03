@@ -59,12 +59,14 @@ def find_rank(query: str, apex: str, *, max_depth: int = 100, gl: str = "", hl: 
     """Walk Google's organic results until ``apex`` appears.
 
     Returns ``{position, url, title, top_results, ai_overview,
-    pages_fetched, error}``. ``pages_fetched`` counts successful (billed)
-    calls only. ``search`` is injectable so tests never hit the network.
+    ai_overview_deferred, pages_fetched, error}``. ``pages_fetched`` counts
+    successful (billed) calls only. ``ai_overview_deferred``: page one showed
+    an AI Overview whose content was not read. ``search`` is injectable so
+    tests never hit the network.
     """
     out = {
         "position": None, "url": "", "title": "", "top_results": [],
-        "ai_overview": {}, "pages_fetched": 0, "error": "",
+        "ai_overview": {}, "ai_overview_deferred": False, "pages_fetched": 0, "error": "",
     }
     pages = max(1, math.ceil(max(1, int(max_depth)) / PAGE_SIZE))
     for page in range(pages):
@@ -79,6 +81,7 @@ def find_rank(query: str, apex: str, *, max_depth: int = 100, gl: str = "", hl: 
         out["pages_fetched"] += 1
         if page == 0:
             out["ai_overview"] = payload.get("ai_overview") or {}
+            out["ai_overview_deferred"] = bool(payload.get("ai_overview_deferred"))
         organic = payload.get("organic") or []
         if not organic:
             break
@@ -97,14 +100,26 @@ def find_rank(query: str, apex: str, *, max_depth: int = 100, gl: str = "", hl: 
     return out
 
 
-def summarize_ai_overview(block: dict, *, brand: str, apex: str) -> dict:
-    """Did Google's own AI answer show up, name the brand, or cite the site?"""
+def summarize_ai_overview(block: dict, *, brand: str, apex: str, deferred: bool = False) -> dict:
+    """Did Google's own AI answer show up, name the brand, or cite the site?
+
+    ``deferred``: Google showed an overview whose content was not read
+    (serp_google's ``ai_overview_deferred``). With nothing parsed it is
+    reported as shown with ``content_captured`` False and mentions_you /
+    cites_you None (not measured), never as absent or as not naming the
+    brand. ``content_captured`` is True whenever what Google returned was
+    read, including when it showed no overview.
+    """
     block = block or {}
     text = block.get("text") or ""
     references = block.get("references") or []
+    if deferred and not (text or references):
+        return {"shown": True, "content_captured": False, "mentions_you": None,
+                "cites_you": None, "references": []}
     mentions = bool(brand) and re.search(rf"\b{re.escape(brand)}\b", text, re.IGNORECASE) is not None
     return {
         "shown": bool(text or references),
+        "content_captured": True,
         "mentions_you": mentions,
         "cites_you": any(is_same_site(r.get("domain", ""), apex) for r in references),
         "references": references[:MAX_AI_OVERVIEW_REFERENCES],
@@ -162,7 +177,8 @@ def check(brand_prompt, *, force: bool = False, now=None):
         url=found["url"][:2000],
         title=found["title"][:500],
         top_results=found["top_results"],
-        ai_overview=summarize_ai_overview(found["ai_overview"], brand=website.name, apex=apex),
+        ai_overview=summarize_ai_overview(found["ai_overview"], brand=website.name, apex=apex,
+                                          deferred=bool(found.get("ai_overview_deferred"))),
         pages_fetched=pages,
         cost_usd=Decimal(str(settings.SERPAPI_COST_PER_SEARCH_USD)) * pages,
         error=found["error"][:200],

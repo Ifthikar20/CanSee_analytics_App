@@ -81,6 +81,9 @@ class ProviderResult:
     # Perplexity return these out-of-band; the answer text only carries
     # [1][2] markers, so text extraction alone can never recover them).
     citations: list = field(default_factory=list)
+    # Server-side web searches the upstream ran and bills per search
+    # (Anthropic's web_search tool); priced into the recorded cost.
+    web_search_requests: int = 0
 
     @property
     def total_tokens(self) -> int:
@@ -146,13 +149,14 @@ class LLMProvider:
         """
         Run a single prompt against the provider.
 
-        Records token usage centrally on success, attributed to ``module``
-        (the AITokenUsage module key — pass the calling app's name so the
-        per-module spend breakdown stays honest). Retryable call sites
-        (Celery acks_late tasks) pass ``idempotency_key`` so a redelivered
-        task cannot double-count the same logical call; ``extra_metadata``
-        adds flat tags to the usage row (e.g. actor="system" for
-        scheduled work). On failure returns a ProviderResult with
+        Records token usage centrally for every call the upstream billed
+        (a failed result that reports tokens included), attributed to
+        ``module`` (the AITokenUsage module key — pass the calling app's
+        name so the per-module spend breakdown stays honest). Retryable
+        call sites (Celery acks_late tasks) pass ``idempotency_key`` so a
+        redelivered task cannot double-count the same logical call;
+        ``extra_metadata`` adds flat tags to the usage row (e.g.
+        actor="system" for scheduled work). On failure returns a ProviderResult with
         succeeded=False and the upstream error string — callers should
         check `.succeeded` rather than catching exceptions.
         """
@@ -206,17 +210,21 @@ class LLMProvider:
 
         result.duration_ms = int((time.monotonic() - t0) * 1000)
 
-        if result.succeeded:
+        # Tokens on a result mean the upstream answered and billed the call,
+        # even when the answer is unusable (a refusal, an answer cut off at
+        # max_tokens): the service is healthy, and the spend is real.
+        billed = bool(result.input_tokens or result.output_tokens)
+        if result.succeeded or billed:
             breaker.record_success()
-            if result.input_tokens or result.output_tokens:
-                self._record(
-                    result=result, user=user, website=website,
-                    audit_id=audit_id, role=role, module=module,
-                    idempotency_key=idempotency_key,
-                    extra_metadata=extra_metadata,
-                )
         else:
             breaker.record_failure()
+        if billed:
+            self._record(
+                result=result, user=user, website=website,
+                audit_id=audit_id, role=role, module=module,
+                idempotency_key=idempotency_key,
+                extra_metadata=extra_metadata,
+            )
         return result
 
     # ── To implement in subclasses ────────────────────────────────────────
@@ -249,6 +257,7 @@ class LLMProvider:
                 duration_ms=result.duration_ms,
                 metadata=metadata,
                 idempotency_key=idempotency_key,
+                web_search_requests=getattr(result, "web_search_requests", 0),
             )
         except Exception as exc:  # never let bookkeeping break a query
             logger.warning("record_usage failed for %s: %s", self.name, exc)

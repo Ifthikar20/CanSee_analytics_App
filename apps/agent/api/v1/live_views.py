@@ -18,8 +18,10 @@ from rest_framework.renderers import JSONRenderer
 from rest_framework.response import Response
 
 from apps.agent.api.v1.serializers import MessageSerializer, RunSerializer
+from apps.agent.api.v1.stream import open_reads, run_ended
 from apps.agent.api.v1.views import AgentAPIView
 from apps.agent.constants import TERMINAL_RUN_STATUSES
+from apps.agent.exceptions import TooManyStreams
 from apps.agent.runtime.cancel import request_cancel
 from apps.agent.runtime.events import get_event_store, resync_event
 from apps.agent.runtime.registry import start_process_services
@@ -148,7 +150,9 @@ def _int_param(value, default: int, *, low: int, high: int) -> int:
 class RunEventsView(_LiveView):
     """GET ?after=&wait=: the run's events after ``after``, waiting up to
     ``wait`` (max 25) seconds for new ones. Not enveloped:
-    {events, next_after, terminal, run_status}."""
+    {events, next_after, terminal, run_status}. A run that has already
+    ended answers at once; a user holds at most MAX_OPEN_READS_PER_USER
+    polls and streams open at a time (429 too_many_streams)."""
 
     renderer_classes = [JSONRenderer]
 
@@ -162,13 +166,20 @@ class RunEventsView(_LiveView):
             # A run an earlier agent process left behind ends now, so the
             # reader's resync finds the reply settled.
             interrupt_if_orphaned(run.id)
-        result = store.read(run.id, after)
-        if not result.events and result.resync is None and wait:
-            # The wait holds no database connection.
-            if not connection.in_atomic_block:
-                connection.close()
-            store.wait(run.id, after, wait)
+        release = open_reads.acquire(request.user.id)
+        if release is None:
+            raise TooManyStreams()
+        try:
             result = store.read(run.id, after)
+            ended = run.status in TERMINAL_RUN_STATUSES or run_ended(store, str(run.id), after)
+            if not result.events and result.resync is None and wait and not ended:
+                # The wait holds no database connection.
+                if not connection.in_atomic_block:
+                    connection.close()
+                store.wait(run.id, after, wait)
+                result = store.read(run.id, after)
+        finally:
+            release()
         run.refresh_from_db(fields=["status"])
         if result.resync is not None:
             event = resync_event(run.id, run.assistant_message_id, after=after,

@@ -1,15 +1,20 @@
-"""Starting runs: inline (tests) or on this process's run executor.
+"""Starting runs: inline (tests) or on this process's run threads.
 
-Thread mode submits after the transaction that created the run commits,
-to a process-wide pool of AGENT_MAX_CONCURRENT_RUNS threads; queued runs
-wait for a free thread. Every runner thread closes its DB connections
-when it ends.
+Thread mode hands a run over after the transaction that created it
+commits, to a process-wide pool of AGENT_MAX_CONCURRENT_RUNS threads;
+queued runs wait for a free thread. The threads are daemon threads: an
+exiting interpreter (a runserver reload, a shutdown) does not wait for
+the runs in flight, which the next process or the sweeper interrupts,
+and a run handed over meanwhile is still accepted instead of failing the
+request that started it. A run that cannot be handed over is failed at
+once rather than left queued. Every runner thread closes its DB
+connections when a run ends.
 """
 from __future__ import annotations
 
 import logging
+import queue
 import threading
-from concurrent.futures import ThreadPoolExecutor
 
 from django.db import connections, transaction
 from django.utils import timezone
@@ -20,20 +25,38 @@ from apps.agent.runtime.registry import get_registry
 
 logger = logging.getLogger("apps")
 
-_executor_lock = threading.Lock()
-_executor: ThreadPoolExecutor | None = None
+
+class RunThreads:
+    """A fixed set of daemon threads that take run ids from one queue."""
+
+    def __init__(self, size: int):
+        self._queue: queue.SimpleQueue[str] = queue.SimpleQueue()
+        self.threads = [
+            threading.Thread(target=self._work, name=f"agent-run-{i}", daemon=True)
+            for i in range(size)
+        ]
+        for thread in self.threads:
+            thread.start()
+
+    def submit(self, run_id: str) -> None:
+        self._queue.put(run_id)
+
+    def _work(self) -> None:
+        while True:
+            _run_in_thread(self._queue.get())
 
 
-def _get_executor() -> ThreadPoolExecutor:
-    global _executor
-    if _executor is None:
-        with _executor_lock:
-            if _executor is None:
-                _executor = ThreadPoolExecutor(
-                    max_workers=agent_conf().max_concurrent_runs,
-                    thread_name_prefix="agent-run",
-                )
-    return _executor
+_pool_lock = threading.Lock()
+_pool: RunThreads | None = None
+
+
+def _get_pool() -> RunThreads:
+    global _pool
+    if _pool is None:
+        with _pool_lock:
+            if _pool is None:
+                _pool = RunThreads(agent_conf().max_concurrent_runs)
+    return _pool
 
 
 def _run_in_thread(run_id: str) -> None:
@@ -69,6 +92,15 @@ def dispatch_run(run_id) -> None:
     )
 
     def submit():
-        _get_executor().submit(_run_in_thread, run_id)
+        try:
+            _get_pool().submit(run_id)
+        except Exception:
+            # A registered, heart-beaten queued run would hold the chat
+            # (409 run_in_progress) until this process exits.
+            from apps.agent.runtime.runner import fail_unstarted
+
+            logger.exception("agent run %s could not be handed to a thread", run_id)
+            registry.unregister(run_id)
+            fail_unstarted(run_id)
 
     transaction.on_commit(submit)

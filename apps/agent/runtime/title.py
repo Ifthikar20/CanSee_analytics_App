@@ -3,8 +3,8 @@
 When the first message is sent, the chat gets the message cut to 60
 characters on a word boundary (``auto``). The first turn then asks the
 model for a short title (effort low, structured JSON output) and, when
-that works, stores it (``model``) and emits ``chat.updated``. A title
-the user set is never overwritten.
+that works, stores it (``model``) and, while the reply is still running,
+emits ``chat.updated``. A title the user set is never overwritten.
 """
 from __future__ import annotations
 
@@ -81,5 +81,7 @@ def generate_title(run, *, emitter=None) -> str | None:
                .exclude(title_source=TitleSource.USER)
                .update(title=title, title_source=TitleSource.MODEL))
     if updated and emitter is not None:
-        emitter.emit(EventType.CHAT_UPDATED, chat_id=str(run.chat_id), title=title)
+        # A title that comes after the reply ended is only stored: the run's
+        # terminal event stays its last one.
+        emitter.emit_before_end(EventType.CHAT_UPDATED, chat_id=str(run.chat_id), title=title)
     return title if updated else None

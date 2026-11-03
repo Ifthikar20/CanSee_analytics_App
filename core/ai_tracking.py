@@ -38,6 +38,16 @@ PRICING = {
         "input": 5.00, "output": 25.00,
         "cache_write_5m": 6.25, "cache_write_1h": 10.00, "cache_read": 0.50,
     },
+    # Engine-check variants a tracked prompt can select
+    # (apps.llm_ranking.providers.MODEL_VARIANTS).
+    "claude-fable-5": {
+        "input": 10.00, "output": 50.00,
+        "cache_write_5m": 12.50, "cache_write_1h": 20.00, "cache_read": 1.00,
+    },
+    "claude-sonnet-5": {
+        "input": 2.00, "output": 10.00,
+        "cache_write_5m": 2.50, "cache_write_1h": 4.00, "cache_read": 0.20,
+    },
     "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00},
     "claude-sonnet-4-5-20250929": {"input": 3.00, "output": 15.00},
     "claude-opus-4-1-20250805": {"input": 15.00, "output": 75.00},
@@ -67,9 +77,10 @@ PRICING = {
     # xAI
     "grok-4": {"input": 3.00, "output": 15.00},
     "grok-3": {"input": 3.00, "output": 15.00},
-    # Fallback for unknown models — conservative estimate. Erring high is
-    # deliberate: a missing price must never understate spend against the
-    # margin cap.
+    # Fallback for models without a row. It is a mid-tier rate, so a model
+    # priced above it would be understated against the margin cap: every
+    # model the product selects on its own (provider defaults, MODEL_VARIANTS)
+    # needs its own row rather than relying on this one.
     "default": {"input": 3.00, "output": 15.00},
 }
 
@@ -79,6 +90,8 @@ MODEL_PROVIDER = {
     "claude-opus-5-5": "anthropic",
     "claude-opus-5": "anthropic",
     "claude-opus-4-8": "anthropic",
+    "claude-fable-5": "anthropic",
+    "claude-sonnet-5": "anthropic",
     "claude-sonnet-4-20250514": "anthropic",
     "claude-sonnet-4-5-20250929": "anthropic",
     "claude-opus-4-1-20250805": "anthropic",
@@ -421,14 +434,36 @@ AI_SPEND_CAP_RATIO = 0.65
 AI_SPEND_WARN_RATIO = 0.80
 
 
+def ai_allowance_plan(user) -> str:
+    """The plan whose AI allowance ``user`` gets, as a PLAN_LIMITS key.
+
+    The organization's plan for an org member (plan_limits.org_plan_for,
+    which honours the ORG_FEATURES_ENABLED master switch), else the plan
+    the user's own subscription grants (plan_limits.current_plan_for).
+    effective_ai_cap prices this plan and every usage surface labels the
+    cap with it, so the label and the number can never disagree.
+    """
+    from apps.billing.services.plan_limits import current_plan_for, org_plan_for
+    from core.utils.constants import PLAN_LIMITS, Plan
+
+    plan = org_plan_for(user) or current_plan_for(user)
+    if plan not in PLAN_LIMITS:
+        # An unrecognised plan value grants nothing beyond the free tier.
+        plan = Plan.FREE
+    return plan
+
+
 def effective_ai_cap(user) -> float:
     """Monthly AI spend allowance in USD for ``user``. 0 = unlimited.
 
-    Organization members get their organization's plan cap, resolved the
-    same way plan_limits.get_limits resolves an org member's plan
-    (apps.billing.services.plan_limits.org_plan_for); only an actual
-    OrganizationMember row grants it. Everyone else is resolved from
-    ACTUAL subscription status (plan_limits.current_plan_for): an account
+    The plan comes from ai_allowance_plan. Organization members get their
+    organization's plan cap, resolved the same way plan_limits.get_limits
+    resolves an org member's plan (plan_limits.org_plan_for); only an
+    actual OrganizationMember row grants it, and only while
+    ORG_FEATURES_ENABLED is on: with the master switch off production is
+    plain B2C, so a member staged before launch keeps the individual
+    allowance, as the session and billing pages show. Everyone else is
+    resolved from ACTUAL subscription status (plan_limits.current_plan_for): an account
     without an active/trialing subscription is on the FREE plan and gets
     ``settings.AI_FREE_MONTHLY_CAP_USD`` (a small acquisition budget) —
     never a paid tier's allowance. The denormalized user.plan value is
@@ -450,13 +485,9 @@ def effective_ai_cap(user) -> float:
         return 0.0
     from django.conf import settings
 
-    from apps.billing.services.plan_limits import current_plan_for, org_plan_for
     from core.utils.constants import PLAN_LIMITS, Plan
 
-    plan = org_plan_for(user) or current_plan_for(user)
-    if plan not in PLAN_LIMITS:
-        # An unrecognised plan value grants nothing beyond the free tier.
-        plan = Plan.FREE
+    plan = ai_allowance_plan(user)
     limits = PLAN_LIMITS[plan]
     manual = float(getattr(user, "monthly_ai_cost_cap_usd", 0) or 0)
 

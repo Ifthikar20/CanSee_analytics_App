@@ -2,6 +2,9 @@
 
 Mid-stream failures arrive as APIStatusError with HTTP 200 (an SSE
 ``error`` event); they are classified by the error type in the body.
+A connection that breaks while the body streams (a reset, a cut proxy,
+a read timeout) surfaces as the transport's own error: the SDK wraps
+transport errors in APIConnectionError only while it sends the request.
 Messages never carry raw upstream text.
 """
 from __future__ import annotations
@@ -9,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import anthropic
+import httpx2
 
 from apps.agent.exceptions import AgentNotConfigured
 
@@ -95,7 +99,8 @@ def classify(exc: BaseException) -> RunError:
         if exc.status_code == 413 or "prompt is too long" in _error_text(exc):
             return CONTEXT_TOO_LONG
         return BAD_REQUEST
-    if isinstance(exc, anthropic.APIConnectionError):
-        # APITimeoutError is a subclass.
+    if isinstance(exc, anthropic.APIConnectionError | httpx2.TransportError):
+        # APITimeoutError is a subclass of the first; ReadError,
+        # RemoteProtocolError and ReadTimeout of the second.
         return UNREACHABLE
     return INTERNAL

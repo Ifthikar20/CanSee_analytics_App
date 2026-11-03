@@ -17,11 +17,14 @@ A manual loop over streamed requests (design section 6):
 - invalid streamed tool JSON and mid-stream overload are retried a few
   times with ``turn.reset`` (and ``run.retrying`` after a backoff);
 - a stop keeps the safe part of the response and answers open tool
-  calls with "Stopped before this ran.".
+  calls with "Stopped before this ran."; every ending stores a wire the
+  next turn can follow (wire.close_turn: a paused server tool call that
+  never got its result is dropped).
 
 Usage is recorded per request and the gate (llm.gate) is checked before
 every request. Postgres holds the result: wire at each boundary, parts
-at checkpoints, status with a compare-and-set at the end.
+at checkpoints, status with a compare-and-set at the end. A run always
+ends with one terminal event, also when the database fails under it.
 """
 from __future__ import annotations
 
@@ -36,6 +39,7 @@ from django.utils import timezone
 
 from apps.agent.conf import agent_conf
 from apps.agent.constants import (
+    ACTIVE_RUN_STATUSES,
     EventType,
     MessageStatus,
     PartType,
@@ -43,13 +47,13 @@ from apps.agent.constants import (
     RunTrigger,
 )
 from apps.agent.llm.client import get_client
-from apps.agent.llm.errors import classify
+from apps.agent.llm.errors import INTERNAL, classify
 from apps.agent.llm.gate import CancelRequested, GateStop, before_request
 from apps.agent.llm.request import MAX_OUTPUT_TOKENS, build_turn_request
 from apps.agent.llm.usage import UsageTotals, estimate_output_tokens, record_request_usage
 from apps.agent.runtime import wire
 from apps.agent.runtime.emitter import RunEmitter
-from apps.agent.runtime.events import now_iso
+from apps.agent.runtime.events import get_event_store, now_iso
 from apps.agent.runtime.registry import get_registry
 from apps.agent.runtime.request_stream import stream_request
 from apps.agent.runtime.translate import StreamTranslator
@@ -78,27 +82,71 @@ class Ending:
 
 def run_turn(run_id) -> None:
     """Execute a queued run to its end. A run another worker took, or one
-    stopped while queued, is left alone."""
+    stopped while queued, is left alone. A run that cannot even start
+    (the database failed under it) is failed, so it never stays active."""
     from apps.agent.models import AgentRun
 
     registry = get_registry()
-    now = timezone.now()
-    claimed = AgentRun.objects.filter(id=run_id, status=RunStatus.QUEUED).update(
-        status=RunStatus.RUNNING, executor_id=registry.executor_id, started_at=now,
-        heartbeat_at=now,
-    )
-    if not claimed:
-        registry.unregister(run_id)
-        return
-    run = (AgentRun.objects
-           .select_related("chat", "chat__snapshot", "website", "user", "assistant_message",
-                           "user_message")
-           .get(id=run_id))
-    active = registry.register(run.id)
     try:
-        TurnRunner(run, active).execute()
+        now = timezone.now()
+        claimed = AgentRun.objects.filter(id=run_id, status=RunStatus.QUEUED).update(
+            status=RunStatus.RUNNING, executor_id=registry.executor_id, started_at=now,
+            heartbeat_at=now,
+        )
+        if not claimed:
+            return
+        run = (AgentRun.objects
+               .select_related("chat", "chat__snapshot", "website", "user", "assistant_message",
+                               "user_message")
+               .get(id=run_id))
+        TurnRunner(run, registry.register(run.id)).execute()
+    except Exception:
+        logger.exception("agent run %s could not start", run_id)
+        _reset_connections()
+        fail_unstarted(run_id)
     finally:
-        registry.unregister(run.id)
+        registry.unregister(run_id)
+
+
+def _reset_connections() -> None:
+    """Drop this thread's database connections, so the next query opens a
+    new one (Django reconnects only between requests, never inside a run
+    thread). A connection inside a transaction (an inline run) is kept."""
+    for conn in connections.all(initialized_only=True):
+        if not conn.in_atomic_block:
+            conn.close()
+
+
+def fail_unstarted(run_id) -> None:
+    """Fail a run whose runner never got going (it could not start, or not
+    be handed to a thread), and end its event stream."""
+    from apps.agent.models import AgentMessage, AgentRun
+
+    message_id = None
+    try:
+        message_id = (AgentRun.objects.filter(id=run_id)
+                      .values_list("assistant_message_id", flat=True).first())
+        now = timezone.now()
+        failed = AgentRun.objects.filter(id=run_id, status__in=ACTIVE_RUN_STATUSES).update(
+            status=RunStatus.FAILED, error_code=INTERNAL.code, error_message=INTERNAL.message,
+            finished_at=now,
+        )
+        if failed and message_id:
+            AgentMessage.objects.filter(id=message_id).update(
+                status=MessageStatus.FAILED, error_code=INTERNAL.code,
+                error_message=INTERNAL.message, finished_at=now,
+            )
+    except Exception:
+        logger.exception("agent run %s could not be marked failed", run_id)
+    store = get_event_store()
+    if store.has(run_id):
+        store.append(str(run_id), {
+            "type": EventType.RUN_FAILED,
+            "run_id": str(run_id),
+            "message_id": str(message_id) if message_id else None,
+            "ts": now_iso(),
+            "error": INTERNAL.as_payload(),
+        })
 
 
 class TurnRunner:
@@ -121,31 +169,52 @@ class TurnRunner:
                               or self.conf.max_tokens)
         self.model_used = (self.snapshot.config or {}).get("model") or self.conf.model
         self._client = None
-        self._title_thread: threading.Thread | None = None
+        # The outcome of the terminal compare-and-set, once _finish made it.
+        self._claimed: bool | None = None
 
     # ── Entry ────────────────────────────────────────────────────────
 
     def execute(self) -> None:
         from apps.agent.models import AgentMessage
 
-        now = timezone.now()
-        AgentMessage.objects.filter(id=self.message.id).update(
-            started_at=now, status=MessageStatus.STREAMING,
-        )
-        self.emitter.emit(EventType.RUN_STARTED, chat_id=str(self.chat.id),
-                          user_message_id=str(self.user_message.id), model=self.model_used)
-        self._start_title()
+        ending = Ending(MessageStatus.FAILED, error=INTERNAL.as_payload())
         try:
-            ending = self._loop()
-        except CancelRequested:
-            ending = Ending(MessageStatus.CANCELLED)
-        except GateStop as stop:
-            ending = Ending(MessageStatus.FAILED, error=stop.as_payload())
-        except Exception as exc:
-            logger.exception("agent run %s failed", self.run.id)
-            ending = Ending(MessageStatus.FAILED, error=classify(exc).as_payload())
-        self._finish_title()
-        self._finish(ending)
+            now = timezone.now()
+            AgentMessage.objects.filter(id=self.message.id).update(
+                started_at=now, status=MessageStatus.STREAMING,
+            )
+            self.emitter.emit(EventType.RUN_STARTED, chat_id=str(self.chat.id),
+                              user_message_id=str(self.user_message.id), model=self.model_used)
+            self._announce_fallback_title()
+            self._start_title()
+            try:
+                ending = self._loop()
+            except CancelRequested:
+                ending = Ending(MessageStatus.CANCELLED)
+            except GateStop as stop:
+                ending = Ending(MessageStatus.FAILED, error=stop.as_payload())
+            except Exception as exc:
+                logger.exception("agent run %s failed", self.run.id)
+                ending = Ending(MessageStatus.FAILED, error=classify(exc).as_payload())
+            self._inline_title()
+            self._finish(ending)
+        except Exception:
+            # The database failed under the run (a dropped connection, a
+            # Postgres restart): end it on a new connection.
+            logger.exception("agent run %s could not be finished", self.run.id)
+            self._finish_after_error(ending)
+
+    def _finish_after_error(self, ending: Ending) -> None:
+        """Finish once more on new connections and, when even that fails,
+        still end the event stream, so no reader waits on a run that no
+        thread runs any more (the sweeper settles the row later)."""
+        _reset_connections()
+        try:
+            self._finish(ending)
+        except Exception:
+            logger.exception("agent run %s could not be saved", self.run.id)
+        if not self.emitter.ended:
+            self.emitter.emit(EventType.RUN_FAILED, error=INTERNAL.as_payload())
 
     # ── Loop ─────────────────────────────────────────────────────────
 
@@ -226,7 +295,7 @@ class TurnRunner:
             if stop == "pause_turn":
                 pauses += 1
                 if pauses > MAX_PAUSES:
-                    self._trim_paused_tail()
+                    self._close_turn()
                     return Ending(MessageStatus.FAILED, stop_reason=stop, error={
                         "code": "pause_limit", "retryable": True,
                         "message": "The web research took too many steps to finish.",
@@ -305,25 +374,22 @@ class TurnRunner:
         self.emitter.checkpoint(force=True)
 
     def _keep_partial(self, outcome) -> None:
+        """Keep the safe part of a stopped response. When it continued a
+        paused one, the two are cut together: a paused server tool call
+        whose result had not arrived yet is dropped."""
         kept = wire.safe_prefix(outcome.partial_blocks, outcome.completed)
         if kept:
             self.turn_wire.append(wire.assistant_message(kept))
-            ids = wire.tool_use_ids(kept)
-            if ids:
-                self.turn_wire.append(wire.stopped_results(ids))
+        closed = wire.close_turn(self.turn_wire)
+        if kept or closed != self.turn_wire:
+            self.turn_wire = closed
             self._save_wire()
 
-    def _trim_paused_tail(self) -> None:
-        last = self.turn_wire[-1] if self.turn_wire else None
-        if not last or last.get("role") != "assistant":
-            return
-        blocks = last["content"]
-        kept = wire.safe_prefix(blocks, set(range(len(blocks))))
-        if kept:
-            self.turn_wire[-1] = wire.assistant_message(kept)
-        else:
-            self.turn_wire.pop()
-        self._save_wire()
+    def _close_turn(self) -> None:
+        closed = wire.close_turn(self.turn_wire)
+        if closed != self.turn_wire:
+            self.turn_wire = closed
+            self._save_wire()
 
     def _skip_dropped(self, translator, dropped_ids: list[str]) -> None:
         for tid in dropped_ids:
@@ -396,7 +462,21 @@ class TurnRunner:
         return (self.run.trigger == RunTrigger.SEND and self.user_message.parent_id is None
                 and self.chat.title_source != TitleSource.USER)
 
+    def _announce_fallback_title(self) -> None:
+        """First turn: send the title the chat has now (the first message cut
+        to length, stored when it was sent), so the chat list shows it even
+        when the model's title fails or comes after the reply ended."""
+        from apps.agent.constants import TitleSource
+
+        if (self.user_message.parent_id is None and self.chat.title
+                and self.chat.title_source == TitleSource.AUTO):
+            self.emitter.emit(EventType.CHAT_UPDATED, chat_id=str(self.chat.id),
+                              title=self.chat.title)
+
     def _start_title(self) -> None:
+        """Thread mode: ask for the title next to the turn. The reply never
+        waits for it; a title that comes after the reply ended is stored
+        without an event (the emitter takes none after the terminal one)."""
         if not self._wants_title() or self.conf.run_mode == "inline":
             return
         from apps.agent.runtime.title import generate_title
@@ -409,21 +489,18 @@ class TurnRunner:
             finally:
                 connections.close_all()
 
-        self._title_thread = threading.Thread(target=work, name="agent-title", daemon=True)
-        self._title_thread.start()
+        threading.Thread(target=work, name="agent-title", daemon=True).start()
 
-    def _finish_title(self) -> None:
-        if self._title_thread is not None:
-            # A title still pending after the reply is not worth waiting for.
-            self._title_thread.join(timeout=5)
+    def _inline_title(self) -> None:
+        """Inline mode: the title request runs here, before the reply ends."""
+        if not self._wants_title() or self.conf.run_mode != "inline":
             return
-        if self._wants_title() and self.conf.run_mode == "inline":
-            from apps.agent.runtime.title import generate_title
+        from apps.agent.runtime.title import generate_title
 
-            try:
-                generate_title(self.run, emitter=self.emitter)
-            except Exception:
-                logger.warning("agent: title generation failed", exc_info=True)
+        try:
+            generate_title(self.run, emitter=self.emitter)
+        except Exception:
+            logger.warning("agent: title generation failed", exc_info=True)
 
     # ── End ──────────────────────────────────────────────────────────
 
@@ -453,8 +530,12 @@ class TurnRunner:
                                          error="Stopped" if stopped else "Not finished")
 
     def _finish(self, ending: Ending) -> None:
+        """Store the end of the run and emit its terminal event. Safe to
+        call again after it raised: the compare-and-set and the terminal
+        event happen once."""
         from apps.agent.models import AgentChat, AgentMessage, AgentRun
 
+        self.turn_wire = wire.close_turn(self.turn_wire)
         self._close_open_parts(ending)
         parts, parts_seq, research = self.emitter.snapshot()
         now = timezone.now()
@@ -465,10 +546,15 @@ class TurnRunner:
         }.get(status, RunStatus.COMPLETED)
         error = ending.error or {}
         t = self.totals
-        claimed = AgentRun.objects.filter(id=self.run.id, status=RunStatus.RUNNING).update(
-            status=run_status, stop_reason=ending.stop_reason, error_code=error.get("code", ""),
-            error_message=error.get("message", ""), finished_at=now, last_seq=parts_seq,
-        )
+        if self._claimed is None:
+            self._claimed = bool(
+                AgentRun.objects.filter(id=self.run.id, status=RunStatus.RUNNING).update(
+                    status=run_status, stop_reason=ending.stop_reason,
+                    error_code=error.get("code", ""), error_message=error.get("message", ""),
+                    finished_at=now, last_seq=parts_seq,
+                )
+            )
+        claimed = self._claimed
         message_fields = {
             "wire": wire.dumps(self.turn_wire),
             "parts": parts,
@@ -487,20 +573,25 @@ class TurnRunner:
         AgentMessage.objects.filter(id=self.message.id).update(**message_fields)
         if not claimed:
             # The row was ended elsewhere (the sweeper); tell local readers.
-            self.emitter.emit(EventType.RUN_INTERRUPTED, reason="lost")
+            if not self.emitter.ended:
+                self.emitter.emit(EventType.RUN_INTERRUPTED, reason="lost")
             return
         AgentChat.objects.filter(id=self.chat.id).update(last_message_at=now)
-        duration_ms = int((time.monotonic() - self.started) * 1000)
+        if not self.emitter.ended:
+            self._emit_terminal(run_status, ending, parts_seq)
+        AgentRun.objects.filter(id=self.run.id).update(last_seq=self.emitter.last_seq)
+
+    def _emit_terminal(self, run_status: str, ending: Ending, parts_seq: int) -> None:
+        error = ending.error or {}
         if run_status == RunStatus.CANCELLED:
-            event = self.emitter.emit(EventType.RUN_CANCELLED)
+            self.emitter.emit(EventType.RUN_CANCELLED)
         elif run_status == RunStatus.FAILED:
-            event = self.emitter.emit(EventType.RUN_FAILED, error={
+            self.emitter.emit(EventType.RUN_FAILED, error={
                 "code": error.get("code", "internal_error"),
                 "message": error.get("message", "Something went wrong."),
                 "retryable": bool(error.get("retryable")),
             })
         else:
-            event = self.emitter.emit(EventType.RUN_COMPLETED, status=status,
-                                      stop_reason=ending.stop_reason, parts_seq=parts_seq,
-                                      duration_ms=duration_ms)
-        AgentRun.objects.filter(id=self.run.id).update(last_seq=event["seq"])
+            self.emitter.emit(EventType.RUN_COMPLETED, status=ending.message_status,
+                              stop_reason=ending.stop_reason, parts_seq=parts_seq,
+                              duration_ms=int((time.monotonic() - self.started) * 1000))

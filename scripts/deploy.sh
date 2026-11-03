@@ -433,6 +433,17 @@ dep_deploy() {
   local services agent_svc=""
   services=$(remote_compose "config --services")
   if grep -qx agent <<<"$services"; then agent_svc="agent"; fi
+  if [[ -z "$agent_svc" ]]; then
+    # The profile is off. A container left from when it was on keeps its
+    # old image and env (AGENT_ENABLED included), stays reachable through
+    # nginx and comes back after a reboot (restart: unless-stopped), so
+    # remove it. Naming the profile on ps/rm starts nothing.
+    if [[ -n "$(remote_compose "--profile agent ps -a -q agent" 2>/dev/null || true)" ]]; then
+      step "Remove the agent container (the agent profile is off)"
+      remote_compose "--profile agent rm -s -f agent"
+      ok "Agent service removed; its routes now answer 503 agent_unavailable"
+    fi
+  fi
 
   step "Rebuild backend (web + celery + intelligence + sources)"
   remote_compose "build --build-arg CACHE_DATE=$cache_bust \
@@ -447,14 +458,6 @@ dep_deploy() {
   remote_compose "pull frontend"
   remote_compose "rm -f frontend" >/dev/null 2>&1 || true
   remote_compose "run --rm frontend"
-  # nginx.conf is a single-file bind mount: git replaces the file with a new
-  # inode, which a reload keeps ignoring. When docker/nginx changed since
-  # the previous deploy (or that cannot be told), restart instead.
-  local nginx_changed=1
-  if [[ -n "$PRIOR_SHA" && "$PRIOR_SHA" != "unknown" ]] \
-     && ssh_remote "cd $REMOTE_DIR && git diff --quiet $PRIOR_SHA $new_sha -- docker/nginx"; then
-    nginx_changed=0
-  fi
   # `up -d` rather than `restart`: dep_deploy only brings up web/celery/
   # intelligence/sources, so on a freshly provisioned box no nginx container
   # exists yet and `docker compose restart nginx` exits non-zero -- which
@@ -462,14 +465,24 @@ dep_deploy() {
   # `up -d` is idempotent: it creates the container when absent and is a
   # no-op when it is already running and unchanged.
   remote_compose "up -d nginx"
-  if [[ "$nginx_changed" == "1" ]]; then
-    remote_compose "restart nginx"
-    ok "Frontend bundle refreshed and nginx restarted (docker/nginx changed)"
-  else
+  # nginx.conf is a single-file bind mount: git replaces the file with a new
+  # inode, and the running container keeps the old one (a reload re-reads
+  # that stale copy) until nginx restarts. Decide from what the container
+  # holds, not from git history: a deploy that failed after the pull has
+  # already moved HEAD, so a later run would see no change under
+  # docker/nginx while nginx still serves the old file.
+  local nginx_conf
+  nginx_conf=$(ssh_remote "cd $REMOTE_DIR && sed -n 's/^NGINX_CONF=//p' docker/.env 2>/dev/null | tail -n 1" || true)
+  nginx_conf=$(printf '%s' "$nginx_conf" | tr -d "\"' \r\t")
+  nginx_conf="${nginx_conf:-nginx.prod.conf}"
+  if ssh_remote "cd $REMOTE_DIR && docker compose -f $COMPOSE_FILE exec -T nginx cat /etc/nginx/nginx.conf | cmp -s - docker/nginx/$nginx_conf"; then
     # Reload so in-flight workers re-stat the new index.html. Fall back to a
     # restart if the container was only just created and cannot reload yet.
     remote_compose "exec -T nginx nginx -s reload" || remote_compose "restart nginx"
     ok "Frontend bundle refreshed and nginx reloaded"
+  else
+    remote_compose "restart nginx"
+    ok "Frontend bundle refreshed and nginx restarted (it held an outdated $nginx_conf)"
   fi
 
   step "Apply migrations & collect static"

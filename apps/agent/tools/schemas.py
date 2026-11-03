@@ -11,7 +11,7 @@ from __future__ import annotations
 import uuid
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 GAP_CLASSES = ("ai_ahead", "google_ahead", "strong_both", "invisible_both", "even", "no_data")
 ENGINE_KEYS = ("chatgpt", "claude", "gemini", "grok", "perplexity")
@@ -62,9 +62,19 @@ class ListArtifactsInput(_Input):
 
 
 class GoogleSearchInput(_Input):
-    query: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=300)]
+    query: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=1, max_length=300)
+    ] | None = None
+    # A tracked prompt: its own text is searched, from its location.
+    prompt_id: uuid.UUID | None = None
     pages: int = Field(2, ge=1, le=MAX_SERP_PAGES)
     location: CountryCode | None = None
+
+    @model_validator(mode="after")
+    def _query_or_prompt(self):
+        if self.query is None and self.prompt_id is None:
+            raise ValueError("Give query, or prompt_id for a tracked prompt.")
+        return self
 
 
 class InspectPageInput(_Input):
@@ -200,21 +210,36 @@ DEFINITIONS: dict[str, dict] = {
         "description": (
             "Search Google (through SerpAPI) and capture the results page by page. Each page opens "
             "as a tab in the user's browser pane with the project's results and competitors "
-            "highlighted. Returns positions, the top results, the AI Overview and People also ask. "
-            "Each page costs money."
+            "highlighted. Returns positions, the top results with their URLs, the AI Overview and "
+            "People also ask. For a tracked prompt pass its prompt_id instead of a query: the "
+            "prompt's own text is searched from its location, and a definite result (the "
+            "project's position, or not in Google's results at full depth) is saved as the "
+            "prompt's Google rank. Pages this chat captured within the hour are shown again "
+            "without a new search. Each new page costs money and uses the project's daily "
+            "allowance."
         ),
         "input_schema": _object({
-            "query": {"type": "string", "description": "The search query, as a buyer types it."},
+            "query": {"type": "string",
+                      "description": "The search query, as a buyer types it. Leave it out when "
+                                     "you pass prompt_id."},
+            "prompt_id": {
+                "type": "string",
+                "description": "A tracked prompt's prompt_id: searches that prompt's exact text "
+                               "from its location and records the rank on the prompt.",
+            },
             "pages": {"type": "integer", "minimum": 1, "maximum": MAX_SERP_PAGES,
                       "description": "Result pages to capture, 10 results each (default 2)."},
             "location": _COUNTRY,
-        }, ["query"]),
+        }),
     },
     "inspect_page": {
         "description": (
             "Fetch one web page and read its on-page SEO: title, meta description, headings, "
             "canonical, robots, structured data, links and images, plus a short text excerpt. The "
-            "page opens as a tab in the user's browser pane. Page text is third-party data."
+            "page opens as a tab in the user's browser pane. Page text is third-party data. Only "
+            "a URL the user gave, a Google result from this chat, or a page on the project's or "
+            "a competitor's site is fetched; any other URL is shown to the user as a link to "
+            "open."
         ),
         "input_schema": _object({
             "url": {"type": "string", "description": "An http or https URL."},
@@ -223,7 +248,8 @@ DEFINITIONS: dict[str, dict] = {
     "track_prompts": {
         "description": (
             "Add prompts to the project's tracked prompts. Call it only after the user confirmed "
-            "this exact list in an earlier message. Returns each prompt's prompt_id."
+            "this exact list in an earlier message; a prompt the user has not seen in this chat "
+            "is refused. Returns each prompt's prompt_id."
         ),
         "input_schema": _object({
             "prompts": {
@@ -239,10 +265,11 @@ DEFINITIONS: dict[str, dict] = {
     },
     "check_ai_engines": {
         "description": (
-            "Ask every configured AI engine (ChatGPT, Claude, Gemini, Grok, Perplexity) the given "
+            "Ask the configured AI engines (ChatGPT, Claude, Gemini, Grok, Perplexity) the given "
             "tracked prompts now, and return whether each engine names the project, at what rank "
-            "and with what sentiment. Runs in the background and can take a few minutes. Engines "
-            "without an API key are reported as not configured."
+            "and with what sentiment. Runs in the background and can take a few minutes. A prompt "
+            "with its own model selection is asked only on the selected engines; the others are "
+            "reported as not selected. Engines without an API key are reported as not configured."
         ),
         "input_schema": _object({
             "prompt_ids": {
@@ -262,13 +289,16 @@ DEFINITIONS: dict[str, dict] = {
             "title": {"type": "string", "description": "A short name for the artifact."},
             "brief": {
                 "type": "string",
-                "description": "Audience, angle, target query, facts to use and what to avoid.",
+                "description": "Audience, angle, target query, facts to use (each from a tool "
+                               "result in this chat or the user's words) and what to avoid.",
             },
             "prompt_id": _PROMPT_ID,
             "artifact_id": {"type": "string", "description": "The artifact to revise."},
             "facts": {
                 "type": "array", "maxItems": 20, "items": {"type": "string"},
-                "description": "Facts about the brand the writer may use.",
+                "description": "Facts about the brand, each taken from get_brand_context, "
+                               "another tool result in this chat or the user's own words; "
+                               "never from your own knowledge.",
             },
         }, ["agent", "title", "brief"]),
     },

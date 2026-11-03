@@ -3,8 +3,9 @@
 A run is stale when its heartbeat (or, before its first one, its
 creation) is older than AGENT_STALE_SECONDS. It moves to ``interrupted``
 with a compare-and-set, its message is marked interrupted, open parts
-are closed, and its stored wire is left valid for the next turn (an
-unanswered tool call gets a "Stopped before this ran." result). The
+are closed, and its stored wire is left valid for the next turn
+(wire.close_turn: an unanswered tool call gets a "Stopped before this
+ran." result, a paused server tool call without its result goes). The
 celery beat task runs it every minute; reading a chat runs it for that
 chat; the agent process ends a run another executor left behind as soon
 as a reader asks for it.
@@ -27,18 +28,6 @@ from apps.agent.runtime.parts import strip_nul
 logger = logging.getLogger("apps")
 
 _DONE = {"done", "error", "cancelled", "unavailable"}
-
-
-def _close_wire(turn: list[dict]) -> list[dict]:
-    if not turn or turn[-1].get("role") != "assistant":
-        return turn
-    blocks = turn[-1].get("content") or []
-    kept = wire.safe_prefix(blocks, set(range(len(blocks))))
-    turn = turn[:-1] + ([wire.assistant_message(kept)] if kept else [])
-    ids = wire.tool_use_ids(kept)
-    if ids:
-        turn.append(wire.stopped_results(ids))
-    return turn
 
 
 def _close_parts(parts: list[dict]) -> list[dict]:
@@ -77,7 +66,7 @@ def interrupt_runs(run_ids, *, reason: str) -> int:
             continue
         message = run.assistant_message
         try:
-            turn = _close_wire(wire.loads(message.wire))
+            turn = wire.close_turn(wire.loads(message.wire))
         except ValueError:
             logger.warning("agent: unreadable wire on message %s", message.id)
             turn = wire.loads(message.wire) if message.wire else []

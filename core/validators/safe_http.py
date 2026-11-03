@@ -30,6 +30,11 @@ path which fetches a user-supplied URL must use. Hardening covered:
 
 What this does not defeat: hostile content. Callers treat what comes
 back as untrusted data.
+
+services/sources/safe_http.py is a Django-free copy of this module for
+the sources service. Change both together;
+apps/agent/tests/test_fix_be_platform_sources_ssrf.py checks them side by
+side.
 """
 from __future__ import annotations
 

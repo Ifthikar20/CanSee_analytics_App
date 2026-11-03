@@ -10,7 +10,12 @@ import os
 
 from django.core.asgi import get_asgi_application
 
-os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings.agent")
+# Assigned, not setdefault: importing this module first runs
+# config/__init__.py, whose Celery app has already defaulted the variable to
+# the prod settings, and those cannot serve the live endpoints (AGENT_PROCESS
+# is off, connections persist). This module is only ever the agent service's
+# entry point. Celery reads settings lazily, so they are not configured yet.
+os.environ["DJANGO_SETTINGS_MODULE"] = "config.settings.agent"
 
 application = get_asgi_application()
 

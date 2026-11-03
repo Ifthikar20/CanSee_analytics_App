@@ -14,7 +14,7 @@ import re
 import threading
 import time
 
-from apps.agent.constants import EventType
+from apps.agent.constants import TERMINAL_EVENT_TYPES, EventType
 from apps.agent.runtime.events import get_event_store, now_iso
 from apps.agent.runtime.parts import PART_EVENT_TYPES, PartsState, strip_nul
 
@@ -40,6 +40,8 @@ class RunEmitter:
         self.persisted_seq = int(message.parts_seq or 0)
         self._last_checkpoint = time.monotonic()
         self._dirty = False
+        # Set once the run's terminal event went out.
+        self.ended = False
 
     # ── Events ───────────────────────────────────────────────────────
 
@@ -57,8 +59,18 @@ class RunEmitter:
             if type in PART_EVENT_TYPES:
                 self._parts.apply(event)
                 self._dirty = True
+            if type in TERMINAL_EVENT_TYPES:
+                self.ended = True
             self.last_seq = event["seq"]
             return event
+
+    def emit_before_end(self, type: str, **payload) -> dict | None:
+        """``emit``, unless the terminal event already went out (readers
+        stop there, so a later event would never be seen)."""
+        with self._lock:
+            if self.ended:
+                return None
+            return self.emit(type, **payload)
 
     # ── Parts ────────────────────────────────────────────────────────
 

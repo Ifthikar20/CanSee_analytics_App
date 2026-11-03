@@ -43,6 +43,12 @@ services:
       # so it can never silently inherit the wsgi.py prod default or masquerade
       # as a production bring-up.
       DJANGO_SETTINGS_MODULE: config.settings.dev
+      # The image runs gunicorn with several workers, and the agent runs in
+      # one process only: each worker would treat the others' runs as
+      # orphans and interrupt them. This stack has no agent process; the
+      # live endpoints answer 503 agent_unavailable. Use
+      # docker-compose.dev.yml (runserver is the agent process there).
+      AGENT_PROCESS: "false"
     depends_on:
       db:
         condition: service_healthy

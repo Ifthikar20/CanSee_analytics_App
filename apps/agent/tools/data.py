@@ -27,7 +27,8 @@ KNOWLEDGE_CHUNKS = 5
 KNOWLEDGE_CHARS = 800
 
 
-def _brand_prompt(website, prompt_id):
+def tracked_prompt(website, prompt_id):
+    """The website's BrandPrompt for ``prompt_id``, or a ToolError."""
     from apps.prompt_library.models import BrandPrompt
 
     bp = (
@@ -104,6 +105,26 @@ def list_tracked_prompts(ctx: ToolContext, args) -> ToolResult:
     return ToolResult.ok(result, summary=f"{len(rows)} {noun}")
 
 
+def ai_overview_summary(overview: dict) -> dict:
+    """Whether Google showed an AI Overview, and whether it names or cites
+    the brand. Those two stay None (not measured) for an overview whose
+    content was never read (``content_captured`` False), with a note saying
+    so. ``content_captured`` is passed on when the capture recorded it (rank
+    checks from before it existed did not)."""
+    from apps.agent.tools.research import DEFERRED_OVERVIEW_NOTE
+
+    out = {
+        "shown": bool(overview.get("shown")),
+        "mentions_you": overview.get("mentions_you"),
+        "cites_you": overview.get("cites_you"),
+    }
+    if overview.get("content_captured") is not None:
+        out["content_captured"] = bool(overview["content_captured"])
+    if out["shown"] and overview.get("content_captured") is False:
+        out["note"] = DEFERRED_OVERVIEW_NOTE
+    return out
+
+
 def trim_prompt_detail(detail: dict) -> dict:
     """build_prompt_detail cut to what the model and a report need."""
     google = detail.get("google") or {}
@@ -148,6 +169,7 @@ def trim_prompt_detail(detail: dict) -> dict:
             "top_results": [
                 {
                     "position": r.get("position"),
+                    "url": r.get("url") or "",
                     "domain": r.get("domain"),
                     "title": clip(r.get("title"), 120),
                     "is_yours": r.get("is_yours"),
@@ -155,11 +177,7 @@ def trim_prompt_detail(detail: dict) -> dict:
                 }
                 for r in (google.get("top_results") or [])[:10]
             ],
-            "ai_overview": {
-                "shown": bool(overview.get("shown")),
-                "mentions_you": bool(overview.get("mentions_you")),
-                "cites_you": bool(overview.get("cites_you")),
-            } if overview else None,
+            "ai_overview": ai_overview_summary(overview) if overview else None,
             "search_console": google.get("gsc"),
         },
         "engines": engines,
@@ -185,7 +203,7 @@ def trim_prompt_detail(detail: dict) -> dict:
 def get_prompt_gap(ctx: ToolContext, args) -> ToolResult:
     from apps.search_gap.services.overview import build_prompt_detail
 
-    bp = _brand_prompt(ctx.website, args.prompt_id)
+    bp = tracked_prompt(ctx.website, args.prompt_id)
     result = trim_prompt_detail(build_prompt_detail(ctx.website, bp))
     ctx.emitter.record_gap(result)
     gap_class = result["gap"]["class"] or "no_data"
@@ -197,7 +215,7 @@ def get_ai_answers(ctx: ToolContext, args) -> ToolResult:
     from apps.prompt_library.services.prompt_stats import MODEL_LABELS, matching_results
     from apps.search_gap.services.overview import WINDOW_DAYS
 
-    bp = _brand_prompt(ctx.website, args.prompt_id)
+    bp = tracked_prompt(ctx.website, args.prompt_id)
     since = timezone.now() - timedelta(days=WINDOW_DAYS)
     latest: dict = {}
     for r in matching_results(ctx.website, bp.prompt, since=since):
@@ -228,6 +246,9 @@ def get_ai_answers(ctx: ToolContext, args) -> ToolResult:
 
 
 def get_cited_sources(ctx: ToolContext, args) -> ToolResult:
+    from django.db.models import Count, F, Q, Value
+    from django.db.models.functions import Coalesce, NullIf
+
     from apps.citations.models import Citation
     from apps.citations.services.url_analytics import model_key
     from apps.prompt_library.services.prompt_stats import matching_results
@@ -239,46 +260,74 @@ def get_cited_sources(ctx: ToolContext, args) -> ToolResult:
     qs = Citation.objects.filter(audit__website=ctx.website, created_at__gte=since)
     scope = {"prompt": None}
     if args.prompt_id:
-        bp = _brand_prompt(ctx.website, args.prompt_id)
+        bp = tracked_prompt(ctx.website, args.prompt_id)
         results = matching_results(ctx.website, bp.prompt, since=since)
         qs = qs.filter(result_id__in=[r.id for r in results])
         scope["prompt"] = {"id": str(bp.prompt_id), "text": bp.prompt.text}
-    rows = qs.values("apex_domain", "domain", "url", "is_target", "is_competitor",
-                     "result__provider")[:5000]
-    by_domain: dict = defaultdict(lambda: {"count": 0, "engines": set(), "urls": [],
-                                           "is_competitor": False, "is_yours": False})
-    for row in rows:
-        domain = row["apex_domain"] or row["domain"]
-        entry = by_domain[domain]
-        entry["count"] += 1
-        entry["engines"].add(model_key(row["result__provider"] or ""))
-        entry["is_competitor"] = entry["is_competitor"] or bool(row["is_competitor"])
-        entry["is_yours"] = entry["is_yours"] or bool(row["is_target"]) or is_same_site(domain, apex)
-        if row["url"] not in entry["urls"] and len(entry["urls"]) < 3:
-            entry["urls"].append(row["url"])
-    ranked = sorted(by_domain.items(), key=lambda kv: (-kv[1]["count"], kv[0]))[:MAX_SOURCES]
+    # Counted in the database, so totals and ranking cover every citation
+    # in the window. A citation's source is its registrable domain, else
+    # its host.
+    keyed = qs.annotate(source=Coalesce(NullIf(F("apex_domain"), Value("")), F("domain")))
+    top = list(
+        keyed.values("source")
+        .annotate(
+            n=Count("id"),
+            competitor=Count("id", filter=Q(is_competitor=True)),
+            target=Count("id", filter=Q(is_target=True)),
+        )
+        .order_by("-n", "source")[:MAX_SOURCES]
+    )
+    names = [t["source"] for t in top]
+    engines: dict = defaultdict(set)
+    for row in (keyed.filter(source__in=names).values("source", "result__provider")
+                .order_by().distinct()):
+        engines[row["source"]].add(model_key(row["result__provider"] or ""))
     result = {
         **scope,
         "window_days": WINDOW_DAYS,
-        "citations": sum(v["count"] for v in by_domain.values()),
+        "citations": qs.count(),
         "sources": [
             {
-                "domain": domain,
-                "citations": v["count"],
-                "engines": sorted(e for e in v["engines"] if e),
-                "is_yours": v["is_yours"],
-                "is_competitor": v["is_competitor"],
-                "example_urls": v["urls"],
+                "domain": t["source"],
+                "citations": t["n"],
+                "engines": sorted(e for e in engines[t["source"]] if e),
+                "is_yours": t["target"] > 0 or is_same_site(t["source"], apex),
+                "is_competitor": t["competitor"] > 0,
+                "example_urls": _example_urls(keyed.filter(source=t["source"])),
             }
-            for domain, v in ranked
+            for t in top
         ],
     }
-    return ToolResult.ok(result, summary=f"{len(ranked)} sources")
+    return ToolResult.ok(result, summary=f"{len(top)} sources")
+
+
+def _example_urls(citations, limit: int = 3) -> list[str]:
+    """The newest distinct cited URLs of one source."""
+    urls: list[str] = []
+    for url in citations.order_by("-created_at").values_list("url", flat=True)[:limit * 10]:
+        if url not in urls:
+            urls.append(url)
+        if len(urls) == limit:
+            break
+    return urls
+
+
+# Why the knowledge base could not be searched, by the retriever's reason.
+KNOWLEDGE_UNAVAILABLE = {
+    "embeddings_not_configured": "Knowledge search isn't available: OPENAI_API_KEY is not set.",
+    "embeddings_pending": (
+        "Knowledge search isn't available yet: the knowledge base's sources have not been "
+        "indexed, so nothing could be searched."
+    ),
+    "ai_allowance_exhausted": "Knowledge search isn't available: the monthly AI allowance is "
+                              "used up.",
+    "embeddings_failed": "Knowledge search failed: the embedding service returned an error.",
+}
 
 
 def _knowledge(ctx: ToolContext, query: str) -> tuple[list[dict], str | None]:
     if not getattr(settings, "OPENAI_API_KEY", ""):
-        return [], "Knowledge search isn't available: OPENAI_API_KEY is not set."
+        return [], KNOWLEDGE_UNAVAILABLE["embeddings_not_configured"]
     try:
         from apps.rag.services.retriever import retrieve
 
@@ -286,6 +335,12 @@ def _knowledge(ctx: ToolContext, query: str) -> tuple[list[dict], str | None]:
     except Exception:
         logger.warning("agent: knowledge retrieval failed", exc_info=True)
         return [], "Knowledge search failed."
+    # An empty result with a reason means the search could not run, which
+    # is not the same as nothing matching.
+    reason = getattr(hits, "reason", None)
+    if not hits and reason:
+        return [], KNOWLEDGE_UNAVAILABLE.get(
+            reason, f"Knowledge search isn't available ({reason}).")
     return [
         {
             "source_url": h.source_url,
@@ -329,7 +384,8 @@ def get_brand_context(ctx: ToolContext, args) -> ToolResult:
     result = {**facts, "knowledge": knowledge}
     if note:
         result["knowledge_note"] = note
-    return ToolResult.ok(result, summary=f"{len(knowledge)} knowledge snippets")
+    summary = "Knowledge search unavailable" if note else f"{len(knowledge)} knowledge snippets"
+    return ToolResult.ok(result, summary=summary)
 
 
 def list_artifacts(ctx: ToolContext, args) -> ToolResult:

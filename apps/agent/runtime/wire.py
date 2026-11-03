@@ -169,6 +169,38 @@ def safe_prefix(blocks: list[dict], completed: set[int]) -> list[dict]:
     return kept
 
 
+def close_turn(turn: list[dict]) -> list[dict]:
+    """``turn`` (one run's wire) made safe to end on, as a stopped, failed
+    or lost run stores it.
+
+    Render joins the trailing assistant messages (a paused response and
+    its resumption) into one, so they are cut together, as safe_prefix
+    cuts a stopped response: a server tool call whose result never came
+    (a paused turn that was not resumed) goes, with everything after it,
+    and each kept tool call is answered "Stopped before this ran.". A
+    turn that is already safe comes back unchanged.
+    """
+    start = len(turn)
+    while start and turn[start - 1].get("role") == MessageRole.ASSISTANT:
+        start -= 1
+    tail = [_content(m) for m in turn[start:]]
+    blocks = [b for content in tail for b in content]
+    kept = safe_prefix(blocks, set(range(len(blocks))))
+    out = list(turn[:start])
+    if len(kept) == len(blocks):
+        out.extend(turn[start:])
+    else:
+        keep = {id(b) for b in kept}
+        for content in tail:
+            content = [b for b in content if id(b) in keep]
+            if content:
+                out.append(assistant_message(content))
+    ids = tool_use_ids(kept)
+    if ids:
+        out.append(stopped_results(ids))
+    return out
+
+
 # ── History ─────────────────────────────────────────────────────────────
 
 

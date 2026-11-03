@@ -181,8 +181,16 @@ def org_plan_for(user):
     org branch WITHOUT its personal ``user.plan`` fallback, which defaults
     to a paid tier and leaked paid features to unsubscribed accounts.
     Legacy plan names map to the live tiers.
+
+    None while ORG_FEATURES_ENABLED is off: the master switch keeps every
+    account plain B2C (the session and billing payloads show no org then),
+    so a membership staged before launch grants nothing until it is on.
     """
+    from core.permissions.org import org_features_enabled
+
     if user is None or not getattr(user, "pk", None):
+        return None
+    if not org_features_enabled():
         return None
     if not hasattr(user, "org_memberships"):
         return None

@@ -2,12 +2,17 @@
 
 Structured outputs enforce the shape but drop length constraints, so the
 Google Ads limits are checked here. Text over a limit is kept as written
-and reported in ``warnings`` (never truncated silently).
+and reported in ``warnings`` (never truncated silently). So are landing
+page URLs (final_url, sitelinks) that are not http(s), not on the
+brand's website, or not taken from the data the writer was given: an ad
+must not point at a page nobody knows exists.
 """
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -173,8 +178,60 @@ def limit_warnings(campaign: AdCampaign) -> list[dict]:
     return warnings
 
 
-def validate_sheet(raw: str) -> tuple[dict, list[dict]]:
-    """(sheet content with ``warnings``, warnings) from the model's JSON text."""
+def _link_key(url: str) -> str:
+    """``url`` as compared with the known ones: host without www., path
+    without a trailing slash, the query; scheme and fragment ignored."""
+    try:
+        parts = urlsplit((url or "").strip())
+        host = (parts.hostname or "").lower()
+    except ValueError:
+        return ""
+    host = host.removeprefix("www.")
+    query = f"?{parts.query}" if parts.query else ""
+    return f"{host}{parts.path.rstrip('/')}{query}"
+
+
+def _url_problem(url: str, apex: str, known: set[str]) -> str | None:
+    from apps.search_gap.services.google_rank import is_same_site
+
+    try:
+        parts = urlsplit((url or "").strip())
+        scheme, host = parts.scheme.lower(), parts.hostname or ""
+    except ValueError:
+        scheme, host = "", ""
+    if scheme not in ("http", "https") or not host:
+        return "This is not an http(s) link to a page."
+    if apex and not is_same_site(host, apex):
+        return "This URL is not on the brand's website."
+    if _link_key(url) not in known:
+        return ("This URL does not appear in the brand data or the brief; check that the page "
+                "exists before uploading.")
+    return None
+
+
+def url_warnings(campaign: AdCampaign, *, site_url: str, known_urls: Iterable[str]) -> list[dict]:
+    """Warnings for the campaign's final_url and sitelink URLs."""
+    from apps.search_gap.services.google_rank import site_apex
+
+    apex = site_apex(site_url) if site_url else ""
+    known = {_link_key(u) for u in known_urls}
+    targets = [("campaign.final_url", campaign.campaign.final_url)]
+    targets += [(f"sitelinks[{i}].url", link.url) for i, link in enumerate(campaign.sitelinks)]
+    warnings = []
+    for path, url in targets:
+        problem = _url_problem(url, apex, known)
+        if problem:
+            warnings.append({"path": path, "message": problem})
+    return warnings
+
+
+def validate_sheet(raw: str, *, site_url: str | None = None,
+                   known_urls: Iterable[str] | None = None) -> tuple[dict, list[dict]]:
+    """(sheet content with ``warnings``, warnings) from the model's JSON text.
+
+    With ``known_urls`` (the URLs of the writer's data) the landing page
+    URLs are checked too; they are reported, never rewritten.
+    """
     try:
         data = json.loads(raw)
     except ValueError as exc:
@@ -186,6 +243,8 @@ def validate_sheet(raw: str) -> tuple[dict, list[dict]]:
         where = ".".join(str(p) for p in first.get("loc") or ())
         raise SheetInvalid(f"The campaign does not match the sheet shape ({where}).") from exc
     warnings = limit_warnings(campaign)
+    if known_urls is not None:
+        warnings += url_warnings(campaign, site_url=site_url or "", known_urls=known_urls)
     content = campaign.model_dump(mode="json")
     content["warnings"] = warnings
     return content, warnings

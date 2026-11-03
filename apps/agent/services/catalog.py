@@ -2,8 +2,9 @@
 
 ``agents()`` is the fixed catalog behind GET agents/. ``status_for(user)``
 reports the live configuration (switch, process, model, which AI engines
-and Google search have keys, the user's allowance); every value comes from
-settings or the usage ledger, never from a default that pretends.
+and Google search have keys, the user's allowance and which writing agents
+it can start); every value comes from settings or the usage ledger, never
+from a default that pretends.
 """
 from __future__ import annotations
 
@@ -102,6 +103,24 @@ def live_available() -> bool:
         return False
 
 
+def writers(user) -> dict:
+    """Whether the user's remaining AI allowance can start each writing
+    agent (the check run_agent makes before it starts one), and the least
+    it needs, so the workspace can disable a writer before the user pays
+    for an orchestrator turn."""
+    from apps.agent.subagents.base import OUTPUT_PRICE_PER_TOKEN, _specs, writer_budget
+
+    conf = agent_conf()
+    out = {}
+    for key, spec in _specs().items():
+        max_tokens, minimum, _cap, _spent = writer_budget(user, int(spec.max_tokens(conf)))
+        out[key] = {
+            "available": max_tokens >= minimum,
+            "needs_usd": float(OUTPUT_PRICE_PER_TOKEN * minimum),
+        }
+    return out
+
+
 def status_for(user) -> dict:
     """Contract: GET status/. Answers even when the agent is switched off."""
     from apps.citations.services import serp_google
@@ -124,4 +143,5 @@ def status_for(user) -> dict:
             "exceeded": allowance["exceeded"],
             "warning": allowance["warning"],
         },
+        "writers": writers(user),
     }

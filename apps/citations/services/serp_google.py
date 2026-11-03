@@ -21,6 +21,7 @@ Returns::
      "questions":   [{question, snippet, url, domain}],
      "related_searches": [str],
      "ai_overview": {"text": str, "references": [{url, domain, title}]},
+     "ai_overview_deferred": bool,     # shown, but its content was not read
      "knowledge_graph": {"title", "type", "website", "description", "thumbnail"}}
 """
 
@@ -61,6 +62,7 @@ def _empty(error: str = "", configured: bool = True) -> dict:
         "questions": [],
         "related_searches": [],
         "ai_overview": {},
+        "ai_overview_deferred": False,
         "knowledge_graph": {},
     }
 
@@ -170,6 +172,13 @@ def search(
     payload["questions"] = _parse_questions(data)
     payload["related_searches"] = _parse_related_searches(data)
     payload["ai_overview"] = _parse_ai_overview(data)
+    # Google showed an AI Overview whose content did not come with the page
+    # (SerpAPI sent only a page_token / serpapi_link for it). ``ai_overview``
+    # stays {}: nothing was read, so nothing about it is known.
+    block = data.get("ai_overview")
+    payload["ai_overview_deferred"] = (
+        isinstance(block, dict) and bool(block) and not payload["ai_overview"]
+    )
     payload["knowledge_graph"] = _parse_knowledge_graph(data)
     return payload
 
@@ -286,7 +295,8 @@ def _parse_ai_overview(data: dict) -> dict:
     Treated as a sixth AI engine downstream — it is a model recommending
     brands to the user's customers, which is exactly what the engine lane
     tracks. SerpAPI sometimes returns only a `page_token` here (the overview
-    needs a second billed request); we deliberately do not chase it.
+    needs a second billed request); we deliberately do not chase it, and
+    search() reports it as ``ai_overview_deferred``.
     """
     block = data.get("ai_overview")
     if not isinstance(block, dict):

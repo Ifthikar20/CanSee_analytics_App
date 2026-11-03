@@ -111,7 +111,10 @@ by a separate `agent` service: the web image under uvicorn, one worker, settings
 reports the service as live from the start). Runs execute on a
 thread pool inside that process. nginx routes the `live/` prefix there with buffering
 off and answers `503 agent_unavailable` (JSON) when the service is down or not
-enabled. A gunicorn worker that receives a `live/` request answers the same 503.
+enabled, and `503 maintenance` (JSON) while the maintenance switch is on. One client
+(`CF-Connecting-IP` behind Cloudflare, else the peer address) holds at most 20
+connections there; past that nginx answers `429 too_many_streams` (JSON). A gunicorn
+worker that receives a `live/` request answers `503 agent_unavailable`.
 
 **Switches.** `AGENT_ENABLED` (default off) gates every agent endpoint except
 `status/`, which reports what is configured: the switch, the agent process, the model,
@@ -129,10 +132,19 @@ SerpAPI pages, browse limits, stream and heartbeat timing) are all env-overridab
 3. In `.env.prod`: `AGENT_ENABLED=true` and `ANTHROPIC_API_KEY`.
 4. Check that Cloudflare caches nothing under `/api/` (event streams must pass through).
 5. Deploy. `scripts/deploy.sh` detects the profile, recreates the agent after
-   migrations (in-flight runs end as `interrupted`), and restarts nginx when
-   `docker/nginx` changed.
+   migrations (in-flight runs end as `interrupted`), and restarts nginx whenever the
+   running container still holds an older `nginx.conf` than the checkout.
 6. After the first deploy, check the routing:
    `docker compose -f docker/docker-compose.prod.yml exec nginx nginx -T | grep agent/live`.
+
+**Turning it off.**
+1. In `docker/.env` on the host: remove `agent` from `COMPOSE_PROFILES`.
+2. In `.env.prod`: `AGENT_ENABLED=false`.
+3. Deploy. `scripts/deploy.sh` removes the agent container when the profile is off
+   (runs in flight end as `interrupted`); nginx then answers the `live/` routes with
+   `503 agent_unavailable` and `status/` reports the agent as disabled. Without a
+   deploy, remove it by hand:
+   `docker compose -f docker/docker-compose.prod.yml --profile agent rm -s -f agent`.
 
 Celery beat runs `apps.agent.tasks.sweep_stale_agent_runs` every minute, so a run
 whose process died (deploy, crash) ends as `interrupted` instead of staying "running";
@@ -141,8 +153,12 @@ the agent process also ends such a run as soon as a reader asks for it. A daily
 `AGENT_CHAT_RETENTION_DAYS` (0, the default, keeps every chat; artifacts and reports
 made in a deleted chat stay).
 
-In dev, `runserver` is the agent process (`config/settings/dev.py`); the test suite
-runs turns inline against a fake Anthropic client and never calls the real API.
+In dev, `runserver` is the agent process (`config/settings/dev.py`; `AGENT_PROCESS`
+defaults to true there). `docker/docker-compose.yml` runs gunicorn's several workers
+instead, which would interrupt each other's runs, so it sets `AGENT_PROCESS=false` and
+has no agent process; use `docker/docker-compose.dev.yml` to work on the agent. The
+test suite runs turns inline against a fake Anthropic client and never calls the real
+API.
 
 ## Deploy
 

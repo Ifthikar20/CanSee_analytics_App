@@ -168,8 +168,12 @@ class MemoryEventStore:
                 return ReadResult(events=[], resync="behind_buffer")
             start = after - first_seq + 1
             batch = list(itertools.islice(buf.events, start, start + max(1, limit)))
-        terminal = bool(batch) and batch[-1].get("type") in TERMINAL_EVENT_TYPES
-        return ReadResult(events=batch, terminal=terminal)
+        # A batch ends at the run's terminal event, so a reader that stops
+        # on ``terminal`` stops right after it, whatever came later.
+        for i, event in enumerate(batch):
+            if event.get("type") in TERMINAL_EVENT_TYPES:
+                return ReadResult(events=batch[:i + 1], terminal=True)
+        return ReadResult(events=batch)
 
     def wait(self, run_id: str, after: int, timeout: float) -> bool:
         """Block until an event with seq > after exists, or ``timeout`` passes."""

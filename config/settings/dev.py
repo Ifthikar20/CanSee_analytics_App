@@ -16,9 +16,12 @@ LLM_SCAN_MODE = env("LLM_SCAN_MODE", default="inline")  # noqa: F405
 CHAT_EAGER_THREAD_DISPATCH = True
 
 # runserver is the agent process in dev: it serves the live endpoints and
-# runs turns on the background executor.
+# runs turns on the background executor. A dev stack served by several
+# processes (docker/docker-compose.yml runs gunicorn workers) sets
+# AGENT_PROCESS=false: each worker would keep its own runs and interrupt
+# the others' as orphans.
 AGENT_ENABLED = True
-AGENT_PROCESS = True
+AGENT_PROCESS = env.bool("AGENT_PROCESS", default=True)  # noqa: F405
 AGENT_RUN_MODE = "thread"
 
 # Disable rate limiting in dev

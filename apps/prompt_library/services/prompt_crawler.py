@@ -73,6 +73,8 @@ class CrawlOutcome:
     fanouts: list[str]
     responses: int
     errors: list[str]
+    # should_stop asked the crawl to end before every model was asked.
+    stopped: bool = False
 
 
 def _llm_fanout(
@@ -184,7 +186,9 @@ def _query_with_retry(instance, prompt_text, *, user=None, website=None,
 
     A succeeded=False result whose error is the not-configured /
     service_unavailable sentinel is returned immediately without a
-    retry — a missing key won't fix itself on a second call.
+    retry — a missing key won't fix itself on a second call. Neither is
+    a refusal: it is the model's answer to this prompt, and asking again
+    bills the same decline.
 
     The attribution kwargs make crawl spend visible and capped: an
     unattributed query() records nothing and bypasses the spend wall.
@@ -210,6 +214,8 @@ def _query_with_retry(instance, prompt_text, *, user=None, website=None,
         err = (getattr(result, "error", "") or "").lower()
         if "service_unavailable" in err or "not configured" in err or "not enabled" in err:
             return result  # no point retrying a missing key
+        if err.startswith("refusal:"):
+            return result
         # transient failure — loop for one more attempt
     return last
 
@@ -242,7 +248,7 @@ def _dispatch_alignment(result_id) -> None:
 
 def crawl_prompt(
     website: Website, prompt: Prompt, *, only_missing: bool = False,
-    acting_user=None,
+    acting_user=None, should_stop=None,
 ) -> CrawlOutcome:
     """Run a prompt across every configured provider and persist the
     fanout + responses. Returns a small outcome summary used by the
@@ -258,8 +264,17 @@ def crawl_prompt(
     to them (actor="user"). Scheduled/system runs leave it None and the
     spend goes to the website owner, tagged actor="system" so the usage
     breakdown can tell the two apart.
+
+    ``should_stop`` (a callable, optional) is checked before each model is
+    asked: when it returns True the crawl asks no further model and ends
+    with what it has (``stopped`` on the outcome). An answer already
+    received is still analysed and stored, so it is not paid for twice.
     """
     spend_user = acting_user or getattr(website, "user", None)
+    stopped = False
+
+    def stop_requested() -> bool:
+        return should_stop is not None and bool(should_stop())
     actor = "user" if acting_user is not None else "system"
 
     run = PromptCrawlRun.objects.create(
@@ -398,6 +413,8 @@ def crawl_prompt(
     # what makes the visibility/sentiment numbers light up. No audit is
     # created when there is nothing to ask.
     audit = None
+    if run_specs and stop_requested():
+        stopped, run_specs = True, []
     if run_specs:
         audit = LLMRankingAudit.objects.create(
             website=website,
@@ -413,6 +430,9 @@ def crawl_prompt(
         )
 
     for _skip_key, provider_key, instance in run_specs:
+        if stop_requested():
+            stopped = True
+            break
         # One query, one retry. A model that doesn't answer (transient
         # error, rate limit) gets a single second attempt, then we record
         # the failure and move on instead of looping. A hard failure with
@@ -530,16 +550,18 @@ def crawl_prompt(
     # "unknown error" in the UI and left nothing to debug with. The only
     # silent path here is the fan-out LLM call (it swallows its own
     # exception and returns []) with no providers left to query.
-    if run.status == PromptCrawlRun.STATUS_FAILED and not errors:
+    if run.status == PromptCrawlRun.STATUS_FAILED and not errors and not stopped:
         errors.append(
             "fan-out generated no sub-queries and no model was queried "
             "(fan-out LLM call likely failed; check provider keys and logs)"
         )
-    run.error = "; ".join(errors)[:1000]
+    run_errors = [*errors, "stopped before every model was asked"] if stopped else errors
+    run.error = "; ".join(run_errors)[:1000]
     run.completed_at = timezone.now()
     run.save(update_fields=[
         "providers", "fanout_count", "source_count",
         "status", "error", "completed_at",
     ])
 
-    return CrawlOutcome(fanouts=fanouts, responses=responses_logged, errors=errors)
+    return CrawlOutcome(fanouts=fanouts, responses=responses_logged, errors=errors,
+                        stopped=stopped)

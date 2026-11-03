@@ -4,8 +4,16 @@ The page is previewed in a sandboxed iframe with no script rights, but
 it is also downloadable and shared with the project's members, so the
 stored HTML itself must run nothing and load nothing: no scripts (except
 JSON-LD structured data), frames, plugins, base, meta refresh, form
-actions, event handlers, javascript: or data: URLs (data: images are
-fine) and no external resources except Google Fonts.
+actions, pings, event handlers, javascript: or data: URLs (data: images
+are fine) and no external resources except Google Fonts.
+
+html.parser reads <style> and <script> as raw text everywhere, but a
+browser parses them as markup inside <svg> and <math>, and ends a
+CDATA section outside them at the first ">". So the text of every kept
+style and JSON-LD script is escaped where it could open a tag, and
+comments, CDATA sections, processing instructions and declarations are
+removed. URLs are checked as a browser reads them (tabs and newlines
+dropped, backslashes as slashes) and CSS after its escapes are decoded.
 """
 from __future__ import annotations
 
@@ -14,21 +22,33 @@ import re
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
-from bs4 import BeautifulSoup, Comment, Doctype
+from bs4 import BeautifulSoup, CData, Comment, Declaration, Doctype, ProcessingInstruction
 
 MAX_BYTES = 400 * 1024
 FONT_HOSTS = ("fonts.googleapis.com", "fonts.gstatic.com")
 _DROP_TAGS = ("iframe", "frame", "frameset", "object", "embed", "applet", "base", "portal")
 _URL_ATTRS = ("href", "src", "action", "formaction", "poster", "background", "cite", "data",
-              "xlink:href", "srcset", "ping", "longdesc", "manifest", "codebase", "lowsrc")
-_RESOURCE_ATTRS = ("src", "srcset", "poster", "background", "data", "lowsrc", "codebase")
-_CSS_URL = re.compile(r"url\(\s*(['\"]?)(.*?)\1\s*\)", re.IGNORECASE | re.DOTALL)
+              "xlink:href", "srcset", "imagesrcset", "ping", "longdesc", "manifest", "codebase",
+              "lowsrc")
+_RESOURCE_ATTRS = ("src", "srcset", "imagesrcset", "poster", "background", "data", "lowsrc",
+                   "codebase")
+# Schemes a browser fetches over the network.
+_NETWORK_SCHEMES = ("http", "https", "ftp", "ws", "wss")
+_CSS_URL = re.compile(r"url\(\s*(['\"]?)(.*?)\1\s*(?:\)|\Z)", re.IGNORECASE | re.DOTALL)
 _CSS_IMPORT = re.compile(
     r"""@import\s+(?:url\(\s*(?P<q1>['"]?)(?P<u1>.*?)(?P=q1)\s*\)|(?P<q2>['"])(?P<u2>.*?)(?P=q2))"""
     r"""[^;]*;?""",
     re.IGNORECASE | re.DOTALL,
 )
+# CSS functions that load an image from a string argument (url() aside).
+_CSS_IMAGE_FUNCTION = re.compile(
+    r"(?<![\w-])(?:-webkit-)?(?:image-set|cross-fade|image|src)\(", re.IGNORECASE,
+)
+_CSS_STRING = re.compile(r"""(['"])(.*?)\1""", re.DOTALL)
+_CSS_ESCAPE = re.compile(r"\\(?:([0-9a-fA-F]{1,6})[ \t\n\r\f]?|(.))", re.DOTALL)
 _CSS_EXPRESSION = re.compile(r"expression\s*\(|behavior\s*:|-moz-binding", re.IGNORECASE)
+# A "<" that would open a tag, comment or declaration where text is markup.
+_MARKUP_OPEN = re.compile(r"<(?=[A-Za-z!/?])")
 _FENCE = re.compile(r"^\s*```[a-zA-Z]*\s*\n(.*?)\n?```\s*$", re.DOTALL)
 
 
@@ -39,9 +59,16 @@ class SanitizeResult:
     error: str | None = None
 
 
+def _browser_url(url: str) -> str:
+    """``url`` as a browser reads it: tabs and newlines removed, outer
+    spaces and control characters stripped, backslashes as slashes."""
+    value = re.sub(r"[\t\n\r]", "", url or "")
+    return value.strip("".join(chr(c) for c in range(0x21))).replace("\\", "/")
+
+
 def _host(url: str) -> str:
     try:
-        return (urlsplit(url).hostname or "").lower()
+        return (urlsplit(_browser_url(url)).hostname or "").lower()
     except ValueError:
         return ""
 
@@ -57,11 +84,49 @@ def _scheme(url: str) -> str:
 
 
 def _is_external(url: str) -> bool:
-    value = (url or "").strip().lower()
-    return value.startswith(("http://", "https://", "//"))
+    value = _browser_url(url).lower()
+    return value.startswith("//") or _scheme(value) in _NETWORK_SCHEMES
 
 
-def _clean_css(css: str, warn) -> str:
+def _css_unescape(css: str) -> str:
+    """CSS with its escapes decoded, as a browser's tokenizer reads it."""
+    def replace(match):
+        if match.group(1):
+            code = int(match.group(1), 16)
+            return chr(code) if 0 < code <= 0x10FFFF and not 0xD800 <= code <= 0xDFFF else "�"
+        return "" if match.group(2) == "\n" else match.group(2)
+
+    return _CSS_ESCAPE.sub(replace, css)
+
+
+def _css_target_ok(target: str) -> bool:
+    target = target.strip()
+    return (target.lower().startswith("data:image/") or target.startswith("#")
+            or _is_font_url(target))
+
+
+def _function_end(css: str, start: int) -> int:
+    """The index after the ")" closing the function whose arguments start
+    at ``start``; the end of ``css`` when it is never closed."""
+    depth, quote, i = 1, "", start
+    while i < len(css):
+        ch = css[i]
+        if quote:
+            if ch == quote:
+                quote = ""
+        elif ch in "\"'":
+            quote = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return len(css)
+
+
+def _clean_css_text(css: str, warn) -> str:
     def replace_import(match):
         if _is_font_url(match.group("u1") or match.group("u2") or ""):
             return match.group(0)
@@ -69,20 +134,47 @@ def _clean_css(css: str, warn) -> str:
         return ""
 
     def replace_url(match):
-        target = match.group(2).strip()
-        if target.lower().startswith("data:image/") or _is_font_url(target):
-            return match.group(0)
-        if target.startswith("#"):
+        if _css_target_ok(match.group(2)):
             return match.group(0)
         warn("style", "Removed a CSS url() that loads an external or unsafe resource.")
         return "none"
 
     css = _CSS_IMPORT.sub(replace_import, css)
+    out, pos = [], 0
+    for match in _CSS_IMAGE_FUNCTION.finditer(css):
+        if match.start() < pos:
+            continue
+        end = _function_end(css, match.end())
+        call = css[match.start():end]
+        if all(_css_target_ok(s.group(2)) for s in _CSS_STRING.finditer(call)):
+            continue
+        warn("style", "Removed a CSS image that loads an external or unsafe resource.")
+        out.append(css[pos:match.start()] + "none")
+        pos = end
+    css = "".join(out) + css[pos:]
     css = _CSS_URL.sub(replace_url, css)
     if _CSS_EXPRESSION.search(css):
         warn("style", "Removed CSS that can run code.")
         css = _CSS_EXPRESSION.sub("", css)
     return css
+
+
+def _clean_css(css: str, warn) -> str:
+    """``css`` without external loads and code. The checks read the CSS with
+    its escapes decoded; CSS whose escapes hide nothing is kept as written."""
+    decoded = _css_unescape(css)
+    cleaned = _clean_css_text(decoded, warn)
+    return css if cleaned == decoded else cleaned
+
+
+def _escape_markup(text: str) -> str:
+    """Raw text with every "<" that could open a tag as the CSS escape \\3c."""
+    return _MARKUP_OPEN.sub(r"\\3c ", text)
+
+
+def _escape_json(text: str) -> str:
+    """JSON with <, > and & as \\u escapes: the same data, no markup."""
+    return text.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
 
 
 def sanitize_html(raw: str) -> SanitizeResult:
@@ -106,7 +198,12 @@ def sanitize_html(raw: str) -> SanitizeResult:
         warn("document", "The page does not start with <!DOCTYPE html>.")
 
     soup = BeautifulSoup(text, "html.parser")
-    for node in soup.find_all(string=lambda s: isinstance(s, Comment)):
+    # Comments, CDATA sections, processing instructions and declarations
+    # (a browser ends some of them at a different place than html.parser).
+    hidden = (Comment, CData, Declaration, ProcessingInstruction)
+    for node in soup.find_all(string=lambda s: isinstance(s, hidden)):
+        if not isinstance(node, Comment):
+            warn("document", "Removed a CDATA section, declaration or processing instruction.")
         node.extract()
 
     for tag in list(soup.find_all(True)):
@@ -123,6 +220,8 @@ def sanitize_html(raw: str) -> SanitizeResult:
                     tag.decompose()
                     continue
                 tag.attrs = {"type": "application/ld+json"}
+                if _escape_json(body) != body:
+                    tag.string = _escape_json(body)
                 continue
             warn("script", "Removed a script.")
             tag.decompose()
@@ -147,12 +246,12 @@ def sanitize_html(raw: str) -> SanitizeResult:
                 warn("link", "Removed an unsafe link element.")
                 tag.decompose()
                 continue
-        if name == "form" and tag.get("action") is not None:
-            del tag["action"]
-            warn("form", "Removed a form action.")
         if name == "style":
             css = tag.string or tag.get_text()
             cleaned = _clean_css(css, warn)
+            if _escape_markup(cleaned) != cleaned:
+                warn("style", "Escaped markup inside a style element.")
+                cleaned = _escape_markup(cleaned)
             if cleaned != css:
                 tag.string = cleaned
 
@@ -162,6 +261,14 @@ def sanitize_html(raw: str) -> SanitizeResult:
             if lower.startswith("on"):
                 del tag.attrs[attr]
                 warn(f"{name}[{lower}]", "Removed an event handler attribute.")
+                continue
+            if lower in ("action", "formaction"):
+                del tag.attrs[attr]
+                warn("form", "Removed a form action.")
+                continue
+            if lower == "ping":
+                del tag.attrs[attr]
+                warn(f"{name}[ping]", "Removed a ping URL.")
                 continue
             if lower == "style" and isinstance(value, str):
                 cleaned = _clean_css(value, warn)
@@ -186,10 +293,10 @@ def sanitize_html(raw: str) -> SanitizeResult:
             if lower in _RESOURCE_ATTRS or (lower in ("href", "xlink:href") and name in (
                 "image", "use", "feimage",
             )):
-                if lower == "srcset":
+                if lower in ("srcset", "imagesrcset"):
                     if any(_is_external(c.strip().split(" ")[0]) for c in joined.split(",")):
                         del tag.attrs[attr]
-                        warn(f"{name}[srcset]", "Removed external images.")
+                        warn(f"{name}[{lower}]", "Removed external images.")
                     continue
                 if _is_external(joined):
                     del tag.attrs[attr]

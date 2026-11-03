@@ -66,6 +66,13 @@ def _public_model_error(raw: str) -> str:
     e = (raw or "").lower()
     if not e:
         return ""
+    # Answers the provider rejected as measurements (ClaudeProvider).
+    if e.startswith("refusal:"):
+        return "The model declined to answer this prompt."
+    if e.startswith(("max_tokens:", "pause_turn:")):
+        return "The model's answer was cut off before it finished."
+    if e.startswith("empty_answer:"):
+        return "The model returned no answer."
     if "rate limit" in e or "429" in e or "quota" in e or "overloaded" in e:
         return "The model was busy and will be retried on the next scan."
     if "timeout" in e or "timed out" in e:

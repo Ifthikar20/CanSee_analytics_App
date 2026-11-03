@@ -59,6 +59,18 @@ class AgentBusy(CanseeException):
         super().__init__(message, code="agent_busy", status_code=429)
 
 
+class TooManyStreams(CanseeException):
+    """The user already holds the most event streams and polls allowed."""
+
+    def __init__(self):
+        super().__init__(
+            "Too many open connections to the agent from your account. "
+            "Close other tabs and try again.",
+            code="too_many_streams",
+            status_code=429,
+        )
+
+
 class RunInProgress(CanseeException):
     """This chat already has a queued or running run."""
 

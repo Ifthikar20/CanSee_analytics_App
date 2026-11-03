@@ -6,13 +6,16 @@ XML-tagged data blocks (<brand>, <target_prompt>, <current_version>,
 ``artifact.delta`` (pages, articles) or throttled ``artifact.snapshot``
 partial JSON (sheets); the result is validated, saved as the artifact's
 next version, and summarized for the orchestrator. Spend is checked
-before the request: a sub-agent can only start when the user's
-remaining allowance covers its whole ``max_tokens`` at $20 per MTok.
+before the request: the writer's ``max_tokens`` is what the user's
+remaining allowance pays for at $20 per MTok, at most the agent's own
+limit, and a writer that would get less than MIN_WRITER_TOKENS does not
+start.
 """
 from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 import uuid
 from collections.abc import Callable
@@ -34,11 +37,17 @@ from apps.agent.tools.shaping import clip
 
 logger = logging.getLogger("apps")
 
-# Worst case output price used for the affordability check ($ per token).
+# Worst case output price used to size a writer's request ($ per token).
 OUTPUT_PRICE_PER_TOKEN = Decimal("20") / Decimal("1000000")
+# The smallest output budget a writer is started with ($0.32).
+MIN_WRITER_TOKENS = 16_000
 SNAPSHOT_SECONDS = 0.5
 PROGRESS_SECONDS = 1.0
 CURRENT_VERSION_CHARS = 120_000
+# The data blocks whose URLs a writer may link to. Never <current_version>:
+# that is the writer's own earlier output, not a source.
+_LINK_SOURCES = ("brand", "target_prompt", "brief")
+_LINK = re.compile(r"https?://[^\s\"'<>\\]+", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -46,6 +55,14 @@ class Validated:
     content: str
     warnings: list[dict]
     summary: str
+
+
+@dataclass(frozen=True)
+class LinkFacts:
+    """What a writer may link to: the brand's website and the URLs its
+    data blocks carry."""
+    site_url: str
+    known: frozenset[str]
 
 
 @dataclass(frozen=True)
@@ -61,7 +78,9 @@ class SubagentSpec:
     streams: str
     output_schema: dict | None
     # Raises ValueError with a user-readable message when the output is unusable.
-    validate: Callable[[str, str | None], Validated]
+    # Called as validate(raw, stop_reason), plus links=LinkFacts when checks_links.
+    validate: Callable[..., Validated]
+    checks_links: bool = False
 
 
 def _specs() -> dict[str, SubagentSpec]:
@@ -79,7 +98,8 @@ def build_user_content(ctx: ToolContext, spec: SubagentSpec, args, current: str 
 
     brand = brand_facts(ctx.website)
     if args.facts:
-        brand["approved_facts"] = list(args.facts)
+        # Passed on by the orchestrator from this chat; nobody approved them.
+        brand["facts_from_chat"] = list(args.facts)
     blocks = [_block("brand", json.dumps(brand, ensure_ascii=False, indent=1, sort_keys=True))]
     if args.prompt_id:
         from apps.prompt_library.models import BrandPrompt
@@ -100,16 +120,37 @@ def build_user_content(ctx: ToolContext, spec: SubagentSpec, args, current: str 
     return blocks
 
 
-def affordability(user, max_tokens: int) -> tuple[bool, float, float, float]:
-    """(affordable, cap, spent, needed) for a request of ``max_tokens``."""
+def link_facts(website, blocks: list[dict]) -> LinkFacts:
+    """The website and every URL in the <brand>, <target_prompt> and
+    <brief> blocks of ``blocks`` (build_user_content's)."""
+    heads = tuple(f"<{tag}>\n" for tag in _LINK_SOURCES)
+    known = {website.url} if website.url else set()
+    for block in blocks:
+        text = block.get("text") or ""
+        if text.startswith(heads):
+            known.update(url.rstrip(".,;:!?)]}") for url in _LINK.findall(text))
+    return LinkFacts(site_url=website.url or "", known=frozenset(known))
+
+
+def writer_budget(user, limit: int) -> tuple[int, int, float, float]:
+    """(max_tokens, minimum, cap, spent) for a writer whose own output
+    limit is ``limit`` tokens.
+
+    ``max_tokens`` is what the user's remaining allowance pays for at the
+    worst case output price, at most ``limit`` (all of it when the
+    allowance is unlimited). A writer whose ``max_tokens`` is below
+    ``minimum`` (MIN_WRITER_TOKENS, or ``limit`` when smaller) is not
+    worth starting.
+    """
     from core.ai_tracking import effective_ai_cap, month_to_date_cost
 
-    needed = float(OUTPUT_PRICE_PER_TOKEN * max_tokens)
+    minimum = min(limit, MIN_WRITER_TOKENS)
     cap = float(effective_ai_cap(user))
     if cap <= 0:
-        return True, cap, 0.0, needed
+        return limit, minimum, cap, 0.0
     spent = float(month_to_date_cost(user))
-    return spent + needed <= cap, cap, spent, needed
+    left = Decimal(str(max(0.0, cap - spent)))
+    return min(limit, int(left / OUTPUT_PRICE_PER_TOKEN)), minimum, cap, spent
 
 
 class _Progress:
@@ -186,11 +227,12 @@ def run_subagent(ctx: ToolContext, args) -> ToolResult:
 
     from apps.agent.conf import agent_conf
 
-    max_tokens = int(spec.max_tokens(agent_conf()))
-    ok, cap, spent, needed = affordability(ctx.user, max_tokens)
-    if not ok:
+    limit = int(spec.max_tokens(agent_conf()))
+    max_tokens, minimum, cap, spent = writer_budget(ctx.user, limit)
+    if max_tokens < minimum:
         raise fail(
-            f"Insufficient allowance: the {spec.name.lower()} agent needs up to ${needed:.2f} and "
+            f"Insufficient allowance: the {spec.name.lower()} agent needs at least "
+            f"${float(OUTPUT_PRICE_PER_TOKEN * minimum):.2f} and "
             f"${max(0.0, cap - spent):.2f} of the ${cap:.2f} monthly AI allowance is left.",
             code="insufficient_allowance",
         )
@@ -217,9 +259,12 @@ def run_subagent(ctx: ToolContext, args) -> ToolResult:
 
     em.emit(EventType.ARTIFACT_STARTED, artifact_id=str(artifact_id), kind=spec.kind,
             title=title, agent_key=spec.key, base_version=base_version)
-    em.update_part(part_id, status="planning", artifact_id=str(artifact_id))
+    # base_version > 0: the artifact was saved before this call (a revision,
+    # possibly of an artifact another chat made), so a failure leaves it as it was.
+    em.update_part(part_id, status="planning", artifact_id=str(artifact_id),
+                   base_version=base_version)
 
-    request = build_subagent_request(spec, content_blocks)
+    request = build_subagent_request(spec, content_blocks, max_tokens=max_tokens)
     progress = _Progress(em, part_id)
     text_parts: list[str] = []
     state = {"drafting": False, "last_snapshot": 0.0}
@@ -322,10 +367,15 @@ def run_subagent(ctx: ToolContext, args) -> ToolResult:
 
     em.update_part(part_id, status="validating")
     raw = "".join(b.text for b in final.content if getattr(b, "type", "") == "text")
+    extra = {"links": link_facts(ctx.website, content_blocks)} if spec.checks_links else {}
     try:
-        validated = spec.validate(raw, final.stop_reason)
+        validated = spec.validate(raw, final.stop_reason, **extra)
     except ValueError as exc:
-        raise fail(str(exc), code="invalid_output", artifact_id=artifact_id) from None
+        message = str(exc)
+        if final.stop_reason == "max_tokens" and max_tokens < limit:
+            message += (f" The remaining AI allowance covered {max_tokens:,} of the "
+                        f"{limit:,} output tokens this agent can use.")
+        raise fail(message, code="invalid_output", artifact_id=artifact_id) from None
     if spec.streams == "snapshot":
         em.emit(EventType.ARTIFACT_SNAPSHOT, artifact_id=str(artifact_id),
                 content=json.loads(validated.content))

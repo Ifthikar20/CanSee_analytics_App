@@ -74,11 +74,12 @@ def show_chart(ctx: ToolContext, args) -> ToolResult:
                          summary=spec["title"] or "Chart")
 
 
-def _known_hosts(ctx: ToolContext) -> set[str]:
+def project_hosts(website) -> set[str]:
+    """The registrable domains of the project's site and its competitors."""
     from apps.citations.services.url_normalizer import extract_apex_domain
 
-    hosts = {extract_apex_domain(host_of(ctx.website.url))}
-    for c in ctx.website.competitors or []:
+    hosts = {extract_apex_domain(host_of(website.url))}
+    for c in website.competitors or []:
         if isinstance(c, dict) and c.get("domain"):
             hosts.add(extract_apex_domain(str(c["domain"]).strip().lower()))
     hosts.discard("")
@@ -92,7 +93,7 @@ def open_in_browser(ctx: ToolContext, args) -> ToolResult:
     if not url.lower().startswith(("http://", "https://")) or not host_of(url):
         raise ToolError("open_in_browser needs an http or https URL.", summary="Invalid URL")
     seen_in_chat = url in (ctx.history_text or "")
-    own_or_competitor = extract_apex_domain(host_of(url)) in _known_hosts(ctx)
+    own_or_competitor = extract_apex_domain(host_of(url)) in project_hosts(ctx.website)
     requires_confirmation = not (seen_in_chat or own_or_competitor)
     title = clip(args.title or host_of(url), 120)
     ctx.emitter.add_part(PartType.BROWSER_OPEN, request=ctx.request, url=url, title=title,

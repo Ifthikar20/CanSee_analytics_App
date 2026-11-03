@@ -9,16 +9,22 @@ what happened; nothing here raises for a bad page.
 
 Pages are hostile input. Every pass over the tree is iterative and linear
 in its size, so deep nesting cannot exhaust the stack or the CPU, and
-page text is untrusted data for whoever reads the result.
+page text is untrusted data for whoever reads the result. A parse tree
+takes far more memory than its bytes (2 MB of tiny elements is about
+300 MB of objects), so a page with more than MAX_TAGS tags is refused,
+at most PARSE_SLOTS pages are parsed at a time in this process, and each
+tree is taken apart as soon as it has been read.
 """
 from __future__ import annotations
 
 import json
 import re
+import threading
 import time
 from urllib.parse import urldefrag, urljoin, urlsplit
 
 from bs4 import BeautifulSoup, NavigableString, Tag
+from bs4.dammit import UnicodeDammit
 from bs4.element import CData, Comment, Declaration, Doctype, ProcessingInstruction
 from django.utils import timezone
 
@@ -31,6 +37,16 @@ ALLOWED_PORTS = (80, 443, 8080, 8443)
 HTML_TYPES = ("text/html", "application/xhtml+xml")
 CONNECT_TIMEOUT = 5
 USER_AGENT = "Mozilla/5.0 (compatible; CanseeAgent/1.0; +https://cansee.ai/bot)"
+
+# Start and end tags, comments and declarations: each becomes a tree node
+# or splits the text into another one. Real pages stay far below this; at
+# the limit a tree holds about 70 MB.
+MAX_TAGS = 80_000
+PARSE_SLOTS = 2
+PARSE_WAIT_SECONDS = 10
+# Nodes read for one heading's text in the SEO facts: headings nested in
+# each other would otherwise each re-read the rest of the page.
+MAX_HEADING_NODES = 5_000
 
 MAX_READER_BLOCKS = 400
 MAX_READER_LINKS = 50
@@ -54,6 +70,8 @@ ERROR_MESSAGES = {
     ),
     "timeout": f"The page took longer than {DEADLINE_SECONDS} seconds to load.",
     "too_large": f"The page is larger than {MAX_BYTES // 1_000_000} MB.",
+    "too_complex": f"The page has more than {MAX_TAGS:,} HTML tags, too many to read here.",
+    "busy": "Too many pages are being read right now. Try again in a moment.",
     "not_html": "This address is not a web page.",
     "fetch_failed": "The page could not be loaded.",
 }
@@ -80,15 +98,19 @@ _NOT_TEXT = (Comment, CData, Declaration, Doctype, ProcessingInstruction)
 _SPACE = re.compile(r"\s+")
 _CHARSET = re.compile(r"charset\s*=\s*[\"']?([A-Za-z0-9._:\-]+)", re.I)
 _HTML_START = re.compile(rb"^\s*(<!--.*?-->\s*)*<(!doctype\s+html|html)[\s>]", re.I | re.S)
+_TAG = re.compile(r"<[A-Za-z!?/]")
+
+_parse_slots = threading.BoundedSemaphore(PARSE_SLOTS)
 
 
 def fetch_page(url: str) -> dict:
     """BrowseResult (contract section 4) for ``url``.
 
     ``error`` is null on success; otherwise ``{code, message}`` with code
-    blocked_url, fetch_failed, timeout, too_large or not_html, and ``seo``
-    and ``reader`` are null. An HTTP error status is not a fetch error:
-    the page that came back is parsed and ``status_code`` says what it was.
+    blocked_url, fetch_failed, timeout, too_large, too_complex, busy or
+    not_html, and ``seo`` and ``reader`` are null. An HTTP error status is
+    not a fetch error: the page that came back is parsed and
+    ``status_code`` says what it was.
     """
     url = (url or "").strip()
     started = time.monotonic()
@@ -111,17 +133,36 @@ def fetch_page(url: str) -> dict:
         return _failed(url, code)
     fetch_ms = int((time.monotonic() - started) * 1000)
 
-    if resp.content_type not in HTML_TYPES and not _looks_like_html(resp.content):
-        return _failed(url, "not_html", final_url=resp.final_url, status_code=resp.status_code)
-
-    soup = BeautifulSoup(
-        resp.content, "html.parser", from_encoding=_charset(resp.headers.get("Content-Type")),
-    )
     final_url = resp.final_url
-    seo = seo_facts(soup, final_url)
+    if resp.content_type not in HTML_TYPES and not _looks_like_html(resp.content):
+        return _failed(url, "not_html", final_url=final_url, status_code=resp.status_code)
+
+    if not _parse_slots.acquire(timeout=PARSE_WAIT_SECONDS):
+        return _failed(url, "busy", final_url=final_url, status_code=resp.status_code)
+    try:
+        # Decoded here the way BeautifulSoup decodes bytes, so the tags are
+        # counted in whatever encoding the page uses before a tree is built.
+        charset = _charset(resp.headers.get("Content-Type"))
+        markup = UnicodeDammit(
+            resp.content, known_definite_encodings=[charset] if charset else [], is_html=True,
+        ).unicode_markup
+        if markup is None:
+            return _failed(url, "not_html", final_url=final_url, status_code=resp.status_code)
+        if _too_many_tags(markup):
+            return _failed(url, "too_complex", final_url=final_url,
+                           status_code=resp.status_code)
+        soup = BeautifulSoup(markup, "html.parser")
+        try:
+            seo = seo_facts(soup, final_url)
+            reader = reader_view(soup, final_url, title=seo["title"] or "")
+        finally:
+            # The tree is full of reference cycles; taking it apart frees it
+            # now instead of at the next garbage collection.
+            soup.decompose()
+    finally:
+        _parse_slots.release()
     seo["bytes"] = len(resp.content)
     seo["fetch_ms"] = fetch_ms
-    reader = reader_view(soup, final_url, title=seo["title"] or "")
     return {
         "url": url,
         "final_url": final_url,
@@ -224,7 +265,8 @@ def reader_view(soup: BeautifulSoup, base_url: str, *, title: str = "") -> dict:
     builder.walk(root, in_content)
     h1 = root.find("h1")
     return {
-        "title": title or (_clean(_visible_text(h1)) if h1 else "") or None,
+        "title": title or (_clean(_visible_text(h1, limit=MAX_HEADING))[:MAX_HEADING]
+                           if h1 else "") or None,
         "blocks": builder.blocks,
         "links": _reader_links(root, base_url, in_content),
     }
@@ -279,19 +321,19 @@ class _ReaderBuilder:
         """Add ``el``'s block; True when it is a container to descend into."""
         name = el.name
         if name in _INLINE:
-            self._inline.append(_visible_text(el))
+            self._inline.append(_visible_text(el, limit=MAX_TEXT))
         elif name == "br":
             self._inline.append(" ")
         elif name == "img":
             pass
         elif name in _HEADINGS:
             self.flush()
-            text = _clean(_visible_text(el))
+            text = _clean(_visible_text(el, limit=MAX_HEADING))
             if text:
                 self.add({"type": "heading", "level": _HEADINGS[name], "text": text[:MAX_HEADING]})
         elif name in ("p", "blockquote"):
             self.flush()
-            text = _clean(_visible_text(el))
+            text = _clean(_visible_text(el, limit=MAX_TEXT))
             if text:
                 kind = "paragraph" if name == "p" else "quote"
                 self.add({"type": kind, "text": text[:MAX_TEXT]})
@@ -300,13 +342,14 @@ class _ReaderBuilder:
             if not items:
                 return True
             self.flush()
-            texts = [_clean(_visible_text(li))[:MAX_TEXT] for li in items[:MAX_LIST_ITEMS]]
+            texts = [_clean(_visible_text(li, limit=MAX_TEXT))[:MAX_TEXT]
+                     for li in items[:MAX_LIST_ITEMS]]
             texts = [t for t in texts if t]
             if texts:
                 self.add({"type": "list", "ordered": name == "ol", "items": texts})
         elif name == "pre":
             self.flush()
-            text = _strip_nul(_visible_text(el, keep_space=True)).strip("\n")
+            text = _strip_nul(_visible_text(el, keep_space=True, limit=MAX_CODE)).strip("\n")
             if text.strip():
                 self.add({"type": "code", "text": text[:MAX_CODE]})
         elif name == "table" and el.find(_LAYOUT_MARKERS) is None:
@@ -342,12 +385,22 @@ def _skipped(el: Tag, in_content: bool) -> bool:
     return "display:none" in style or "visibility:hidden" in style
 
 
-def _visible_text(el: Tag, *, keep_space: bool = False) -> str:
+def _visible_text(el: Tag, *, keep_space: bool = False, limit: int | None = None,
+                  max_nodes: int | None = None) -> str:
     """Text of ``el`` without its dropped or hidden descendants. Inline
-    markup joins as written; block elements are separated by a space."""
+    markup joins as written; block elements are separated by a space.
+
+    With ``limit`` the walk stops once the text holds that many characters
+    besides whitespace, so the text cleaned and cut to ``limit`` is the
+    same as if the whole element had been read. ``max_nodes`` stops it
+    after that many nodes."""
     parts: list[str] = []
+    found = 0
+    nodes = 0
     stack = [(iter(el.children), False)]
     while stack:
+        if (limit is not None and found >= limit) or (max_nodes is not None and nodes >= max_nodes):
+            break
         children, is_block = stack[-1]
         child = next(children, None)
         if child is None:
@@ -355,10 +408,14 @@ def _visible_text(el: Tag, *, keep_space: bool = False) -> str:
             if is_block and not keep_space:
                 parts.append(" ")
             continue
+        nodes += 1
         if isinstance(child, _NOT_TEXT):
             continue
         if isinstance(child, NavigableString):
-            parts.append(str(child))
+            text = str(child)
+            parts.append(text)
+            if limit is not None:
+                found += len(_SPACE.sub("", _strip_nul(text)))
             continue
         if not isinstance(child, Tag) or _skipped(child, True):
             continue
@@ -376,7 +433,7 @@ def _table_rows(table: Tag) -> list[list[str]]:
     rows = []
     for tr in table.find_all("tr"):
         cells = [
-            _clean(_visible_text(cell))[:MAX_CELL]
+            _clean(_visible_text(cell, limit=MAX_CELL))[:MAX_CELL]
             for cell in tr.find_all(["th", "td"], recursive=False)[:MAX_TABLE_COLS]
         ]
         if any(cells):
@@ -406,7 +463,7 @@ def _reader_links(root: Tag, base_url: str, in_content: bool) -> list[dict]:
             if href and urldefrag(href)[0] != page and href not in seen:
                 seen.add(href)
                 text = (
-                    _clean(_visible_text(child))
+                    _clean(_visible_text(child, limit=MAX_HEADING))
                     or _clean(child.get("aria-label"))
                     or _clean(child.get("title"))
                 )
@@ -519,7 +576,7 @@ def _word_count(soup: BeautifulSoup) -> int:
 def _texts(soup: BeautifulSoup, name: str, limit: int) -> list[str]:
     out = []
     for el in soup.find_all(name, limit=limit * 3):
-        text = _clean(_visible_text(el))
+        text = _clean(_visible_text(el, limit=MAX_HEADING, max_nodes=MAX_HEADING_NODES))
         if text:
             out.append(text[:MAX_HEADING])
         if len(out) >= limit:
@@ -563,6 +620,12 @@ def _charset(content_type: str | None) -> str | None:
 
 def _looks_like_html(body: bytes) -> bool:
     return bool(_HTML_START.match(body[:2048].lstrip(b"\xef\xbb\xbf")))
+
+
+def _too_many_tags(markup: str) -> bool:
+    if markup.count("<") <= MAX_TAGS:
+        return False
+    return any(n >= MAX_TAGS for n, _ in enumerate(_TAG.finditer(markup)))
 
 
 def _now() -> str:

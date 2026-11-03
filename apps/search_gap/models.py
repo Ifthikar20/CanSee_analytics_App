@@ -35,7 +35,9 @@ class GoogleRankCheck(TimestampMixin):
     title = models.CharField(max_length=500, blank=True)
     # First page of organic results: [{position, url, domain, title}].
     top_results = models.JSONField(default=list, blank=True)
-    # {shown, mentions_you, cites_you, references: [{url, domain, title}]}.
+    # {shown, content_captured, mentions_you, cites_you, references: [{url, domain, title}]}.
+    # content_captured False (Google showed an overview whose content was not
+    # read): mentions_you and cites_you are None. Older rows lack the key.
     ai_overview = models.JSONField(default=dict, blank=True)
     pages_fetched = models.PositiveSmallIntegerField(default=0)
     cost_usd = models.DecimalField(max_digits=8, decimal_places=4, default=0)
