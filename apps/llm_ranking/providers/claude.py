@@ -85,9 +85,8 @@ class ClaudeProvider(LLMProvider):
         seen: set[str] = set()
 
         def _url_of(item):
-            # On the pinned SDK, citation entries and search results arrive
-            # as plain dicts (unknown-to-the-SDK fields land in model_extra
-            # unparsed); newer SDK versions type them. Accept both.
+            # SDK 2.x types citation entries and search results; older SDKs
+            # returned them as plain dicts. Accept both.
             if isinstance(item, dict):
                 return item.get("url")
             return getattr(item, "url", None)

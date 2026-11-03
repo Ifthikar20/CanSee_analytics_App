@@ -25,7 +25,7 @@ from django.conf import settings
 from apps.brand_vault.models import BrandFact, FactStatus
 from apps.brand_vault.services.embeddings import embed_text
 from apps.brand_vault.services.fact_versioning import record_creation
-from core.llm import ClaudeUtility
+from core.llm import ClaudeUtility, configured_claude_model
 
 logger = logging.getLogger("apps")
 
@@ -46,7 +46,7 @@ def _call_llm(text: str, *, website=None) -> list[dict]:
     instead of raising. ``website`` attributes the token spend to the
     tenant in core.ai_tracking.
     """
-    result = ClaudeUtility(model="claude-sonnet-4-20250514", max_tokens=1024).query(
+    result = ClaudeUtility(model=configured_claude_model(), max_tokens=1024).query(
         EXTRACTION_PROMPT.format(text=text),
         user=getattr(website, "user", None),
         website=website,
