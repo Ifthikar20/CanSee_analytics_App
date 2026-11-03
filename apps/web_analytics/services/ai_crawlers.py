@@ -32,7 +32,8 @@ logger = logging.getLogger("apps")
 WINDOW_DAYS = 7
 CAPABILITY_TTL_SECONDS = 86400
 REPORT_TTL_SECONDS = 1800
-MAX_PATHS = 10
+# The AI traffic page shows the first 10; Pages (insights) reads them all.
+MAX_PATHS = 50
 _TIME_FMT = "%Y-%m-%dT%H:%M:%SZ"
 
 # (key, user-agent token, name, operator key, operator, purpose). The

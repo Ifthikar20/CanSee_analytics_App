@@ -33,6 +33,19 @@ def _agent_line(agent_key: str) -> str:
     return f"{label} ({agent_key})"
 
 
+def brand_context_line(website) -> str:
+    """How much context the agents have: active entries per section and
+    the suggestions that wait for review (design/p2_backend.md 11f)."""
+    from apps.agent.services.context import SECTIONS, counts, suggested_count
+
+    per = counts(website)
+    total, waiting = sum(per.values()), suggested_count(website)
+    if not total and not waiting:
+        return "- Brand context: not set"
+    sections = ", ".join(f"{label} {per[key]}" for key, label, _help in SECTIONS)
+    return f"- Brand context: {total} entries ({sections}); {waiting} suggestions wait for review"
+
+
 def project_context(website, *, entry_agent: str, tracked_prompts: int, today: date) -> str:
     competitors = _competitors(website)
     lines = [
@@ -42,6 +55,7 @@ def project_context(website, *, entry_agent: str, tracked_prompts: int, today: d
         f"- Industry: {website.industry or 'not set'}",
         "- Competitors: " + ("; ".join(competitors) if competitors else "none set"),
         f"- Tracked prompts: {tracked_prompts}",
+        brand_context_line(website),
         f"- Agent the user started with: {_agent_line(entry_agent)}",
         f"- Today (UTC): {today.isoformat()}",
     ]

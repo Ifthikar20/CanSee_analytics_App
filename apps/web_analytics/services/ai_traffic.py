@@ -78,11 +78,6 @@ def _shape(source: str, *, labels: list[str], total_sessions: int, days: list, l
     def measured(day: str) -> bool:
         return measured_since is None or day >= measured_since
 
-    pages: dict = defaultdict(Counter)
-    for url, assistant, sessions in landing:
-        if assistant:
-            pages[path_of(url)][assistant] += sessions
-    ranked = sorted(pages.items(), key=lambda item: (-sum(item[1].values()), item[0]))
     by_country: Counter = Counter()
     for code, assistant, sessions in countries:
         code = (code or "").strip().upper()
@@ -118,14 +113,7 @@ def _shape(source: str, *, labels: list[str], total_sessions: int, days: list, l
                 for key in order
             },
         },
-        "landing_pages": [
-            {
-                "path": path,
-                "sessions": sum(counts.values()),
-                "by_assistant": {key: counts[key] for key in order if counts[key]},
-            }
-            for path, counts in ranked[:MAX_LANDING_PAGES]
-        ],
+        "landing_pages": _landing_pages(landing, order, MAX_LANDING_PAGES),
         "countries": [
             {"code": code, "sessions": sessions}
             for code, sessions in sorted(by_country.items(), key=lambda item: (-item[1], item[0]))
@@ -136,25 +124,54 @@ def _shape(source: str, *, labels: list[str], total_sessions: int, days: list, l
     }
 
 
-def _pixel_referrals(website, period: str, measured_since: str | None) -> dict:
-    from django.db.models import Count
-    from django.db.models.functions import TruncDate
+def _landing_pages(landing: list, order: list, limit: int) -> list[dict]:
+    """Landing pages of AI sessions from rows [url or path, assistant, n],
+    most sessions first; ``by_assistant`` follows ``order``."""
+    pages: dict = defaultdict(Counter)
+    for url, assistant, sessions in landing:
+        if assistant:
+            pages[path_of(url)][assistant] += sessions
+    ranked = sorted(pages.items(), key=lambda item: (-sum(item[1].values()), item[0]))
+    return [
+        {
+            "path": path,
+            "sessions": sum(counts.values()),
+            "by_assistant": {key: counts[key] for key in order if counts[key]},
+        }
+        for path, counts in ranked[:limit]
+    ]
 
+
+def _pixel_sessions(website, period: str):
+    """(start, end, every session, the AI ones) of the period (pixel)."""
     from apps.analytics.models import Session
     from core.utils.date_utils import get_date_range
 
     start, end = get_date_range(period)
     base = Session.objects.filter(visitor__website_id=website.id, started_at__range=(start, end))
-    ai = base.filter(medium="ai")
+    return start, end, base, base.filter(medium="ai")
+
+
+def _pixel_landing(ai) -> list:
+    from django.db.models import Count
+
+    return [
+        [row["entry_page"], row["source"], row["n"]]
+        for row in ai.values("entry_page", "source").annotate(n=Count("id"))
+    ]
+
+
+def _pixel_referrals(website, period: str, measured_since: str | None) -> dict:
+    from django.db.models import Count
+    from django.db.models.functions import TruncDate
+
+    start, end, base, ai = _pixel_sessions(website, period)
     per_day = ai.annotate(day=TruncDate("started_at")).values("day", "source")
     days = [
         [row["day"].isoformat(), row["source"], row["n"]]
         for row in per_day.annotate(n=Count("id"))
     ]
-    landing = [
-        [row["entry_page"], row["source"], row["n"]]
-        for row in ai.values("entry_page", "source").annotate(n=Count("id"))
-    ]
+    landing = _pixel_landing(ai)
     countries = [
         [row["visitor__geo_country"], row["source"], row["n"]]
         for row in ai.values("visitor__geo_country", "source").annotate(n=Count("id"))
@@ -207,6 +224,52 @@ def _crawlers(website, states: dict, integrations: dict) -> dict:
     if status != "ok":
         return ai_crawlers.unavailable("no_cloudflare")
     return ai_crawlers.crawler_report(integrations["cloudflare"], website)
+
+
+def ai_landing_pages(website, *, period: str, source: str = "auto", limit: int = 500) -> dict:
+    """Landing pages of the period's AI referrals, from the same source
+    ``ai_traffic`` would pick, without its top-10 cut: ``{source,
+    source_label, available, reason, pages: [{path, sessions,
+    by_assistant}]}`` (``reason`` as the referrals payload's)."""
+    integrations = source_resolver.integrations_for(website)
+    states = source_resolver.source_states(website, integrations=integrations)
+    chosen = _referral_source(source, states)
+
+    def unavailable(which, reason: str) -> dict:
+        return {"source": which, "source_label": SOURCE_LABELS.get(which) if which else None,
+                "available": False, "reason": reason, "pages": []}
+
+    if chosen is None:
+        return unavailable(None, "no_source")
+    if chosen == "pixel":
+        pixel = states["pixel"]
+        if not pixel["has_data"]:
+            return unavailable("pixel", "no_data" if pixel["connected"] else "not_connected")
+        landing = _pixel_landing(_pixel_sessions(website, period)[3])
+    else:
+        if states["ga4"]["status"] != "ok":
+            return unavailable("ga4", "not_connected")
+        found = ga4_reports.ai_referrals(integrations["ga4"], website, period)
+        if found is None:
+            return unavailable("ga4", "source_error")
+        if not found["total_sessions"]:
+            return unavailable("ga4", "no_data")
+        landing = found["landing"]
+    totals: Counter = Counter()
+    for _url, assistant, sessions in landing:
+        if assistant:
+            totals[assistant] += sessions
+    order = sorted(totals, key=lambda key: (-totals[key], key))
+    return {"source": chosen, "source_label": SOURCE_LABELS[chosen], "available": True,
+            "reason": None, "pages": _landing_pages(landing, order, limit)}
+
+
+def crawler_paths(website) -> dict:
+    """The ``crawlers`` part of the AI traffic payload alone (Cloudflare's
+    last 7 days, the same source states and cache)."""
+    integrations = source_resolver.integrations_for(website)
+    states = source_resolver.source_states(website, integrations=integrations)
+    return _crawlers(website, states, integrations)
 
 
 def ai_traffic(website, *, period: str, source: str) -> dict:

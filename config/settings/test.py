@@ -119,3 +119,6 @@ AGENT_RUN_MODE = "inline"
 # Country checks run before the create request returns, in the request's
 # thread, so tests see every cell settled.
 COUNTRY_CHECK_RUN_MODE = "inline"
+
+# Insights runs, likewise.
+INSIGHTS_RUN_MODE = "inline"

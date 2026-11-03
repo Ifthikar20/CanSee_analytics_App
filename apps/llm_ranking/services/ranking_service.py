@@ -39,6 +39,27 @@ def _merge_citation_lists(provider_urls, extracted) -> list:
     return merged
 
 
+def search_query_fields(result) -> dict:
+    """The query fan-out fields of a stored answer from its ProviderResult:
+    ``{"search_queries": [str] | None, "web_searches": int | None}``.
+
+    None means not recorded: a failed answer, or a provider that does not
+    report its searches. Provider doubles in tests may carry mock
+    attributes, so anything that is not a list or an int is not recorded.
+    """
+    from apps.llm_ranking.providers.openai_compat import clean_search_queries
+
+    if getattr(result, "succeeded", False) is not True:
+        return {"search_queries": None, "web_searches": None}
+    queries = getattr(result, "search_queries", None)
+    searches = getattr(result, "web_searches", None)
+    valid_count = isinstance(searches, int) and not isinstance(searches, bool)
+    return {
+        "search_queries": clean_search_queries(queries) if isinstance(queries, list) else None,
+        "web_searches": min(max(searches, 0), 32767) if valid_count else None,
+    }
+
+
 def _country_counts_for(citations) -> dict:
     """Local helper — silently degrades to {} if citation_geo isn't importable."""
     try:
@@ -625,6 +646,8 @@ class LLMRankingService:
                 ),
                 "extraction_model": analysis.get("extraction_model", ""),
                 "extraction_version": analysis.get("extraction_version", ""),
+                # None for a failed cell, so a retry never keeps stale searches.
+                **search_query_fields(result),
             },
         )
         LLMRankingService._dispatch_citation_extraction(result_obj.id)

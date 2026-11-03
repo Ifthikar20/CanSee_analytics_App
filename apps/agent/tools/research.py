@@ -169,6 +169,7 @@ def build_serp_capture(payload: dict, *, website, query: str, page: int, locatio
         "people_also_ask": [
             q["question"] for q in (payload.get("questions") or []) if q.get("question")
         ],
+        "related_searches": payload.get("related_searches") or [],
         "error": None,
     }
 
@@ -226,6 +227,16 @@ def _record_rank_check(website, brand_prompt, *, query: str, location: str, page
             "mentions_you": overview.get("mentions_you"),
             "cites_you": overview.get("cites_you"),
             "references": overview.get("references") or [],
+        },
+        # Page one's People also ask and related searches (prompt research).
+        serp_features={
+            "questions": [
+                {"question": q, "url": ""} for q in first.get("people_also_ask") or []
+                if isinstance(q, str) and q
+            ],
+            "related_searches": [
+                s for s in first.get("related_searches") or [] if isinstance(s, str) and s
+            ],
         },
         pages_fetched=fetched,
         cost_usd=serp_google.cost_per_search_usd() * fetched,

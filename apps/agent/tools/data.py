@@ -353,10 +353,11 @@ def _knowledge(ctx: ToolContext, query: str) -> tuple[list[dict], str | None]:
 
 
 def brand_facts(website) -> dict:
-    """Website fields plus AgentBrandContext: what writers may rely on."""
-    from apps.agent.models import AgentBrandContext
+    """Website fields plus the active context entries: what writers may
+    rely on. ``offerings`` mirrors the Offerings entries (their first page
+    of the site as ``url``), the shape the ad campaign prompt names."""
+    from apps.agent.services.context import agent_context, offerings_for_writers
 
-    ctx_row = AgentBrandContext.objects.filter(website=website).first()
     competitors = [
         {"name": c.get("name"), "domain": c.get("domain") or ""}
         for c in (website.competitors or []) if isinstance(c, dict) and c.get("name")
@@ -368,20 +369,21 @@ def brand_facts(website) -> dict:
         "description": website.description or "",
         "topics": [t for t in (website.topics or []) if isinstance(t, str)][:20],
         "competitors": competitors,
-        "audience": ctx_row.audience if ctx_row else "",
-        "voice": ctx_row.voice if ctx_row else "",
-        "offerings": (ctx_row.offerings if ctx_row else []) or [],
-        "rules": (ctx_row.rules if ctx_row else []) or [],
+        "context": agent_context(website),
+        "offerings": offerings_for_writers(website),
     }
 
 
 def get_brand_context(ctx: ToolContext, args) -> ToolResult:
+    from apps.agent.services.context import counts, suggested_count
+
     facts = brand_facts(ctx.website)
     query = args.query or " ".join(
         x for x in (ctx.website.name, ctx.website.industry, "products and services") if x
     )
     knowledge, note = _knowledge(ctx, query)
-    result = {**facts, "knowledge": knowledge}
+    result = {**facts, "context_counts": counts(ctx.website),
+              "suggested": suggested_count(ctx.website), "knowledge": knowledge}
     if note:
         result["knowledge_note"] = note
     summary = "Knowledge search unavailable" if note else f"{len(knowledge)} knowledge snippets"
@@ -390,8 +392,10 @@ def get_brand_context(ctx: ToolContext, args) -> ToolResult:
 
 def list_artifacts(ctx: ToolContext, args) -> ToolResult:
     from apps.agent.models import AgentArtifact
+    from apps.agent.services.reviews import summary_for
 
-    qs = AgentArtifact.objects.filter(website=ctx.website, deleted_at__isnull=True)
+    qs = (AgentArtifact.objects.filter(website=ctx.website, deleted_at__isnull=True)
+          .select_related("review__reviewer"))
     if args.kind:
         qs = qs.filter(kind=args.kind)
     rows = [
@@ -402,6 +406,7 @@ def list_artifacts(ctx: ToolContext, args) -> ToolResult:
             "agent_key": a.agent_key,
             "latest_version": a.latest_version,
             "updated_at": a.updated_at.isoformat(),
+            "review_state": summary_for(a)["effective_state"],
         }
         for a in qs.order_by("-updated_at")[:MAX_ARTIFACTS]
     ]

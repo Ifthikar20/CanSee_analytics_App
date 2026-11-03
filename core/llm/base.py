@@ -87,6 +87,12 @@ class ProviderResult:
     # True when the answer came from a web search that carried the user's
     # location (the region passed to query()).
     searched: bool = False
+    # The web searches the engine reported running while it answered (query
+    # fan-outs). None: this provider does not report searches; [] and 0: it
+    # reports them and ran none. A search can come without its query text,
+    # so web_searches may exceed len(search_queries).
+    search_queries: list | None = None
+    web_searches: int | None = None
 
     @property
     def total_tokens(self) -> int:

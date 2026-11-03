@@ -40,6 +40,7 @@ from apps.llm_ranking.services.ranking_service import (
     SCORE_FIELDS,
     LLMRankingService,
     _merge_citation_lists,
+    search_query_fields,
 )
 from apps.prompt_library.models import (
     BrandPrompt,
@@ -498,6 +499,7 @@ def crawl_prompt(
             ),
             extraction_model=analysis.get("extraction_model", ""),
             extraction_version=analysis.get("extraction_version", ""),
+            **search_query_fields(result),
         )
         if succeeded:
             responses_logged += 1
@@ -727,6 +729,7 @@ class EngineScan:
             citations=citations,
             extraction_model=analysis.get("extraction_model", ""),
             extraction_version=analysis.get("extraction_version", ""),
+            **search_query_fields(result),
         )
         with self._lock:
             if not self._finished:

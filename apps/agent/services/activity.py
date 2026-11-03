@@ -1,13 +1,16 @@
-"""The activity feed: the user's finished runs and new artifact versions in
-the website, newest first.
+"""The activity feed: the user's finished runs, new artifact versions in
+the website and the review items addressed to the user, newest first.
 
 Runs are private (only the user's own appear). Artifact versions are shared
 with every member; their chat link is only given to the chat's owner.
+Review items (services.reviews.inbox_items) reach the reviewer, the
+requester or both, never the person who acted.
 """
 from __future__ import annotations
 
 from apps.agent.constants import RunStatus
 from apps.agent.models import AgentArtifactVersion, AgentRun
+from apps.agent.services.reviews import inbox_items
 
 ACTIVITY_LIMIT = 20
 
@@ -55,5 +58,6 @@ def activity_for(user, website) -> list[dict]:
         }
         for v in versions
     ]
+    items += inbox_items(user, website, limit=ACTIVITY_LIMIT)
     items.sort(key=lambda item: item["at"], reverse=True)
     return items[:ACTIVITY_LIMIT]

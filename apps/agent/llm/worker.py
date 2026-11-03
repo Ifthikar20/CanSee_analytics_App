@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from pydantic import BaseModel, ValidationError
@@ -27,8 +28,10 @@ from pydantic import BaseModel, ValidationError
 from apps.agent.conf import agent_conf
 from apps.agent.llm.client import get_client
 from apps.agent.llm.errors import classify
+from apps.agent.llm.pricing import usage_rows
 from apps.agent.llm.usage import record_request_usage
 from apps.agent.runtime.swarm import limits
+from core.ai_tracking import record_usage
 from core.llm import allowance_denial
 
 logger = logging.getLogger("apps")
@@ -172,3 +175,114 @@ def ask_haiku(*, run, task_id: str, worker: str, purpose: str, system: str,
     except (ValidationError, ValueError):
         return _failed("invalid_output", INVALID_MESSAGE, request_id)
     return HaikuResult(ok=True, data=data, request_id=request_id)
+
+
+# ── Outside a research run ────────────────────────────────────────────────
+
+
+def _read(response, output_model: type[BaseModel], request_id: str,
+          stop_reason: str) -> HaikuResult:
+    """The answer of one standalone request (ask_haiku's reading rules)."""
+    if stop_reason == "refusal":
+        return _failed("refused", REFUSED_MESSAGE, request_id)
+    if stop_reason == "max_tokens":
+        return _failed("invalid_output", INVALID_MESSAGE, request_id)
+    text = "".join(getattr(block, "text", "") or "" for block in response.content
+                   if getattr(block, "type", "") == "text")
+    try:
+        data = output_model.model_validate_json(text)
+    except (ValidationError, ValueError):
+        return _failed("invalid_output", INVALID_MESSAGE, request_id)
+    return HaikuResult(ok=True, data=data, request_id=request_id)
+
+
+def _standalone_step(module: str, step: str) -> str:
+    """``step`` as the ledger key "{module}:{step}:{row}" can hold it: a
+    step too long for the key is shortened to a digest."""
+    room = LEDGER_KEY_CHARS - len(f"{module}:") - _LEDGER_ROW_CHARS
+    if len(step) > room:
+        step = hashlib.sha1(step.encode()).hexdigest()
+    return step
+
+
+def _standalone_refusal(user, should_stop) -> HaikuResult | None:
+    if should_stop is not None and should_stop():
+        return _failed("cancelled", STOPPED_MESSAGE)
+    if allowance_denial(user):
+        return _failed("allowance_exceeded", ALLOWANCE_MESSAGE)
+    return None
+
+
+def ask_haiku_standalone(*, user, website, system: str, content: list[dict], schema: dict,
+                         output_model: type[BaseModel], timeout: float, audit_id: str, role: str,
+                         step: str, module: str = "insights", max_tokens: int | None = None,
+                         should_stop: Callable[[], bool] | None = None) -> HaikuResult:
+    """One analysis request outside a research run (insights runs, context
+    builds): the request and reading rules of ask_haiku, the same process-wide
+    analysis slots, and one ledger row per priced unit with ``module``,
+    ``metadata.role`` and ``metadata.audit_id`` (the caller's run tag).
+
+    ``step`` is unique per request within the module (the ledger drops a
+    second write under the same key as a replay). Stop (``should_stop``)
+    and the user's monthly allowance are checked before the request and
+    again after the wait for a slot. Never raises for an API failure.
+    """
+    ends = time.monotonic() + timeout
+    refused = _standalone_refusal(user, should_stop)
+    if refused is not None:
+        return refused
+    if not limits.acquire("haiku", timeout):
+        return _failed("rate_limited", "The analysis model was busy. Try again in a minute.")
+
+    request = build_worker_request(system=system, content=content, schema=schema)
+    if max_tokens is not None:
+        request["max_tokens"] = int(max_tokens)
+    started = time.monotonic()
+    try:
+        # The wait for a slot can be long: Stop and the allowance again.
+        refused = _standalone_refusal(user, should_stop)
+        if refused is not None:
+            return refused
+        response = get_client().messages.create(
+            **request, timeout=max(1.0, ends - time.monotonic()))
+    except Exception as exc:
+        error = classify(exc)
+        logger.warning("insights: analysis request failed (%s, %s): %s", role, step, error.code)
+        busy = error.code in ("rate_limited", "upstream_overloaded")
+        return _failed("rate_limited" if busy else "upstream_error", error.message)
+    finally:
+        limits.release("haiku")
+
+    request_id = getattr(response, "_request_id", "") or ""
+    stop_reason = response.stop_reason or ""
+    key_step = _standalone_step(module, step)
+    try:
+        rows = usage_rows(request["model"], response.usage, default_ttl=agent_conf().cache_ttl)
+        duration_ms = int((time.monotonic() - started) * 1000)
+        for i, row in enumerate(rows):
+            record_usage(
+                module=module,
+                model_name=row.model,
+                input_tokens=row.input_tokens,
+                output_tokens=row.output_tokens,
+                user=user,
+                website=website,
+                provider="anthropic",
+                duration_ms=duration_ms if i == 0 else 0,
+                metadata={
+                    "role": role,
+                    "audit_id": audit_id,
+                    "request_id": request_id,
+                    "stop_reason": stop_reason,
+                    "iteration": row.kind,
+                },
+                idempotency_key=f"{module}:{key_step}:{i}"[:LEDGER_KEY_CHARS],
+                cache_write_5m=row.cache_write_5m,
+                cache_write_1h=row.cache_write_1h,
+                cache_read=row.cache_read,
+                web_search_requests=row.web_search_requests,
+            )
+    except Exception:
+        logger.warning("insights: analysis usage was not recorded (%s, %s)", role, step,
+                       exc_info=True)
+    return _read(response, output_model, request_id, stop_reason)

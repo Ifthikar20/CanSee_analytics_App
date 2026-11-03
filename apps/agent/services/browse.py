@@ -50,6 +50,10 @@ MAX_HEADING_NODES = 5_000
 
 MAX_READER_BLOCKS = 400
 MAX_READER_LINKS = 50
+# fetch_page(with_links=True) and fetch_page(with_headers=True).
+MAX_DOCUMENT_LINKS = 300
+MAX_LINK_TEXT = 120
+MAX_HEADER_VALUE = 300
 MAX_H1 = 20
 MAX_H2 = 20
 MAX_HREFLANG = 50
@@ -103,7 +107,7 @@ _TAG = re.compile(r"<[A-Za-z!?/]")
 _parse_slots = threading.BoundedSemaphore(PARSE_SLOTS)
 
 
-def fetch_page(url: str) -> dict:
+def fetch_page(url: str, *, with_headers: bool = False, with_links: bool = False) -> dict:
     """BrowseResult (contract section 4) for ``url``.
 
     ``error`` is null on success; otherwise ``{code, message}`` with code
@@ -111,8 +115,15 @@ def fetch_page(url: str) -> dict:
     not_html, and ``seo`` and ``reader`` are null. An HTTP error status is
     not a fetch error: the page that came back is parsed and
     ``status_code`` says what it was.
+
+    ``with_headers`` adds ``headers``: ``{"x-robots-tag", "content-type"}``
+    as the response sent them ("" when absent or when nothing came back).
+    ``with_links`` adds ``links``: every ``<a href>`` of the whole document,
+    navigation, header and footer included (the reader view leaves those
+    out), as ``[{"url", "text"}]`` ([] when the page was not parsed).
     """
     url = (url or "").strip()
+    flags = {"with_headers": with_headers, "with_links": with_links}
     started = time.monotonic()
     try:
         resp = safe_get(
@@ -130,15 +141,19 @@ def fetch_page(url: str) -> dict:
         )
     except FetchError as exc:
         code = "not_html" if exc.code == "content_type" else exc.code
-        return _failed(url, code)
+        return _extras(_failed(url, code), **flags)
     fetch_ms = int((time.monotonic() - started) * 1000)
 
     final_url = resp.final_url
+    headers = resp.headers
     if resp.content_type not in HTML_TYPES and not _looks_like_html(resp.content):
-        return _failed(url, "not_html", final_url=final_url, status_code=resp.status_code)
+        return _extras(_failed(url, "not_html", final_url=final_url, status_code=resp.status_code),
+                       headers=headers, **flags)
 
     if not _parse_slots.acquire(timeout=PARSE_WAIT_SECONDS):
-        return _failed(url, "busy", final_url=final_url, status_code=resp.status_code)
+        return _extras(_failed(url, "busy", final_url=final_url, status_code=resp.status_code),
+                       headers=headers, **flags)
+    links = None
     try:
         # Decoded here the way BeautifulSoup decodes bytes, so the tags are
         # counted in whatever encoding the page uses before a tree is built.
@@ -147,14 +162,21 @@ def fetch_page(url: str) -> dict:
             resp.content, known_definite_encodings=[charset] if charset else [], is_html=True,
         ).unicode_markup
         if markup is None:
-            return _failed(url, "not_html", final_url=final_url, status_code=resp.status_code)
+            return _extras(
+                _failed(url, "not_html", final_url=final_url, status_code=resp.status_code),
+                headers=headers, **flags,
+            )
         if _too_many_tags(markup):
-            return _failed(url, "too_complex", final_url=final_url,
-                           status_code=resp.status_code)
+            return _extras(
+                _failed(url, "too_complex", final_url=final_url, status_code=resp.status_code),
+                headers=headers, **flags,
+            )
         soup = BeautifulSoup(markup, "html.parser")
         try:
             seo = seo_facts(soup, final_url)
             reader = reader_view(soup, final_url, title=seo["title"] or "")
+            if with_links:
+                links = document_links(soup, final_url)
         finally:
             # The tree is full of reference cycles; taking it apart frees it
             # now instead of at the next garbage collection.
@@ -163,7 +185,7 @@ def fetch_page(url: str) -> dict:
         _parse_slots.release()
     seo["bytes"] = len(resp.content)
     seo["fetch_ms"] = fetch_ms
-    return {
+    return _extras({
         "url": url,
         "final_url": final_url,
         "status_code": resp.status_code,
@@ -173,7 +195,47 @@ def fetch_page(url: str) -> dict:
         "seo": seo,
         "reader": reader,
         "error": None,
-    }
+    }, headers=headers, links=links, **flags)
+
+
+def _extras(result: dict, *, with_headers: bool, with_links: bool, headers=None,
+            links=None) -> dict:
+    """``result`` with the ``headers`` and ``links`` fetch_page was asked for."""
+    if with_headers:
+        lowered = {str(k).lower(): str(v) for k, v in (headers or {}).items()}
+        result["headers"] = {
+            name: _strip_nul(lowered.get(name, ""))[:MAX_HEADER_VALUE]
+            for name in ("x-robots-tag", "content-type")
+        }
+    if with_links:
+        result["links"] = links or []
+    return result
+
+
+def document_links(soup: BeautifulSoup, base_url: str) -> list[dict]:
+    """Every ``<a href>`` of the document as ``[{"url", "text"}]``: absolute
+    http(s), fragment removed, de-duplicated in document order, at most
+    MAX_DOCUMENT_LINKS. Navigation, header and footer count too. Leaves
+    ``soup`` unchanged."""
+    seen: set[str] = set()
+    links: list[dict] = []
+    for a in soup.find_all("a", href=True):
+        href = _absolute(a["href"], base_url)
+        if not href:
+            continue
+        href = urldefrag(href)[0]
+        if href in seen:
+            continue
+        seen.add(href)
+        text = (
+            _clean(_visible_text(a, limit=MAX_LINK_TEXT, max_nodes=MAX_HEADING_NODES))
+            or _clean(a.get("aria-label"))
+            or _clean(a.get("title"))
+        )
+        links.append({"url": href, "text": text[:MAX_LINK_TEXT]})
+        if len(links) >= MAX_DOCUMENT_LINKS:
+            break
+    return links
 
 
 def is_frameable(url: str, headers: dict) -> bool:

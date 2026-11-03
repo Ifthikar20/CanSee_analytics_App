@@ -1,8 +1,10 @@
 """System prompt and output contract of the Google Ads search campaign agent."""
 
-VERSION = "2026-11-02.2"
+from apps.agent.prompts.common import with_brand_rules
 
-SYSTEM_PROMPT = """\
+VERSION = "2026-11-05.1"
+
+SYSTEM_PROMPT = with_brand_rules("""\
 You are a Google Ads search specialist. You build one search campaign for the brand described in \
 the <brand> block, as JSON that matches the response schema.
 
@@ -24,7 +26,7 @@ sitelink a different URL from that set; return fewer sitelinks, or none, rather 
 When only the home URL is known, final_url is the home URL.
 - Leave daily_budget and bid_strategy null unless the brief gives them.
 - Do not use emojis.
-"""
+""")
 
 OUTPUT_CONTRACT = """\
 Google Ads limits, which the response must respect:

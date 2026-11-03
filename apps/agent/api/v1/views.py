@@ -10,14 +10,15 @@ Access rules:
     * The website resolves through WebsiteService.get_for_user. Viewers
       may read; anything that changes data needs member or above.
     * Chats and messages are private: they also filter on the user.
-      Artifacts, reports and brand context are shared by the website's
-      members.
+      Artifacts, their reviews, reports and the context are shared by the
+      website's members (context_views, review_views).
     * The research agents' swarms are private to the chat's user (another
       member gets 404); findings are shared by the website's members
       (design/swarm_contract.md section 6).
 """
 from __future__ import annotations
 
+from django.db.models import prefetch_related_objects
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.renderers import JSONRenderer
 from rest_framework.response import Response
@@ -28,8 +29,6 @@ from apps.agent.api.v1.serializers import (
     ArtifactUpdateSerializer,
     ArtifactVersionSerializer,
     ArtifactVersionSummarySerializer,
-    BrandContextSerializer,
-    BrandContextWriteSerializer,
     BrowseSerializer,
     ChatCreateSerializer,
     ChatSummarySerializer,
@@ -51,7 +50,6 @@ from apps.agent.exceptions import AgentDisabled, AgentNotConfigured, AgentUnavai
 from apps.agent.services import (
     activity,
     artifacts,
-    brand_context,
     browse,
     catalog,
     chats,
@@ -60,9 +58,9 @@ from apps.agent.services import (
     suggestions,
     swarms,
 )
+from apps.agent.services.access import can_write
 from core.exceptions import CanseeException, PermissionDenied, RateLimited
 from core.interceptors.response_envelope import EnvelopeRenderer
-from core.permissions.rbac import role_at_least
 from core.quota import DailyQuota
 from core.resilience import TokenBucket
 from core.views.base import TenantScopedAPIView
@@ -70,6 +68,7 @@ from core.views.base import TenantScopedAPIView
 browse_quota = DailyQuota(
     namespace="agent_browse", setting_name="AGENT_BROWSE_DAILY_LIMIT", default_limit=300,
 )
+VIEWER_MESSAGE = "Viewers can see this project's agent work but not change it."
 
 
 class InvalidRequest(CanseeException):
@@ -133,8 +132,8 @@ class AgentAPIView(TenantScopedAPIView):
         website = WebsiteService.get_for_user(
             user=user, website_id=self.kwargs["website_id"], min_role="viewer",
         )
-        if write and not _can_write(user, website):
-            raise PermissionDenied("Viewers can see this project's agent work but not change it.")
+        if write and not can_write(user, website):
+            raise PermissionDenied(VIEWER_MESSAGE)
         return website
 
 
@@ -227,6 +226,8 @@ class ArtifactListView(AgentAPIView):
         if unknown:
             raise InvalidRequest({"kind": [f"Unknown kind: {', '.join(unknown)}."]})
         items = artifacts.list_artifacts(website, kinds=kinds, q=request.query_params.get("q", ""))
+        # Each summary carries its review block (one query for the list).
+        prefetch_related_objects(items, "review__reviewer")
         return Response(list(ArtifactSummarySerializer(items, many=True, context={"user": request.user}).data))
 
 
@@ -308,7 +309,7 @@ class FindingListCreateView(AgentAPIView):
             "results": _findings_data(rows, request.user),
             "next_cursor": next_cursor,
             "counts": counts,
-            "can_edit": _can_write(request.user, website),
+            "can_edit": can_write(request.user, website),
         })
 
     def post(self, request, website_id):
@@ -347,17 +348,6 @@ class FindingDetailView(AgentAPIView):
 
 
 # ── Project data ──────────────────────────────────────────────────────────
-
-
-class BrandContextView(AgentAPIView):
-    def get(self, request, website_id):
-        return Response(BrandContextSerializer(brand_context.context_for(self.website())).data)
-
-    def put(self, request, website_id):
-        website = self.website(write=True)
-        data = _validated(BrandContextWriteSerializer, request.data)
-        context = brand_context.save_context(website, request.user, **data)
-        return Response(BrandContextSerializer(context).data)
 
 
 class SuggestionsView(AgentAPIView):
@@ -411,16 +401,3 @@ def _first_error(errors) -> str:
     elif errors:
         return str(errors)
     return ""
-
-
-def _can_write(user, website) -> bool:
-    if website.user_id == user.id:
-        return True
-    if not website.organization_id:
-        return False
-    role = (
-        user.org_memberships.filter(organization_id=website.organization_id)
-        .values_list("role", flat=True)
-        .first()
-    )
-    return bool(role) and role_at_least(role, "member")

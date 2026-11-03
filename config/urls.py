@@ -52,6 +52,7 @@ urlpatterns = [
     # /api/v1/analytics/: that prefix's middleware audit-logs every GET,
     # and this surface is polled every 30s.
     path("api/v1/web-analytics/", include("apps.web_analytics.api.v1.urls")),
+    path("api/v1/insights/", include("apps.insights.api.v1.urls")),
 
     # Pixel ingestion (high throughput)
     path("api/v1/track/", include("apps.analytics.api.v1.pixel_urls")),

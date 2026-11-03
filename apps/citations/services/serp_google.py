@@ -1,5 +1,7 @@
 """Google results for Brand Research, the search-gap rank checks and the
-agent's research, via SerpAPI or ScraperAPI's structured Google search.
+agent's research, via SerpAPI or ScraperAPI's structured Google search;
+Google Shopping pages for tracked products (``shopping_search``, ScraperAPI
+only).
 
 The scan's other discovery lane (``web_search`` / Perplexity) returns an
 AI-era index: good recall on things Google buries, but the response carries
@@ -50,6 +52,7 @@ logger = logging.getLogger("apps")
 
 SEARCH_ENDPOINT = "https://serpapi.com/search.json"
 SCRAPERAPI_ENDPOINT = "https://api.scraperapi.com/structured/google/search"
+SCRAPERAPI_SHOPPING_ENDPOINT = "https://api.scraperapi.com/structured/google/shopping"
 DEFAULT_MAX_RESULTS = 10
 TIMEOUT = 15.0
 # ScraperAPI fetches and renders Google before parsing it, so one search
@@ -71,6 +74,7 @@ MAX_DISCUSSIONS = 10
 MAX_QUESTIONS = 8
 MAX_RELATED = 8
 MAX_AI_REFERENCES = 10
+MAX_SHOPPING_RESULTS = 40
 
 # ISO 3166-1 -> Google's gl and ScraperAPI's country_code, where they differ.
 GOOGLE_COUNTRY = {"gb": "uk"}
@@ -437,6 +441,89 @@ def search(
     )
     payload["knowledge_graph"] = _parse_knowledge_graph(data)
     return payload
+
+
+def shopping_search(query: str, *, country: str = "", timeout: float | None = None) -> dict:
+    """One Google Shopping results page, through ScraperAPI's structured
+    shopping endpoint (SerpAPI is not used for shopping).
+
+    Returns ``{"configured", "provider", "error", "results": [{position,
+    title, seller, price, price_value}]}``: ``seller`` is the result's
+    ``source``, ``price`` the string Google showed (never converted) and
+    ``price_value`` ScraperAPI's ``extracted_price`` (None without one), at
+    most MAX_SHOPPING_RESULTS in page order. The country comes from the geo
+    plan (the US by default). Errors as ``search()``: ``not_configured``
+    when ScraperAPI is not the provider, ``network``, ``http_<status>``,
+    ``decode``, and ``empty_results`` for a page without results (Google
+    Shopping lists products for a real query, so an empty page was not
+    read). Never raises.
+    """
+    query = " ".join((query or "").split())
+    which = provider()
+    out = {"configured": which == PROVIDER_SCRAPERAPI, "provider": which, "error": "",
+           "results": []}
+    if which != PROVIDER_SCRAPERAPI:
+        return {**out, "error": "not_configured"}
+    if not query:
+        return {**out, "error": "empty_query"}
+
+    try:
+        import requests
+    except ImportError:  # pragma: no cover - requests is a hard dependency
+        return {**out, "error": "requests_unavailable"}
+
+    key = settings.SCRAPERAPI_KEY
+    plan = geo_plan(country, PROVIDER_SCRAPERAPI)
+    params = {
+        "api_key": key,
+        "query": query[:500],
+        "country_code": plan["params"].get("country_code", "us"),
+    }
+    try:
+        resp = requests.get(
+            SCRAPERAPI_SHOPPING_ENDPOINT, params=params,
+            timeout=SCRAPERAPI_TIMEOUT if timeout is None else timeout,
+        )
+    except Exception as exc:
+        logger.warning("serp_google shopping network error for %r: %s",
+                       query, _redacted(exc, key))
+        return {**out, "error": "network"}
+    if resp.status_code != 200:
+        logger.warning("serp_google shopping %r -> HTTP %s", query, resp.status_code)
+        return {**out, "error": f"http_{resp.status_code}"}
+    try:
+        data = resp.json()
+    except Exception:
+        logger.warning("serp_google shopping %r -> non-JSON body", query)
+        return {**out, "error": "decode"}
+    if not isinstance(data, dict):
+        return {**out, "error": "decode"}
+    results = _parse_shopping(data)
+    if not results:
+        logger.warning("serp_google shopping %r -> no results", query)
+        return {**out, "error": "empty_results"}
+    return {**out, "results": results}
+
+
+def _parse_shopping(data: dict) -> list[dict]:
+    rows = []
+    for index, item in enumerate((data.get("shopping_results") or [])[:MAX_SHOPPING_RESULTS]):
+        if not isinstance(item, dict):
+            continue
+        title = _clean(item.get("title"), 300)
+        if not title:
+            continue
+        value = item.get("extracted_price")
+        numeric = isinstance(value, int | float) and not isinstance(value, bool)
+        rows.append({
+            # The place on the page: ScraperAPI's own numbering is not relied on.
+            "position": index + 1,
+            "title": title,
+            "seller": _clean(item.get("source"), 120),
+            "price": _clean(item.get("price"), 40),
+            "price_value": float(value) if numeric else None,
+        })
+    return rows
 
 
 # -- block parsers ------------------------------------------------------------

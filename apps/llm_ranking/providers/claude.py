@@ -146,6 +146,7 @@ class ClaudeProvider(LLMProvider):
                     for r in content:
                         _add(_url_of(r))
 
+        search_queries, web_searches = _search_queries(resp) if "tools" in kwargs else ([], 0)
         return ProviderResult(
             succeeded=True,
             text=text,
@@ -154,7 +155,25 @@ class ClaudeProvider(LLMProvider):
             citations=citations,
             web_search_requests=searches,
             searched=searches > 0,
+            search_queries=search_queries,
+            web_searches=web_searches,
         )
+
+
+def _search_queries(resp) -> tuple[list[str], int]:
+    """(query texts, searches run) from the web_search server_tool_use
+    blocks: one block per search, its query in ``input.query``. SDK 2.x
+    types the blocks; older SDKs and test doubles use dicts."""
+    from .openai_compat import _get, clean_search_queries
+
+    queries, searches = [], 0
+    for b in getattr(resp, "content", None) or []:
+        if _get(b, "type") != "server_tool_use" or _get(b, "name") != "web_search":
+            continue
+        searches += 1
+        tool_input = _get(b, "input", None)
+        queries.append(_get(tool_input, "query", None) if tool_input is not None else None)
+    return clean_search_queries(queries), searches
 
 
 def _incomplete_answer(resp, text: str, max_tokens: int) -> str:

@@ -1,8 +1,10 @@
 """Cleaning and checks for generated Markdown articles.
 
 Raw script and iframe HTML is removed and links that are not http(s)
-become plain text. The structure checks (an H1, 300 to 5000 words, an
-FAQ) only add warnings: the article is still saved.
+become plain text; with ``known_urls`` (the writers that read sources), a
+link to an address none of the sources carries becomes plain text too.
+The structure checks (an H1, a word range, an FAQ) only add warnings: the
+article is still saved.
 """
 from __future__ import annotations
 
@@ -39,7 +41,18 @@ def word_count(markdown: str) -> int:
     return len([w for w in text.split() if any(ch.isalnum() for ch in w)])
 
 
-def check_markdown(raw: str) -> MarkdownResult:
+def _known(url: str, known: frozenset | set | None) -> bool:
+    if known is None:
+        return True
+    plain = url.rstrip("/")
+    return url in known or plain in {k.rstrip("/") for k in known}
+
+
+def check_markdown(raw: str, *, words: tuple[int, int] | None = (MIN_WORDS, MAX_WORDS),
+                   require_faq: bool = True, known_urls=None,
+                   require_h1: bool = True) -> MarkdownResult:
+    """The article cleaned, with warnings. The defaults are the AEO
+    article's checks; ``words`` None skips the length check (a letter)."""
     warnings: list[dict] = []
     text = (raw or "").strip()
     fenced = _FENCE.match(text)
@@ -54,36 +67,50 @@ def check_markdown(raw: str) -> MarkdownResult:
     text = cleaned
 
     dropped = 0
+    unknown = 0
 
     def replace_link(match):
-        nonlocal dropped
+        nonlocal dropped, unknown
         bang, label, url = match.group(1), match.group(2), match.group(3)
-        if _http(url):
-            return match.group(0)
-        dropped += 1
-        return "" if bang else label
+        if not _http(url):
+            dropped += 1
+            return "" if bang else label
+        if not _known(url, known_urls):
+            unknown += 1
+            return "" if bang else label
+        return match.group(0)
 
     def replace_autolink(match):
-        nonlocal dropped
+        nonlocal dropped, unknown
         url = match.group(1)
-        if _http(url):
-            return match.group(0)
-        dropped += 1
-        return ""
+        if not _http(url):
+            dropped += 1
+            return ""
+        if not _known(url, known_urls):
+            unknown += 1
+            return ""
+        return match.group(0)
 
     text = _LINK.sub(replace_link, text)
     text = _AUTOLINK.sub(replace_autolink, text)
     if dropped:
         warnings.append({"path": "links",
                          "message": f"Removed {dropped} link(s) that were not http or https."})
+    if unknown:
+        warnings.append({"path": "links",
+                         "message": f"Removed {unknown} links to addresses that aren't in the "
+                                    "sources."})
 
-    if not _H1.search(text):
+    if require_h1 and not _H1.search(text):
         warnings.append({"path": "structure", "message": "The article has no H1."})
-    words = word_count(text)
-    if words < MIN_WORDS or words > MAX_WORDS:
-        warnings.append({"path": "length",
-                         "message": f"The article has {words} words; aim for 300 to 5000."})
-    if not _FAQ.search(text):
+    if words is not None:
+        min_words, max_words = words
+        count = word_count(text)
+        if count < min_words or count > max_words:
+            warnings.append({"path": "length",
+                             "message": f"The article has {count} words; aim for {min_words} "
+                                        f"to {max_words}."})
+    if require_faq and not _FAQ.search(text):
         warnings.append({"path": "structure", "message": "The article has no FAQ section."})
     return MarkdownResult(markdown=text, warnings=warnings)
 

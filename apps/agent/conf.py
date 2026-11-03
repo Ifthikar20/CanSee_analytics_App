@@ -6,6 +6,7 @@ override_settings and per-process settings modules take effect.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal
 
 from django.conf import settings
 from django.core import checks
@@ -16,6 +17,33 @@ EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 # these levels (xhigh and max return a 400).
 WORKER_EFFORT_LEVELS = ("low", "medium", "high")
 CACHE_TTLS = ("5m", "1h")
+
+# Settings of the workspace half of wave 2, with the defaults of
+# config/settings/base.py: read with these defaults, so the agent app
+# works the same before and after the settings block is there.
+DEFAULTS = {
+    "AGENT_OPTIMIZER_MAX_TOKENS": 24000,
+    "AGENT_COMPARISON_MAX_TOKENS": 24000,
+    "AGENT_SOCIAL_MAX_TOKENS": 8000,
+    "AGENT_PR_MAX_TOKENS": 16000,
+    "AGENT_LLMS_TXT_MAX_TOKENS": 8000,
+    "AGENT_MESSAGING_MAX_TOKENS": 16000,
+    "AGENT_WRITER_MAX_PAGES": 5,
+    "AGENT_CORRECTION_MAX_PAGES": 5,
+    "AGENT_REVIEW_EMAILS": True,
+    "CONTEXT_BUILD_MAX_PAGES": 8,
+    "CONTEXT_CHECK_MAX_PAGES": 20,
+    "CONTEXT_BUILD_DAILY_RUNS": 5,
+    "CONTEXT_BUILD_USD_PER_REQUEST": "0.0100",
+    "CONTEXT_BUILD_MAX_TOKENS": 4000,
+}
+
+
+def _setting(name: str):
+    if name in DEFAULTS:
+        return getattr(settings, name, DEFAULTS[name])
+    return getattr(settings, name)
+
 
 _POSITIVE_INT_SETTINGS = (
     "AGENT_MAX_TOKENS",
@@ -42,6 +70,17 @@ _POSITIVE_INT_SETTINGS = (
     "AGENT_SWARM_HAIKU_CONCURRENCY",
     "AGENT_SWARM_MAX_SECONDS",
     "AGENT_WORKER_MAX_TOKENS",
+    "AGENT_OPTIMIZER_MAX_TOKENS",
+    "AGENT_COMPARISON_MAX_TOKENS",
+    "AGENT_SOCIAL_MAX_TOKENS",
+    "AGENT_PR_MAX_TOKENS",
+    "AGENT_LLMS_TXT_MAX_TOKENS",
+    "AGENT_MESSAGING_MAX_TOKENS",
+    "AGENT_WRITER_MAX_PAGES",
+    "AGENT_CORRECTION_MAX_PAGES",
+    "CONTEXT_BUILD_MAX_PAGES",
+    "CONTEXT_BUILD_DAILY_RUNS",
+    "CONTEXT_BUILD_MAX_TOKENS",
 )
 
 
@@ -86,6 +125,20 @@ class AgentConf:
     worker_model: str
     worker_effort: str
     worker_max_tokens: int
+    optimizer_max_tokens: int
+    comparison_max_tokens: int
+    social_max_tokens: int
+    pr_max_tokens: int
+    llms_txt_max_tokens: int
+    messaging_max_tokens: int
+    writer_max_pages: int
+    correction_max_pages: int
+    review_emails: bool
+    context_build_max_pages: int
+    context_check_max_pages: int
+    context_build_daily_runs: int
+    context_build_usd_per_request: Decimal
+    context_build_max_tokens: int
 
 
 def agent_conf() -> AgentConf:
@@ -131,6 +184,20 @@ def agent_conf() -> AgentConf:
         worker_model=s.AGENT_WORKER_MODEL,
         worker_effort=s.AGENT_WORKER_EFFORT,
         worker_max_tokens=int(s.AGENT_WORKER_MAX_TOKENS),
+        optimizer_max_tokens=int(_setting("AGENT_OPTIMIZER_MAX_TOKENS")),
+        comparison_max_tokens=int(_setting("AGENT_COMPARISON_MAX_TOKENS")),
+        social_max_tokens=int(_setting("AGENT_SOCIAL_MAX_TOKENS")),
+        pr_max_tokens=int(_setting("AGENT_PR_MAX_TOKENS")),
+        llms_txt_max_tokens=int(_setting("AGENT_LLMS_TXT_MAX_TOKENS")),
+        messaging_max_tokens=int(_setting("AGENT_MESSAGING_MAX_TOKENS")),
+        writer_max_pages=int(_setting("AGENT_WRITER_MAX_PAGES")),
+        correction_max_pages=int(_setting("AGENT_CORRECTION_MAX_PAGES")),
+        review_emails=bool(_setting("AGENT_REVIEW_EMAILS")),
+        context_build_max_pages=int(_setting("CONTEXT_BUILD_MAX_PAGES")),
+        context_check_max_pages=int(_setting("CONTEXT_CHECK_MAX_PAGES")),
+        context_build_daily_runs=int(_setting("CONTEXT_BUILD_DAILY_RUNS")),
+        context_build_usd_per_request=Decimal(str(_setting("CONTEXT_BUILD_USD_PER_REQUEST"))),
+        context_build_max_tokens=int(_setting("CONTEXT_BUILD_MAX_TOKENS")),
     )
 
 
@@ -156,9 +223,17 @@ def check_agent_settings(app_configs=None, **kwargs):
     if settings.AGENT_CACHE_TTL not in CACHE_TTLS:
         _error("AGENT_CACHE_TTL", f"must be one of {', '.join(CACHE_TTLS)}.", 3)
     for setting in _POSITIVE_INT_SETTINGS:
-        value = getattr(settings, setting)
+        value = _setting(setting)
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             _error(setting, "must be a positive integer.", 4)
+    checks_left = _setting("CONTEXT_CHECK_MAX_PAGES")
+    if isinstance(checks_left, bool) or not isinstance(checks_left, int) or checks_left < 0:
+        _error("CONTEXT_CHECK_MAX_PAGES", "must be zero (no re-check) or a positive integer.", 9)
+    try:
+        if Decimal(str(_setting("CONTEXT_BUILD_USD_PER_REQUEST"))) <= 0:
+            raise ValueError
+    except (ArithmeticError, ValueError):
+        _error("CONTEXT_BUILD_USD_PER_REQUEST", "must be an amount above zero.", 10)
     if not settings.AGENT_MODEL:
         _error("AGENT_MODEL", "must name a model.", 5)
     if settings.AGENT_RUN_MAX_COST_USD <= 0:

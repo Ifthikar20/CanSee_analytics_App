@@ -273,6 +273,13 @@ class LLMRankingResult(TimestampMixin):
     # from this row's citations during aggregation; rolled up into the
     # audit-level ``citation_countries`` field for the dashboard.
     citation_countries = models.JSONField(default=dict, blank=True)
+    # Query fan-outs: the web search texts the engine reported running while
+    # it answered, and how many searches it ran (a search can come without
+    # its text). NULL: not recorded (an engine that does not report its
+    # searches, a failed cell, a row from before this was captured); [] and
+    # 0: the engine reports searches and ran none.
+    search_queries = models.JSONField(null=True, blank=True, default=None)
+    web_searches = models.PositiveSmallIntegerField(null=True, blank=True)
     # The intent type of the prompt (recommendation, comparison, persona, etc.)
     # NOTE: computed at runtime from prompt text — no database column needed.
     PROMPT_TYPE_CHOICES = [

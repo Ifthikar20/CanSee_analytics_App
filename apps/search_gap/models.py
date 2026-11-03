@@ -40,6 +40,9 @@ class GoogleRankCheck(TimestampMixin):
     # content_captured False (Google showed an overview whose content was not
     # read): mentions_you and cites_you are None. Older rows lack the key.
     ai_overview = models.JSONField(default=dict, blank=True)
+    # Page one's {"questions": [{question, url}], "related_searches": [str]}
+    # (People also ask and related searches); {} on older rows and failed checks.
+    serp_features = models.JSONField(default=dict, blank=True)
     pages_fetched = models.PositiveSmallIntegerField(default=0)
     cost_usd = models.DecimalField(max_digits=8, decimal_places=4, default=0)
     error = models.CharField(max_length=200, blank=True)

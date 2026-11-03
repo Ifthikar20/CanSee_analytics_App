@@ -1,8 +1,10 @@
 """System prompt and output contract of the answer-engine article agent."""
 
-VERSION = "2026-11-02.1"
+from apps.agent.prompts.common import with_brand_rules
 
-SYSTEM_PROMPT = """\
+VERSION = "2026-11-05.1"
+
+SYSTEM_PROMPT = with_brand_rules("""\
 You write one article in Markdown that answer engines (ChatGPT, Claude, Gemini, Perplexity and \
 Google's AI Overview) can quote when a buyer asks the target question, and that ranks on Google \
 for it.
@@ -24,7 +26,7 @@ Rules
 names, prices or rankings. When a fact is missing, leave it out.
 - Name competitors only when the brief asks for a comparison, and only with facts the brief gives.
 - Do not use emojis.
-"""
+""")
 
 OUTPUT_CONTRACT = """\
 Return only the Markdown article: no code fences around it and no commentary.

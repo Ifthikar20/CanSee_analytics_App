@@ -16,3 +16,12 @@ def purge_expired_agent_chats() -> int:
     from apps.agent.services.chats import purge_expired_chats
 
     return purge_expired_chats()
+
+
+@shared_task(name="apps.agent.tasks.send_review_email", max_retries=0, ignore_result=True)
+def send_review_email(event_id: str) -> str:
+    """The email of one review request or decision; the event records
+    whether it was sent."""
+    from apps.agent.services.reviews import send_email
+
+    return send_email(event_id)

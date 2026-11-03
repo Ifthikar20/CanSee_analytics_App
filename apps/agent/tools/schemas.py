@@ -18,7 +18,21 @@ from apps.agent.constants import SWARM_TITLE_MAX_LENGTH
 GAP_CLASSES = ("ai_ahead", "google_ahead", "strong_both", "invisible_both", "even", "no_data")
 ENGINE_KEYS = ("chatgpt", "claude", "gemini", "grok", "perplexity")
 ARTIFACT_KINDS = ("page", "document", "sheet", "report")
-WRITING_AGENTS = ("landing_page", "aeo_article", "ad_campaign")
+WRITING_AGENTS = (
+    "landing_page", "aeo_article", "ad_campaign", "page_optimizer", "llms_txt",
+    "comparison_page", "social_posts", "pr_writer", "messaging_brief",
+)
+SOCIAL_CHANNELS = ("linkedin", "x", "x_thread")
+PR_FORMATS = ("press_release", "media_pitch", "correction_request")
+# The run_agent inputs only some writers take (contract 12c).
+AGENT_FIELDS = {
+    "url": ("page_optimizer", "comparison_page"),
+    "competitor": ("comparison_page",),
+    "channels": ("social_posts",),
+    "source_artifact_id": ("social_posts",),
+    "format": ("pr_writer",),
+    "claim_key": ("pr_writer",),
+}
 CHART_TYPES = ("bar", "line", "doughnut")
 
 MAX_SERP_PAGES = 5
@@ -98,6 +112,11 @@ class CheckAiEnginesInput(_Input):
     prompt_ids: list[uuid.UUID] = Field(min_length=1, max_length=MAX_ENGINE_PROMPTS)
 
 
+def _agents_phrase(agents) -> str:
+    agents = list(agents)
+    return agents[0] if len(agents) == 1 else f"{', '.join(agents[:-1])} and {agents[-1]}"
+
+
 class RunAgentInput(_Input):
     agent: Literal[WRITING_AGENTS]
     title: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)]
@@ -107,6 +126,46 @@ class RunAgentInput(_Input):
     facts: list[Annotated[str, StringConstraints(strip_whitespace=True, max_length=300)]] = Field(
         default_factory=list, max_length=20,
     )
+    # A page of the project's site (page_optimizer) or of the competitor's
+    # (comparison_page).
+    url: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=4, max_length=2000)
+    ] | None = None
+    competitor: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=1, max_length=253)
+    ] | None = None
+    channels: list[Literal[SOCIAL_CHANNELS]] | None = Field(None, min_length=1, max_length=3)
+    source_artifact_id: uuid.UUID | None = None
+    format: Literal[PR_FORMATS] | None = None
+    claim_key: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=1, max_length=40)
+    ] | None = None
+
+    @model_validator(mode="after")
+    def _agent_inputs(self):
+        for name, agents in AGENT_FIELDS.items():
+            if getattr(self, name) is not None and self.agent not in agents:
+                raise ValueError(f"{name} is used only by {_agents_phrase(agents)}.")
+        if self.url is not None and not self.url.lower().startswith(("http://", "https://")):
+            raise ValueError("url must be an http or https address.")
+        if self.agent == "page_optimizer" and self.url is None:
+            raise ValueError("page_optimizer needs url: the page of the project's site to "
+                             "optimize.")
+        if self.agent == "comparison_page" and self.competitor is None:
+            raise ValueError("comparison_page needs competitor: the domain or name of a "
+                             "competitor the project tracks.")
+        if self.channels is not None and len(set(self.channels)) != len(self.channels):
+            raise ValueError("channels lists each network once.")
+        if self.agent == "pr_writer":
+            if self.format is None:
+                raise ValueError("pr_writer needs format: press_release, media_pitch or "
+                                 "correction_request.")
+            if self.format == "correction_request" and self.claim_key is None:
+                raise ValueError("A correction_request needs claim_key: the Fact check claim's "
+                                 "key.")
+            if self.format != "correction_request" and self.claim_key is not None:
+                raise ValueError("claim_key goes with format correction_request only.")
+        return self
 
 
 class ChartDataset(_Input):
@@ -249,8 +308,10 @@ DEFINITIONS: dict[str, dict] = {
     },
     "get_brand_context": {
         "description": (
-            "Brand facts to write with: project details, audience, voice, offerings and rules, plus "
-            "the most relevant snippets from the project's knowledge base for the query."
+            "Brand context to write with: project details and the active entries of the six "
+            "context sections (company, audience, competitors, offerings, strategy, execution) "
+            "with their sources, plus the most relevant snippets from the project's knowledge "
+            "base for the query."
         ),
         "input_schema": _object({
             "query": {"type": "string", "description": "What to look up in the knowledge base."},
@@ -335,10 +396,23 @@ DEFINITIONS: dict[str, dict] = {
     },
     "run_agent": {
         "description": (
-            "Run a writing agent that saves its work as an artifact the user can open: landing_page "
-            "(a complete HTML page), aeo_article (a Markdown article built to be cited by answer "
-            "engines) or ad_campaign (a Google Ads search campaign). Pass artifact_id to write a new "
-            "version of an existing artifact. Returns the artifact id, version and a summary."
+            "Run a writing agent that saves its work as a draft the user can open, review and "
+            "export. landing_page drafts a complete landing page (HTML) for one search intent. "
+            "aeo_article writes an answer-first article (Markdown) built to be quoted and cited "
+            "by answer engines. ad_campaign builds a Google Search campaign as a sheet. "
+            "page_optimizer rewrites one page of the project's site (url) against the tracked "
+            "prompts, the searches engines ran and the crawler audit, and lists every change "
+            "with the measurement behind it. llms_txt drafts an llms.txt file that points AI "
+            "tools to the site's most useful pages. comparison_page writes a comparison page "
+            "between the brand and one tracked competitor (competitor, optionally url of one "
+            "of its pages) from what each side's own pages say. social_posts turns a draft "
+            "(source_artifact_id) or a topic into LinkedIn posts, X posts or an X thread "
+            "(channels). pr_writer drafts a press release, a media pitch, or correction "
+            "requests (format; claim_key for corrections) to the publishers whose pages repeat "
+            "a claim the brand's evidence contradicts. messaging_brief writes a messaging brief "
+            "from the brand context and how AI engines describe the brand. Pass artifact_id to "
+            "write a new version of an existing draft. Returns the artifact id, version and a "
+            "summary."
         ),
         "input_schema": _object({
             "agent": {"type": "string", "enum": list(WRITING_AGENTS)},
@@ -355,6 +429,37 @@ DEFINITIONS: dict[str, dict] = {
                 "description": "Facts about the brand, each taken from get_brand_context, "
                                "another tool result in this chat or the user's own words; "
                                "never from your own knowledge.",
+            },
+            "url": {
+                "type": "string",
+                "description": "page_optimizer: the page of the project's site to optimize "
+                               "(required). comparison_page: one page of the competitor's site "
+                               "to read as well (optional). Other agents: leave it out.",
+            },
+            "competitor": {
+                "type": "string",
+                "description": "comparison_page only (required): the domain or name of a "
+                               "competitor the project tracks.",
+            },
+            "channels": {
+                "type": "array", "minItems": 1, "maxItems": 3,
+                "items": {"type": "string", "enum": list(SOCIAL_CHANNELS)},
+                "description": "social_posts only: the networks to write for (default linkedin "
+                               "and x).",
+            },
+            "source_artifact_id": {
+                "type": "string",
+                "description": "social_posts only: the document, page or report to promote, as "
+                               "list_artifacts returns it.",
+            },
+            "format": {
+                "type": "string", "enum": list(PR_FORMATS),
+                "description": "pr_writer only (required): what to write.",
+            },
+            "claim_key": {
+                "type": "string",
+                "description": "pr_writer with format correction_request only (required): the "
+                               "key of a contradicted Fact check claim.",
             },
         }, ["agent", "title", "brief"]),
     },

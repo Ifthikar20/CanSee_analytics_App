@@ -1,12 +1,21 @@
-"""Read-only operator views of runs and artifacts.
+"""Read-only operator views of runs, artifacts, reviews and context.
 
-Chat content (titles, previews, messages, wire, parts), artifact bodies
-and research plans, tables and findings are never shown: the admin lists
+Chat content (titles, previews, messages, wire, parts), artifact bodies,
+research plans, tables and findings, review notes and comments and the
+text of context entries and documents are never shown: the admin lists
 ids, owners, states, timings and cost.
 """
 from django.contrib import admin
 
-from apps.agent.models import AgentArtifact, AgentRun, AgentSwarm, AgentSwarmVersion
+from apps.agent.models import (
+    AgentArtifact,
+    AgentArtifactReview,
+    AgentContextEntry,
+    AgentReviewEvent,
+    AgentRun,
+    AgentSwarm,
+    AgentSwarmVersion,
+)
 
 
 class _ReadOnlyAdmin(admin.ModelAdmin):
@@ -86,5 +95,49 @@ class AgentSwarmVersionAdmin(_ReadOnlyAdmin):
         "id", "swarm", "version", "scope", "status", "run_id", "message_id",
         "worker_requests", "cost_usd", "error_code", "created_at", "started_at",
         "finished_at", "duration_ms",
+    )
+    readonly_fields = fields
+
+
+@admin.register(AgentArtifactReview)
+class AgentArtifactReviewAdmin(_ReadOnlyAdmin):
+    list_display = ("artifact", "website", "state", "version", "reviewer", "revision", "updated_at")
+    list_filter = ("state",)
+    list_select_related = ("artifact", "website", "reviewer")
+    search_fields = ("artifact__id", "website__name")
+    ordering = ("-updated_at",)
+    fields = (
+        "artifact", "website", "state", "version", "reviewer", "requested_by", "decided_by",
+        "requested_at", "decided_at", "revision", "updated_at",
+    )
+    readonly_fields = fields
+
+
+@admin.register(AgentReviewEvent)
+class AgentReviewEventAdmin(_ReadOnlyAdmin):
+    list_display = ("id", "artifact", "kind", "version", "actor", "recipient", "email",
+                    "created_at")
+    list_filter = ("kind", "email")
+    list_select_related = ("artifact", "actor", "recipient")
+    search_fields = ("id", "artifact__id")
+    date_hierarchy = "created_at"
+    ordering = ("-created_at",)
+    fields = (
+        "id", "artifact", "website", "kind", "version", "actor", "reviewer", "recipient",
+        "email", "created_at",
+    )
+    readonly_fields = fields
+
+
+@admin.register(AgentContextEntry)
+class AgentContextEntryAdmin(_ReadOnlyAdmin):
+    list_display = ("id", "website", "section", "status", "origin", "revision", "updated_at")
+    list_filter = ("section", "status", "origin")
+    list_select_related = ("website",)
+    search_fields = ("id", "website__name")
+    ordering = ("-updated_at",)
+    fields = (
+        "id", "website", "section", "status", "origin", "position", "revision",
+        "build_run_id", "created_by", "updated_by", "created_at", "updated_at",
     )
     readonly_fields = fields

@@ -67,6 +67,7 @@ LOCAL_APPS = [
     "apps.assistant",
     "apps.agent",
     "apps.web_analytics",
+    "apps.insights",
     # Stub app — kept only to satisfy historical lazy FK references
     # from analytics migrations. All tables are managed=False.
     "apps.leads",
@@ -550,6 +551,26 @@ AGENT_SWARM_MAX_SECONDS = env.int("AGENT_SWARM_MAX_SECONDS", default=420)
 AGENT_WORKER_MODEL = env("AGENT_WORKER_MODEL", default="claude-haiku-5-5")
 AGENT_WORKER_EFFORT = env("AGENT_WORKER_EFFORT", default="low")
 AGENT_WORKER_MAX_TOKENS = env.int("AGENT_WORKER_MAX_TOKENS", default=2048)
+# max_tokens per request of the six writing agents.
+AGENT_OPTIMIZER_MAX_TOKENS = env.int("AGENT_OPTIMIZER_MAX_TOKENS", default=24000)
+AGENT_COMPARISON_MAX_TOKENS = env.int("AGENT_COMPARISON_MAX_TOKENS", default=24000)
+AGENT_SOCIAL_MAX_TOKENS = env.int("AGENT_SOCIAL_MAX_TOKENS", default=8000)
+AGENT_PR_MAX_TOKENS = env.int("AGENT_PR_MAX_TOKENS", default=16000)
+AGENT_LLMS_TXT_MAX_TOKENS = env.int("AGENT_LLMS_TXT_MAX_TOKENS", default=8000)
+AGENT_MESSAGING_MAX_TOKENS = env.int("AGENT_MESSAGING_MAX_TOKENS", default=16000)
+# Pages a writer reads, and third-party pages a correction request reads.
+AGENT_WRITER_MAX_PAGES = env.int("AGENT_WRITER_MAX_PAGES", default=5)
+AGENT_CORRECTION_MAX_PAGES = env.int("AGENT_CORRECTION_MAX_PAGES", default=5)
+# Emails for review requests and decisions.
+AGENT_REVIEW_EMAILS = env.bool("AGENT_REVIEW_EMAILS", default=True)
+# Build from my site (run kind context_build): pages read, cited pages
+# re-checked, builds per website per UTC day, the estimate bound per request
+# and the output cap per request.
+CONTEXT_BUILD_MAX_PAGES = env.int("CONTEXT_BUILD_MAX_PAGES", default=8)
+CONTEXT_CHECK_MAX_PAGES = env.int("CONTEXT_CHECK_MAX_PAGES", default=20)
+CONTEXT_BUILD_DAILY_RUNS = env.int("CONTEXT_BUILD_DAILY_RUNS", default=5)
+CONTEXT_BUILD_USD_PER_REQUEST = env("CONTEXT_BUILD_USD_PER_REQUEST", default="0.0100")
+CONTEXT_BUILD_MAX_TOKENS = env.int("CONTEXT_BUILD_MAX_TOKENS", default=4000)
 
 # ── RAG vector index (optional) ──
 # "python" (default): retriever.py scores every (user, website) chunk in
@@ -654,6 +675,49 @@ COUNTRY_CHECK_ENGINE_CONCURRENCY = env.int("COUNTRY_CHECK_ENGINE_CONCURRENCY", d
 COUNTRY_CHECK_RUN_MODE = env("COUNTRY_CHECK_RUN_MODE", default="auto")
 # A queued or running check with no heartbeat for this long is interrupted.
 COUNTRY_CHECK_STALE_MINUTES = env.int("COUNTRY_CHECK_STALE_MINUTES", default=20)
+
+# ── Insights (apps.insights) ───────────────────────────────────────────
+# Answer analysis, crawler audits, prompt research, fan-out Google checks
+# and shopping checks. Every paid run is estimated and confirmed first.
+INSIGHTS_ENABLED = env.bool("INSIGHTS_ENABLED", default=True)
+# auto | celery | thread | inline. auto runs a Celery task on the kind's
+# queue, or a background thread when Celery runs eagerly.
+INSIGHTS_RUN_MODE = env("INSIGHTS_RUN_MODE", default="auto")
+# A queued or running run with no heartbeat for this long is interrupted.
+INSIGHTS_RUN_STALE_MINUTES = env.int("INSIGHTS_RUN_STALE_MINUTES", default=20)
+# Google pages per website per UTC day, all insights kinds together.
+INSIGHTS_DAILY_GOOGLE_PAGES = env.int("INSIGHTS_DAILY_GOOGLE_PAGES", default=60)
+# Answers per analysis run, the estimate bound per answer (two Claude Haiku
+# 5.5 requests; typical about $0.002), answers analyzed at once and the
+# output cap per analysis request.
+INSIGHTS_ANALYSIS_MAX_ANSWERS = env.int("INSIGHTS_ANALYSIS_MAX_ANSWERS", default=60)
+INSIGHTS_ANALYSIS_USD_PER_ANSWER = env("INSIGHTS_ANALYSIS_USD_PER_ANSWER", default="0.0060")
+INSIGHTS_ANALYSIS_CONCURRENCY = env.int("INSIGHTS_ANALYSIS_CONCURRENCY", default=3)
+INSIGHTS_ANALYSIS_MAX_TOKENS = env.int("INSIGHTS_ANALYSIS_MAX_TOKENS", default=3000)
+# Own pages read as evidence for claim checks, and how long a read is reused.
+INSIGHTS_EVIDENCE_PAGES = env.int("INSIGHTS_EVIDENCE_PAGES", default=5)
+INSIGHTS_EVIDENCE_TTL_HOURS = env.int("INSIGHTS_EVIDENCE_TTL_HOURS", default=24)
+# Google reads per research run, and the estimate bound of one suggestion request.
+INSIGHTS_RESEARCH_MAX_GOOGLE_PROMPTS = env.int("INSIGHTS_RESEARCH_MAX_GOOGLE_PROMPTS", default=5)
+INSIGHTS_SUGGESTIONS_USD = env("INSIGHTS_SUGGESTIONS_USD", default="0.0100")
+# Searches per fan-out Google check.
+INSIGHTS_FANOUT_MAX_QUERIES = env.int("INSIGHTS_FANOUT_MAX_QUERIES", default=10)
+# Crawler audit: own pages per audit, the text_without_js threshold, the
+# pause between audits, audits per website per UTC day and fetches at once
+# (the browse parser reads 2 pages at a time per process).
+SITE_AUDIT_MAX_PAGES = env.int("SITE_AUDIT_MAX_PAGES", default=20)
+SITE_AUDIT_MIN_WORDS = env.int("SITE_AUDIT_MIN_WORDS", default=150)
+SITE_AUDIT_COOLDOWN_MINUTES = env.int("SITE_AUDIT_COOLDOWN_MINUTES", default=10)
+SITE_AUDIT_DAILY_RUNS = env.int("SITE_AUDIT_DAILY_RUNS", default=10)
+SITE_AUDIT_CONCURRENCY = env.int("SITE_AUDIT_CONCURRENCY", default=2)
+# Products: active tracked products per website, products per shopping check
+# and engine answers per shopping check.
+SHOPPING_MAX_PRODUCTS = env.int("SHOPPING_MAX_PRODUCTS", default=10)
+SHOPPING_MAX_PRODUCTS_PER_RUN = env.int("SHOPPING_MAX_PRODUCTS_PER_RUN", default=5)
+SHOPPING_MAX_ENGINE_ANSWERS = env.int("SHOPPING_MAX_ENGINE_ANSWERS", default=30)
+# ScraperAPI credits per Google Shopping page (its Google-domain rate; confirm
+# against the account balance before and after one check).
+SCRAPERAPI_SHOPPING_CREDITS = env.int("SCRAPERAPI_SHOPPING_CREDITS", default=25)
 
 # ── SMS (Twilio) ───────────────────────────────────────────────────────
 # The most intrusive channel in the product, so it is off by default and

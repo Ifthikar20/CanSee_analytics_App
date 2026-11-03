@@ -9,7 +9,6 @@ MessageSerializer and RunSerializer from here.
 from __future__ import annotations
 
 import uuid
-from urllib.parse import urlsplit
 
 from rest_framework import serializers
 
@@ -38,15 +37,8 @@ from apps.agent.services.findings import (
     STATUS_FILTER_ALL,
     TITLE_MAX_LENGTH,
 )
-from core.validators.url_safety import safe_display_url
 
 _datetime_field = serializers.DateTimeField()
-
-AUDIENCE_MAX_LENGTH = 4000
-VOICE_MAX_LENGTH = 2000
-MAX_OFFERINGS = 20
-MAX_RULES = 30
-RULE_MAX_LENGTH = 500
 
 
 def dt(value) -> str | None:
@@ -177,9 +169,12 @@ def _source_chat_id(artifact, user) -> str | None:
 
 
 class ArtifactSummarySerializer(serializers.BaseSerializer):
-    """Contract ``ArtifactSummary``; needs ``context={"user": ...}``."""
+    """Contract ``ArtifactSummary``; needs ``context={"user": ...}``. Lists
+    select_related("review__reviewer") so ``review`` costs no query."""
 
     def to_representation(self, artifact):
+        from apps.agent.services.reviews import summary_for
+
         return {
             "id": str(artifact.id),
             "kind": artifact.kind,
@@ -190,6 +185,7 @@ class ArtifactSummarySerializer(serializers.BaseSerializer):
             "updated_at": dt(artifact.updated_at),
             "created_by_name": display_name(artifact.created_by),
             "source_chat_id": _source_chat_id(artifact, self.context.get("user")),
+            "review": summary_for(artifact),
         }
 
 
@@ -233,65 +229,6 @@ class ArtifactVersionSerializer(serializers.BaseSerializer):
             "created_at": dt(version.created_at),
             "created_by_name": display_name(version.created_by),
         }
-
-
-# ── Brand context ─────────────────────────────────────────────────────────
-
-
-class BrandContextSerializer(serializers.BaseSerializer):
-    """Contract ``BrandContext``. An unsaved context reads as revision 0."""
-
-    def to_representation(self, context):
-        return {
-            "website_id": str(context.website_id),
-            "audience": context.audience,
-            "voice": context.voice,
-            "offerings": context.offerings or [],
-            "rules": context.rules or [],
-            "revision": context.revision,
-            "updated_at": dt(context.updated_at),
-            "updated_by_name": display_name(context.updated_by) if context.updated_by_id else None,
-        }
-
-
-class OfferingSerializer(serializers.Serializer):
-    name = serializers.CharField(max_length=120)
-    description = serializers.CharField(max_length=1000, required=False, allow_blank=True, default="")
-    url = serializers.CharField(max_length=500, required=False, allow_blank=True, default="")
-
-    def validate_url(self, value):
-        if not value:
-            return ""
-        if safe_display_url(value) is None or not urlsplit(value).netloc:
-            raise serializers.ValidationError("Enter a full http(s) address.")
-        return value
-
-
-class BrandContextWriteSerializer(serializers.Serializer):
-    audience = serializers.CharField(
-        max_length=AUDIENCE_MAX_LENGTH, required=False, allow_blank=True, default="",
-    )
-    voice = serializers.CharField(
-        max_length=VOICE_MAX_LENGTH, required=False, allow_blank=True, default="",
-    )
-    offerings = OfferingSerializer(many=True, required=False, default=list)
-    rules = serializers.ListField(
-        child=serializers.CharField(max_length=RULE_MAX_LENGTH, allow_blank=True),
-        required=False,
-        default=list,
-    )
-    revision = serializers.IntegerField(min_value=0)
-
-    def validate_offerings(self, value):
-        if len(value) > MAX_OFFERINGS:
-            raise serializers.ValidationError(f"At most {MAX_OFFERINGS} offerings.")
-        return [dict(item) for item in value]
-
-    def validate_rules(self, value):
-        rules = [rule for rule in value if rule]
-        if len(rules) > MAX_RULES:
-            raise serializers.ValidationError(f"At most {MAX_RULES} rules.")
-        return rules
 
 
 # ── Requests ──────────────────────────────────────────────────────────────

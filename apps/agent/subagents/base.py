@@ -1,15 +1,20 @@
 """Running one writing agent for ``run_agent``.
 
 One streamed request with no tools. The user content is a sequence of
-XML-tagged data blocks (<brand>, <target_prompt>, <current_version>,
-<brief>, <output_contract>). Text streams to the pane as
-``artifact.delta`` (pages, articles) or throttled ``artifact.snapshot``
-partial JSON (sheets); the result is validated, saved as the artifact's
-next version, and summarized for the orchestrator. Spend is checked
-before the request: the writer's ``max_tokens`` is what the user's
-remaining allowance pays for at $20 per MTok, at most the agent's own
-limit, and a writer that would get less than MIN_WRITER_TOKENS does not
-start.
+XML-tagged data blocks (<brand>, <target_prompt>, the blocks a writer
+reads before it writes, <current_version>, <brief>, <output_contract>).
+Text streams to the pane as ``artifact.delta`` (pages, articles) or
+throttled ``artifact.snapshot`` partial JSON (sheets, structured drafts);
+the result is validated, saved as the artifact's next version, and
+summarized for the orchestrator. Spend is checked before the request: the
+writer's ``max_tokens`` is what the user's remaining allowance pays for at
+$20 per MTok, at most the agent's own limit, and a writer that would get
+less than MIN_WRITER_TOKENS does not start.
+
+The writers of design/p2_backend.md 12 read their sources first
+(``SubagentSpec.inputs``: pages of the site, measurements, a claim), with
+each source tagged by an id the validator checks quotes against; a
+structured draft keeps its parts in the version's ``data``.
 """
 from __future__ import annotations
 
@@ -19,7 +24,7 @@ import re
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 
 from django.db import transaction
@@ -44,6 +49,13 @@ MIN_WRITER_TOKENS = 16_000
 SNAPSHOT_SECONDS = 0.5
 PROGRESS_SECONDS = 1.0
 CURRENT_VERSION_CHARS = 120_000
+# Characters the blocks a writer reads before it writes hold together
+# (pages, signals, the source artifact, a claim and its pages), so a new
+# draft's user turn stays under 80,000 characters (contract 12c).
+WRITER_BLOCK_CHARS = 40_000
+# The most a new draft's user turn costs as input: 80,000 characters at 3
+# per token and $4 per million, plus writing the system prompt to the cache.
+WRITER_INPUT_USD_MAX = Decimal("0.13")
 # The data blocks whose URLs a writer may link to. Never <current_version>:
 # that is the writer's own earlier output, not a source.
 _LINK_SOURCES = ("brand", "target_prompt", "brief")
@@ -55,6 +67,25 @@ class Validated:
     content: str
     warnings: list[dict]
     summary: str
+    # A structured draft's parts (contract 12d), saved as the version's data.
+    data: dict | None = None
+
+
+@dataclass(frozen=True)
+class Inputs:
+    """What a writer read before writing (``SubagentSpec.inputs``)."""
+
+    # Data blocks inserted after <brand> and <target_prompt>.
+    blocks: list[dict]
+    # Source id -> the text the validator checks that source's quotes in.
+    sources: dict[str, str]
+    # URLs of those sources the draft may link to.
+    link_urls: frozenset[str]
+    # The parts read before writing that streamed snapshots carry (source,
+    # current, signals, competitor, sources, claim).
+    data: dict
+    # What only the validator needs (the requested channels, the pages read).
+    checks: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -78,22 +109,51 @@ class SubagentSpec:
     streams: str
     output_schema: dict | None
     # Raises ValueError with a user-readable message when the output is unusable.
-    # Called as validate(raw, stop_reason), plus links=LinkFacts when checks_links.
+    # Called as validate(raw, stop_reason), plus links=LinkFacts when
+    # checks_links and inputs=Inputs when the spec has ``inputs``.
     validate: Callable[..., Validated]
     checks_links: bool = False
+    # Reads the writer's sources before the artifact exists:
+    # inputs(ctx, args, progress) -> Inputs, where progress(line) sets the
+    # part's progress line. A ToolError there fails the call.
+    inputs: Callable[[ToolContext, object, Callable[[str], None]], Inputs] | None = None
+    # data.type of a structured draft (contract 12d), or a function of the
+    # call's args (pr_writer: press or corrections).
+    data_type: str | Callable[[object], str] | None = None
 
 
 def _specs() -> dict[str, SubagentSpec]:
-    from apps.agent.subagents import ad_campaign, aeo_article, landing_page
+    from apps.agent.subagents import (
+        ad_campaign,
+        aeo_article,
+        comparison_page,
+        landing_page,
+        llms_txt,
+        messaging_brief,
+        page_optimizer,
+        pr_writer,
+        social_posts,
+    )
 
-    return {s.key: s for s in (landing_page.SPEC, aeo_article.SPEC, ad_campaign.SPEC)}
+    return {s.key: s for s in (
+        landing_page.SPEC, aeo_article.SPEC, ad_campaign.SPEC,
+        page_optimizer.SPEC, llms_txt.SPEC, comparison_page.SPEC, social_posts.SPEC,
+        pr_writer.SPEC, messaging_brief.SPEC,
+    )}
+
+
+def data_type_of(spec: SubagentSpec, args) -> str | None:
+    if callable(spec.data_type):
+        return spec.data_type(args)
+    return spec.data_type
 
 
 def _block(tag: str, body: str) -> dict:
     return {"type": "text", "text": f"<{tag}>\n{body}\n</{tag}>"}
 
 
-def build_user_content(ctx: ToolContext, spec: SubagentSpec, args, current: str | None) -> list:
+def build_user_content(ctx: ToolContext, spec: SubagentSpec, args, current: str | None,
+                       extra: Inputs | None = None) -> list:
     from apps.agent.tools.data import brand_facts, trim_prompt_detail
 
     brand = brand_facts(ctx.website)
@@ -113,6 +173,8 @@ def build_user_content(ctx: ToolContext, spec: SubagentSpec, args, current: str 
         detail = trim_prompt_detail(build_prompt_detail(ctx.website, bp))
         blocks.append(_block("target_prompt", json.dumps(detail, ensure_ascii=False, indent=1,
                                                          sort_keys=True)))
+    if extra is not None:
+        blocks.extend(extra.blocks)
     if current is not None:
         blocks.append(_block("current_version", current[:CURRENT_VERSION_CHARS]))
     blocks.append(_block("brief", f"Title: {args.title}\n\n{args.brief}"))
@@ -120,15 +182,18 @@ def build_user_content(ctx: ToolContext, spec: SubagentSpec, args, current: str 
     return blocks
 
 
-def link_facts(website, blocks: list[dict]) -> LinkFacts:
+def link_facts(website, blocks: list[dict], extra: Inputs | None = None) -> LinkFacts:
     """The website and every URL in the <brand>, <target_prompt> and
-    <brief> blocks of ``blocks`` (build_user_content's)."""
+    <brief> blocks of ``blocks`` (build_user_content's), plus the URLs of
+    the sources the writer read (``extra.link_urls``)."""
     heads = tuple(f"<{tag}>\n" for tag in _LINK_SOURCES)
     known = {website.url} if website.url else set()
     for block in blocks:
         text = block.get("text") or ""
         if text.startswith(heads):
             known.update(url.rstrip(".,;:!?)]}") for url in _LINK.findall(text))
+    if extra is not None:
+        known.update(extra.link_urls)
     return LinkFacts(site_url=website.url or "", known=frozenset(known))
 
 
@@ -191,6 +256,7 @@ def _save_version(ctx: ToolContext, spec: SubagentSpec, *, artifact_id, existing
         version = add_version(
             artifact,
             content=validated.content,
+            data=validated.data,
             summary=validated.summary,
             warnings=validated.warnings,
             source=VersionSource.AGENT,
@@ -248,12 +314,28 @@ def run_subagent(ctx: ToolContext, args) -> ToolResult:
         if existing.kind != spec.kind:
             raise fail(f"Artifact {args.artifact_id} is a {existing.kind}, not a {spec.kind}.",
                        code="wrong_kind")
+        if existing.agent_key and existing.agent_key != spec.key:
+            # Seven agents write documents: one never overwrites another's draft.
+            raise fail(f"Artifact {args.artifact_id} was written by the "
+                       f"{agent_name(existing.agent_key)}; ask that agent to revise it.",
+                       code="wrong_kind")
         latest = existing.versions.order_by("-version").first()
         current = latest.content if latest else None
     artifact_id = existing.id if existing else uuid.uuid4()
     base_version = existing.latest_version if existing else 0
 
-    content_blocks = build_user_content(ctx, spec, args, current)
+    extra_inputs = None
+    if spec.inputs is not None:
+        def set_progress(line: str) -> None:
+            em.update_part(part_id, progress=clip(line, 140))
+
+        try:
+            extra_inputs = spec.inputs(ctx, args, set_progress)
+        except ToolError as exc:
+            raise fail(exc.message, code="invalid_input") from None
+    data_type = data_type_of(spec, args)
+
+    content_blocks = build_user_content(ctx, spec, args, current, extra_inputs)
     if ctx.check_gate is not None:
         ctx.check_gate()
 
@@ -292,6 +374,12 @@ def run_subagent(ctx: ToolContext, args) -> ToolResult:
             partial = from_json(raw, partial_mode="trailing-strings")
         except ValueError:
             return
+        if data_type is not None:
+            # The parts the server read come first, so the pane can pick the
+            # structured view before the draft is saved (contract 12d).
+            partial = {**(extra_inputs.data if extra_inputs is not None else {}),
+                       **(partial if isinstance(partial, dict) else {}),
+                       "type": data_type, "drafting": True}
         em.emit(EventType.ARTIFACT_SNAPSHOT, artifact_id=str(artifact_id), content=partial)
 
     final = None
@@ -367,7 +455,11 @@ def run_subagent(ctx: ToolContext, args) -> ToolResult:
 
     em.update_part(part_id, status="validating")
     raw = "".join(b.text for b in final.content if getattr(b, "type", "") == "text")
-    extra = {"links": link_facts(ctx.website, content_blocks)} if spec.checks_links else {}
+    extra = {}
+    if spec.checks_links:
+        extra["links"] = link_facts(ctx.website, content_blocks, extra_inputs)
+    if spec.inputs is not None:
+        extra["inputs"] = extra_inputs
     try:
         validated = spec.validate(raw, final.stop_reason, **extra)
     except ValueError as exc:
@@ -376,7 +468,10 @@ def run_subagent(ctx: ToolContext, args) -> ToolResult:
             message += (f" The remaining AI allowance covered {max_tokens:,} of the "
                         f"{limit:,} output tokens this agent can use.")
         raise fail(message, code="invalid_output", artifact_id=artifact_id) from None
-    if spec.streams == "snapshot":
+    if validated.data is not None:
+        # Exactly the data the version saves (no ``drafting``).
+        em.emit(EventType.ARTIFACT_SNAPSHOT, artifact_id=str(artifact_id), content=validated.data)
+    elif spec.streams == "snapshot":
         em.emit(EventType.ARTIFACT_SNAPSHOT, artifact_id=str(artifact_id),
                 content=json.loads(validated.content))
 

@@ -1,9 +1,10 @@
 """Persistence for the agent workspace (design/agent_backend.md section 3).
 
 Chats and messages are private to the user who started them; artifacts,
-reports and brand context are shared with every member of the website.
-Postgres is the source of truth for a run: the event stream is rebuilt
-from AgentMessage.parts / parts_seq after a reload or a process restart.
+their reviews, reports and the context are shared with every member of
+the website. Postgres is the source of truth for a run: the event stream
+is rebuilt from AgentMessage.parts / parts_seq after a reload or a
+process restart.
 """
 import uuid
 
@@ -17,16 +18,26 @@ from apps.agent.constants import (
     ARTIFACT_TITLE_MAX_LENGTH,
     CHAT_PREVIEW_MAX_LENGTH,
     CHAT_TITLE_MAX_LENGTH,
+    CONTEXT_DOCUMENT_TITLE_MAX_LENGTH,
+    CONTEXT_TITLE_MAX_LENGTH,
     DEFAULT_ENTRY_AGENT,
     FINDING_CATEGORIES,
     FINDING_CATEGORY_LABELS,
     SWARM_TITLE_MAX_LENGTH,
     ArtifactContentType,
     ArtifactKind,
+    ContextOrigin,
+    ContextSection,
+    ContextStatus,
     FindingSeverity,
     FindingStatus,
     MessageRole,
     MessageStatus,
+    ReferenceKind,
+    ReferenceState,
+    ReviewEmail,
+    ReviewEventKind,
+    ReviewState,
     RunStatus,
     RunTrigger,
     SwarmScope,
@@ -327,8 +338,105 @@ class AgentArtifactVersion(models.Model):
         return f"AgentArtifactVersion({self.artifact_id}, v{self.version})"
 
 
+class AgentArtifactReview(models.Model):
+    """An artifact's review state (design/p2_contract.md 13a), created on
+    its first review action; an artifact without one is a draft.
+
+    ``version`` is the version asked about or approved; a newer version
+    never inherits an approval. ``revision`` guards against two people
+    acting at once.
+    """
+
+    artifact = models.OneToOneField(
+        AgentArtifact, primary_key=True, related_name="review", on_delete=models.CASCADE
+    )
+    website = models.ForeignKey(
+        "websites.Website", related_name="agent_reviews", on_delete=models.CASCADE
+    )
+    state = models.CharField(
+        max_length=20, choices=ReviewState.choices, default=ReviewState.DRAFT
+    )
+    version = models.PositiveIntegerField(default=0)
+    reviewer = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, related_name="+",
+        on_delete=models.SET_NULL,
+    )
+    requested_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, related_name="+",
+        on_delete=models.SET_NULL,
+    )
+    decided_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, related_name="+",
+        on_delete=models.SET_NULL,
+    )
+    requested_at = models.DateTimeField(null=True, blank=True)
+    decided_at = models.DateTimeField(null=True, blank=True)
+    revision = models.PositiveIntegerField(default=0)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "agent_artifact_review"
+        indexes = [
+            models.Index(fields=["website", "state"]),
+            models.Index(fields=["reviewer", "state"]),
+        ]
+
+    def __str__(self):
+        return f"AgentArtifactReview({self.artifact_id}, {self.state})"
+
+
+class AgentReviewEvent(models.Model):
+    """One review action or comment on an artifact, in order.
+
+    ``recipient`` is whom the inbox item and the email address: the
+    reviewer for a request, the requester for a decision, nobody otherwise.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    artifact = models.ForeignKey(
+        AgentArtifact, related_name="review_events", on_delete=models.CASCADE
+    )
+    website = models.ForeignKey(
+        "websites.Website", related_name="agent_review_events", on_delete=models.CASCADE
+    )
+    actor = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, related_name="+",
+        on_delete=models.SET_NULL,
+    )
+    kind = models.CharField(max_length=20, choices=ReviewEventKind.choices)
+    version = models.PositiveIntegerField()
+    body = models.TextField(blank=True)
+    # Who was asked (requested events).
+    reviewer = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, related_name="+",
+        on_delete=models.SET_NULL,
+    )
+    recipient = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, related_name="+",
+        on_delete=models.SET_NULL,
+    )
+    email = models.CharField(max_length=8, choices=ReviewEmail.choices, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "agent_review_event"
+        indexes = [
+            models.Index(fields=["website", "-created_at"]),
+            models.Index(fields=["artifact", "created_at"]),
+            models.Index(fields=["recipient", "-created_at"]),
+        ]
+
+    def __str__(self):
+        # Ids only: comments and notes are the team's own words.
+        return f"AgentReviewEvent({self.kind}, {self.id})"
+
+
 class AgentBrandContext(models.Model):
-    """Per-website brand notes the agents write with. Optimistic ``revision``."""
+    """Legacy per-website brand notes (audience, voice, offerings, rules).
+
+    Migration 0003 moved every row into context entries
+    (AgentContextEntry); nothing reads or writes this table any more.
+    """
 
     website = models.OneToOneField(
         "websites.Website",
@@ -358,6 +466,126 @@ class AgentBrandContext(models.Model):
 
     def __str__(self):
         return f"AgentBrandContext({self.website_id}, r{self.revision})"
+
+
+class AgentContextEntry(models.Model):
+    """One entry of a project's context (design/p2_contract.md 11a).
+
+    Shared with the website's members and edited with an optimistic
+    ``revision``. The agents read active entries only; entries built from
+    the site arrive ``suggested`` until a person accepts them.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    website = models.ForeignKey(
+        "websites.Website", related_name="agent_context_entries", on_delete=models.CASCADE
+    )
+    section = models.CharField(max_length=16, choices=ContextSection.choices)
+    title = models.CharField(max_length=CONTEXT_TITLE_MAX_LENGTH, blank=True)
+    body = models.TextField(blank=True)
+    status = models.CharField(
+        max_length=10, choices=ContextStatus.choices, default=ContextStatus.ACTIVE
+    )
+    origin = models.CharField(
+        max_length=10, choices=ContextOrigin.choices, default=ContextOrigin.USER
+    )
+    position = models.PositiveIntegerField(default=0)
+    revision = models.PositiveIntegerField(default=1)
+    # The context_build run (apps.insights InsightRun) that suggested it;
+    # a plain id, so the two apps' migrations do not depend on each other.
+    build_run_id = models.UUIDField(null=True, blank=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, related_name="+",
+        on_delete=models.SET_NULL,
+    )
+    updated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, related_name="+",
+        on_delete=models.SET_NULL,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "agent_context_entry"
+        indexes = [
+            models.Index(fields=["website", "section", "status", "position"]),
+        ]
+
+    def __str__(self):
+        # Ids only: titles and bodies are the brand's own notes.
+        return f"AgentContextEntry({self.section}, {self.id})"
+
+
+class AgentContextDocument(models.Model):
+    """Text a member added for the agents (positioning notes, style guides)."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    website = models.ForeignKey(
+        "websites.Website", related_name="agent_context_documents", on_delete=models.CASCADE
+    )
+    title = models.CharField(max_length=CONTEXT_DOCUMENT_TITLE_MAX_LENGTH)
+    text = models.TextField()
+    chars = models.PositiveIntegerField(default=0)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, related_name="+",
+        on_delete=models.SET_NULL,
+    )
+    updated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, related_name="+",
+        on_delete=models.SET_NULL,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "agent_context_document"
+
+    def __str__(self):
+        return f"AgentContextDocument({self.id})"
+
+
+class AgentContextReference(models.Model):
+    """A source one entry comes from: a page of the site, a brand fact, a
+    document or a tracked competitor (contract 11a)."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    entry = models.ForeignKey(
+        AgentContextEntry, related_name="references", on_delete=models.CASCADE
+    )
+    website = models.ForeignKey(
+        "websites.Website", related_name="agent_context_references", on_delete=models.CASCADE
+    )
+    kind = models.CharField(max_length=12, choices=ReferenceKind.choices)
+    url = models.URLField(max_length=2000, blank=True)
+    title = models.CharField(max_length=300, blank=True)
+    quote = models.TextField(blank=True)
+    fact = models.ForeignKey(
+        "brand_vault.BrandFact", null=True, blank=True, related_name="+",
+        on_delete=models.SET_NULL,
+    )
+    # Deleting a document removes the references that cite it.
+    document = models.ForeignKey(
+        AgentContextDocument, null=True, blank=True, related_name="references",
+        on_delete=models.CASCADE,
+    )
+    competitor_domain = models.CharField(max_length=253, blank=True)
+    competitor_name = models.CharField(max_length=200, blank=True)
+    # Stored for pages and documents; ``retired`` and ``untracked`` are
+    # computed when read (services.context).
+    state = models.CharField(
+        max_length=12, choices=ReferenceState.choices, default=ReferenceState.UNCHECKED
+    )
+    checked_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "agent_context_reference"
+        indexes = [
+            models.Index(fields=["website", "kind"]),
+        ]
+
+    def __str__(self):
+        return f"AgentContextReference({self.kind}, {self.id})"
 
 
 class AgentSwarm(models.Model):

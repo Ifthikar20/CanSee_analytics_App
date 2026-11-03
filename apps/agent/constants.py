@@ -16,6 +16,8 @@ CHAT_TITLE_MAX_LENGTH = 120
 CHAT_PREVIEW_MAX_LENGTH = 200
 ARTIFACT_TITLE_MAX_LENGTH = 200
 ARTIFACT_SUMMARY_MAX_LENGTH = 500
+CONTEXT_TITLE_MAX_LENGTH = 120
+CONTEXT_DOCUMENT_TITLE_MAX_LENGTH = 200
 # Generated chat titles (model or first-message fallback).
 GENERATED_TITLE_MAX_CHARS = 60
 
@@ -25,6 +27,12 @@ class AgentKey(models.TextChoices):
     LANDING_PAGE = "landing_page", "Landing page"
     AEO_ARTICLE = "aeo_article", "AEO article"
     AD_CAMPAIGN = "ad_campaign", "Ad campaign"
+    PAGE_OPTIMIZER = "page_optimizer", "Page optimizer"
+    COMPARISON_PAGE = "comparison_page", "Comparison page"
+    SOCIAL_POSTS = "social_posts", "Social posts"
+    PR_WRITER = "pr_writer", "PR"
+    LLMS_TXT = "llms_txt", "llms.txt"
+    MESSAGING_BRIEF = "messaging_brief", "Messaging brief"
 
 
 DEFAULT_ENTRY_AGENT = AgentKey.GAP_ANALYST.value
@@ -33,7 +41,41 @@ SUBAGENT_KEYS = (
     AgentKey.LANDING_PAGE.value,
     AgentKey.AEO_ARTICLE.value,
     AgentKey.AD_CAMPAIGN.value,
+    AgentKey.PAGE_OPTIMIZER.value,
+    AgentKey.COMPARISON_PAGE.value,
+    AgentKey.SOCIAL_POSTS.value,
+    AgentKey.PR_WRITER.value,
+    AgentKey.LLMS_TXT.value,
+    AgentKey.MESSAGING_BRIEF.value,
 )
+
+# The Agents page's team tabs, in tab order (design/p2_contract.md 12a).
+TEAMS = (
+    ("aeo_seo", "AEO and SEO"),
+    ("content", "Content"),
+    ("social", "Social"),
+    ("growth", "Growth"),
+    ("pr", "PR and comms"),
+    ("product_marketing", "Product marketing"),
+    ("brand", "Brand"),
+)
+TEAM_LABELS = dict(TEAMS)
+# The research agents count as one agent in the usage dashboard.
+RESEARCH_AGENTS_KEY = "research_agents"
+# Each agent's teams, the primary one first (contract 12b).
+AGENT_TEAMS = {
+    AgentKey.GAP_ANALYST.value: ("aeo_seo", "growth"),
+    AgentKey.LANDING_PAGE.value: ("growth", "product_marketing"),
+    AgentKey.AEO_ARTICLE.value: ("content", "aeo_seo"),
+    AgentKey.AD_CAMPAIGN.value: ("growth",),
+    AgentKey.PAGE_OPTIMIZER.value: ("aeo_seo", "content"),
+    AgentKey.COMPARISON_PAGE.value: ("product_marketing", "content", "growth"),
+    AgentKey.SOCIAL_POSTS.value: ("social", "content"),
+    AgentKey.PR_WRITER.value: ("pr", "brand"),
+    AgentKey.LLMS_TXT.value: ("aeo_seo",),
+    AgentKey.MESSAGING_BRIEF.value: ("product_marketing", "brand"),
+    RESEARCH_AGENTS_KEY: ("aeo_seo",),
+}
 
 
 class TitleSource(models.TextChoices):
@@ -112,6 +154,12 @@ OUTPUT_KIND_BY_AGENT = {
     AgentKey.LANDING_PAGE.value: ArtifactKind.PAGE.value,
     AgentKey.AEO_ARTICLE.value: ArtifactKind.DOCUMENT.value,
     AgentKey.AD_CAMPAIGN.value: ArtifactKind.SHEET.value,
+    AgentKey.PAGE_OPTIMIZER.value: ArtifactKind.DOCUMENT.value,
+    AgentKey.COMPARISON_PAGE.value: ArtifactKind.DOCUMENT.value,
+    AgentKey.SOCIAL_POSTS.value: ArtifactKind.DOCUMENT.value,
+    AgentKey.PR_WRITER.value: ArtifactKind.DOCUMENT.value,
+    AgentKey.LLMS_TXT.value: ArtifactKind.DOCUMENT.value,
+    AgentKey.MESSAGING_BRIEF.value: ArtifactKind.DOCUMENT.value,
 }
 
 
@@ -282,3 +330,75 @@ SWARM_TITLE_MAX_LENGTH = 120
 # (the citations agent counts its references next to the engines' citations).
 AI_OVERVIEW_SOURCE = "ai_overview"
 AI_OVERVIEW_SOURCE_LABEL = "Google AI Overview"
+
+
+# ── Context Manager (design/p2_contract.md section 11) ──────────────────
+
+
+class ContextSection(models.TextChoices):
+    """The six sections of a project's context, in display order."""
+
+    COMPANY = "company", "Company"
+    AUDIENCE = "audience", "Audience"
+    COMPETITORS = "competitors", "Competitors"
+    OFFERINGS = "offerings", "Offerings"
+    STRATEGY = "strategy", "Strategy"
+    EXECUTION = "execution", "Execution"
+
+
+class ContextStatus(models.TextChoices):
+    ACTIVE = "active", "Active"
+    # Built from the site; the agents ignore it until a person accepts it.
+    SUGGESTED = "suggested", "Suggested"
+
+
+class ContextOrigin(models.TextChoices):
+    USER = "user", "Added by a person"
+    BUILT = "built", "Built from the site"
+    MIGRATED = "migrated", "Moved from the earlier context"
+
+
+class ReferenceKind(models.TextChoices):
+    PAGE = "page", "Page"
+    FACT = "fact", "Brand fact"
+    DOCUMENT = "document", "Document"
+    COMPETITOR = "competitor", "Competitor"
+
+
+class ReferenceState(models.TextChoices):
+    OK = "ok", "OK"
+    # A page that loaded without the quote, or a document edited since.
+    CHANGED = "changed", "Changed"
+    FAILED = "failed", "Failed"
+    UNCHECKED = "unchecked", "Not checked"
+    # Computed on reads, never stored: a fact superseded or no longer
+    # approved, a competitor no longer tracked.
+    RETIRED = "retired", "No longer approved"
+    UNTRACKED = "untracked", "No longer tracked"
+
+
+# ── Approvals (contract section 13) ─────────────────────────────────────
+
+
+class ReviewState(models.TextChoices):
+    DRAFT = "draft", "Draft"
+    IN_REVIEW = "in_review", "In review"
+    CHANGES_REQUESTED = "changes_requested", "Changes requested"
+    APPROVED = "approved", "Approved"
+
+
+class ReviewEventKind(models.TextChoices):
+    REQUESTED = "requested", "Requested"
+    APPROVED = "approved", "Approved"
+    CHANGES_REQUESTED = "changes_requested", "Changes requested"
+    WITHDRAWN = "withdrawn", "Withdrawn"
+    REOPENED = "reopened", "Reopened"
+    COMMENT = "comment", "Comment"
+
+
+class ReviewEmail(models.TextChoices):
+    """AgentReviewEvent.email: blank for events that send no email."""
+
+    SENT = "sent", "Sent"
+    FAILED = "failed", "Failed"
+    OFF = "off", "Off"

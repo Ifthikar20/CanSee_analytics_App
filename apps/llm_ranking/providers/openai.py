@@ -52,6 +52,9 @@ class OpenAIProvider(LLMProvider):
         return ProviderResult(
             succeeded=True,
             text=(choice.message.content or "").strip(),
+            # No search tool was offered, so the answer ran no search.
+            search_queries=[],
+            web_searches=0,
             **tokens,
         )
 
@@ -66,6 +69,7 @@ class OpenAIProvider(LLMProvider):
         from apps.llm_ranking.providers.openai_compat import (
             _get,
             extract_responses_citations,
+            extract_search_queries,
         )
         from apps.llm_ranking.services.regions import get_region
 
@@ -94,6 +98,7 @@ class OpenAIProvider(LLMProvider):
         if resp is None:
             return None
         usage = getattr(resp, "usage", None)
+        queries, searches = extract_search_queries(resp)
         return ProviderResult(
             succeeded=True,
             text=(getattr(resp, "output_text", "") or "").strip(),
@@ -104,4 +109,6 @@ class OpenAIProvider(LLMProvider):
                 _get(item, "type") == "web_search_call"
                 for item in (_get(resp, "output", None) or [])
             ),
+            search_queries=queries,
+            web_searches=searches,
         )

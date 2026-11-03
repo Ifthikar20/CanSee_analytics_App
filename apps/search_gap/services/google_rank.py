@@ -68,12 +68,14 @@ def find_rank(query: str, apex: str, *, max_depth: int = 100, gl: str = "", hl: 
     """Walk Google's organic results until ``apex`` appears.
 
     Returns ``{position, url, title, top_results, ai_overview,
-    ai_overview_deferred, pages_fetched, depth, error}``. ``pages_fetched``
-    counts successful (billed) calls only. ``depth`` is how deep the search
-    really looked: ``max_depth``, capped at the pages the provider reads
-    reliably, or only the pages read when a later page failed.
-    ``ai_overview_deferred``: page one showed an AI Overview whose content
-    was not read. ``search`` is injectable so tests never hit the network.
+    ai_overview_deferred, questions, related_searches, pages_fetched, depth,
+    error}``. ``pages_fetched`` counts successful (billed) calls only.
+    ``depth`` is how deep the search really looked: ``max_depth``, capped at
+    the pages the provider reads reliably, or only the pages read when a
+    later page failed. ``ai_overview_deferred``: page one showed an AI
+    Overview whose content was not read. ``questions`` (People also ask)
+    and ``related_searches`` are page one's. ``search`` is injectable so
+    tests never hit the network.
     """
     pages = max(1, math.ceil(max(1, int(max_depth)) / PAGE_SIZE))
     # Never past the pages the provider reads reliably: ScraperAPI's later
@@ -81,8 +83,8 @@ def find_rank(query: str, apex: str, *, max_depth: int = 100, gl: str = "", hl: 
     pages = min(pages, serp_google.max_reliable_pages())
     out = {
         "position": None, "url": "", "title": "", "top_results": [],
-        "ai_overview": {}, "ai_overview_deferred": False, "pages_fetched": 0,
-        "depth": pages * PAGE_SIZE, "error": "",
+        "ai_overview": {}, "ai_overview_deferred": False, "questions": [],
+        "related_searches": [], "pages_fetched": 0, "depth": pages * PAGE_SIZE, "error": "",
     }
     for page in range(pages):
         start = page * PAGE_SIZE
@@ -99,6 +101,8 @@ def find_rank(query: str, apex: str, *, max_depth: int = 100, gl: str = "", hl: 
         if page == 0:
             out["ai_overview"] = payload.get("ai_overview") or {}
             out["ai_overview_deferred"] = bool(payload.get("ai_overview_deferred"))
+            out["questions"] = payload.get("questions") or []
+            out["related_searches"] = payload.get("related_searches") or []
         organic = payload.get("organic") or []
         if not organic:
             break
@@ -140,6 +144,21 @@ def summarize_ai_overview(block: dict, *, brand: str, apex: str, deferred: bool 
         "mentions_you": mentions,
         "cites_you": any(is_same_site(r.get("domain", ""), apex) for r in references),
         "references": references[:MAX_AI_OVERVIEW_REFERENCES],
+    }
+
+
+def serp_features(found: dict) -> dict:
+    """``GoogleRankCheck.serp_features`` of a find_rank result: page one's
+    People also ask questions and related searches, ``{}`` when page one
+    did not come back."""
+    if found.get("error"):
+        return {}
+    return {
+        "questions": [
+            {"question": q["question"], "url": q.get("url", "")}
+            for q in found.get("questions") or [] if isinstance(q, dict) and q.get("question")
+        ],
+        "related_searches": [s for s in found.get("related_searches") or [] if isinstance(s, str)],
     }
 
 
@@ -196,6 +215,7 @@ def check(brand_prompt, *, force: bool = False, now=None):
         top_results=found["top_results"],
         ai_overview=summarize_ai_overview(found["ai_overview"], brand=website.name, apex=apex,
                                           deferred=bool(found.get("ai_overview_deferred"))),
+        serp_features=serp_features(found),
         pages_fetched=pages,
         cost_usd=serp_google.cost_per_search_usd() * pages,
         error=found["error"][:200],
