@@ -128,6 +128,17 @@ class SsoRequired(CanseeException):
         )
 
 
+class LoginRefused(CanseeException):
+    """A password sign-in that cannot go ahead, with a message safe to show.
+
+    Wrong credentials answer 400, not 401: the SPA treats any 401 as an
+    expired session and would try to refresh it.
+    """
+
+    def __init__(self, message: str, *, code: str, status_code: int = 400):
+        super().__init__(message, code=code, status_code=status_code)
+
+
 class SuspiciousInput(CanseeException):
     def __init__(self):
         super().__init__(

@@ -13,9 +13,16 @@ from apps.accounts.models import (
     PasswordResetToken,
     User,
 )
+from core.exceptions import LoginRefused
 from core.logging.audit_logger import audit_log
 
 security_logger = logging.getLogger("security")
+
+# TokenService.issue_session's refusals of a password sign-in, by code.
+_SESSION_REFUSALS = {
+    "Please verify your email before logging in.": "email_not_verified",
+    "This account has been deactivated.": "account_deactivated",
+}
 
 
 class AuthService:
@@ -82,16 +89,25 @@ class AuthService:
                 "Failed login attempt",
                 extra={"email": email, "ip": ip_address},
             )
-            raise ValueError("Invalid email or password.")
+            # Never says which of the two was wrong.
+            raise LoginRefused("Incorrect email or password.", code="invalid_credentials")
 
         # Verified/active checks, the success LoginAttempt row, claims and
         # audit all live in the shared factory so every login method behaves
         # identically.
         from apps.accounts.services.token_service import TokenService
 
-        return TokenService.issue_session(
-            user, method="pwd", ip_address=ip_address, user_agent=user_agent
-        )
+        try:
+            return TokenService.issue_session(
+                user, method="pwd", ip_address=ip_address, user_agent=user_agent
+            )
+        except ValueError as exc:
+            # issue_session's own refusals are written for users; anything
+            # else stays a generic error.
+            code = _SESSION_REFUSALS.get(str(exc))
+            if code is None:
+                raise
+            raise LoginRefused(str(exc), code=code, status_code=403) from exc
 
     @staticmethod
     def _require_sso_gate(*, email: str) -> None:
