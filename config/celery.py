@@ -51,6 +51,7 @@ app.conf.task_routes = {
     # cannot delay request-path work.
     "apps.analytics.tasks.prune_analytics_events": {"queue": "integrations"},
     "apps.analytics.tasks.prune_llm_results": {"queue": "integrations"},
+    "apps.agent.tasks.purge_expired_agent_chats": {"queue": "integrations"},
 }
 
 app.conf.beat_schedule = {
@@ -66,6 +67,12 @@ app.conf.beat_schedule = {
         "task": "apps.accounts.tasks.reverify_org_domains",
         "schedule": crontab(minute=20, hour=6),
     },
+    # Agent chats idle past AGENT_CHAT_RETENTION_DAYS (0, the default,
+    # keeps every chat and makes this a no-op).
+    "purge-expired-agent-chats": {
+        "task": "apps.agent.tasks.purge_expired_agent_chats",
+        "schedule": crontab(minute=40, hour=3),
+    },
     # ── Weekly ──
     "weekly-reports": {
         "task": "apps.notifications.tasks.send_weekly_reports",
@@ -75,6 +82,13 @@ app.conf.beat_schedule = {
     "analytics-aggregation": {
         "task": "apps.analytics.tasks.aggregate_hourly_metrics",
         "schedule": crontab(minute=5),
+    },
+    # ── Every minute ──
+    # Agent runs whose process stopped heartbeating (deploy, crash) end as
+    # interrupted. Default queue; a cheap no-op when nothing is running.
+    "sweep-stale-agent-runs": {
+        "task": "apps.agent.tasks.sweep_stale_agent_runs",
+        "schedule": crontab(minute="*"),
     },
     # ── Every 15 minutes ──
     "refresh-expiring-oauth-tokens": {

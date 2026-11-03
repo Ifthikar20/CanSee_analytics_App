@@ -1,0 +1,294 @@
+"""Starting runs: send, regenerate, edit and continue.
+
+Each writes the new tree nodes and a queued run in one transaction,
+under a per-user advisory lock (one active run per user, one per chat),
+then dispatches the run. A send with an Idempotency-Key the user already
+used returns that earlier run instead of starting another.
+
+Tree rules: regenerate adds an assistant sibling under the same user
+message; edit adds a user sibling (and its reply) under the same parent;
+continue adds a synthetic "Continue" user message under a truncated
+reply. The chat's current leaf moves to the new reply.
+"""
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+
+from django.db import IntegrityError, transaction
+from django.utils import timezone
+
+from apps.agent.constants import (
+    CHAT_PREVIEW_MAX_LENGTH,
+    AgentKey,
+    MessageRole,
+    MessageStatus,
+    RunStatus,
+    RunTrigger,
+    TitleSource,
+)
+from apps.agent.exceptions import RunInProgress
+from apps.agent.prompts import context as context_prompt
+from apps.agent.runtime import wire
+from apps.agent.runtime.dispatch import dispatch_run
+from apps.agent.runtime.title import fallback_title
+from apps.agent.services import quota
+from core.exceptions import CanseeException, ResourceNotFound
+
+MAX_MESSAGE_CHARS = 20_000
+MAX_IDEMPOTENCY_KEY = 64
+CONTINUE_TEXT = "Continue"
+_AGENT_RE = re.compile(
+    r"(?:started with|selected the) [^()\n]*\((" + "|".join(AgentKey.values) + r")\)"
+)
+
+
+class InvalidRequest(CanseeException):
+    def __init__(self, message: str):
+        super().__init__(message, code="invalid", status_code=400)
+
+
+@dataclass
+class StartedRun:
+    user_message: object | None
+    assistant_message: object
+    run: object
+    # True when an Idempotency-Key matched an earlier request.
+    replayed: bool = False
+
+
+def clean_text(text) -> str:
+    if not isinstance(text, str) or not text.strip():
+        raise InvalidRequest("Write a message first.")
+    text = text.replace("\x00", "").strip()
+    if len(text) > MAX_MESSAGE_CHARS:
+        raise InvalidRequest(f"Messages can be at most {MAX_MESSAGE_CHARS} characters.")
+    return text
+
+
+def clean_agent(agent) -> str | None:
+    if agent in (None, ""):
+        return None
+    if agent not in AgentKey.values:
+        raise InvalidRequest("Unknown agent.")
+    return agent
+
+
+def clean_idempotency_key(key) -> str | None:
+    key = (key or "").strip()
+    if not key:
+        return None
+    if len(key) > MAX_IDEMPOTENCY_KEY:
+        raise InvalidRequest(f"Idempotency-Key can be at most {MAX_IDEMPOTENCY_KEY} characters.")
+    return key
+
+
+def _last_agent(history: list[dict], default: str) -> str:
+    found = default
+    for m in history:
+        if m.get("role") != "system":
+            continue
+        for block in m.get("content") or []:
+            for match in _AGENT_RE.finditer(block.get("text") or ""):
+                found = match.group(1)
+    return found
+
+
+def _tracked_prompt_count(website) -> int:
+    from apps.prompt_library.models import BrandPrompt
+
+    return BrandPrompt.objects.filter(website=website, is_archived=False).count()
+
+
+def user_wire(chat, parent, text: str, *, agent: str | None = None) -> list[dict]:
+    """The wire a new user message contributes: the message, then the
+    system context it needs (project context first; later a date update
+    when the date changed, and the agent the user picked)."""
+    today = timezone.now().date()
+    messages = [wire.user_message(text)]
+    notes = []
+    if parent is None:
+        notes.append(context_prompt.project_context(
+            chat.website, entry_agent=chat.entry_agent,
+            tracked_prompts=_tracked_prompt_count(chat.website), today=today,
+        ))
+        if agent and agent != chat.entry_agent:
+            notes.append(context_prompt.agent_selected(agent))
+    else:
+        history = wire.history_of(wire.path_to(parent))
+        if wire.last_context_date(history) != today.isoformat():
+            notes.append(context_prompt.date_update(today))
+        if agent and agent != _last_agent(history, chat.entry_agent):
+            notes.append(context_prompt.agent_selected(agent))
+    if notes:
+        messages.append(wire.system_message("\n\n".join(notes)))
+    return messages
+
+
+def _create_turn(chat, *, user, parent, text: str | None, trigger: str,
+                 user_message=None, agent: str | None = None,
+                 idempotency_key: str | None = None) -> StartedRun:
+    """Nodes and run for one turn. ``user_message`` reuses an existing user
+    node (regenerate); otherwise a new one is created from ``text``."""
+    from apps.agent.models import AgentChat, AgentMessage, AgentRun
+
+    now = timezone.now()
+    if user_message is None:
+        user_message = AgentMessage.objects.create(
+            chat=chat, parent=parent, role=MessageRole.USER,
+            depth=(parent.depth + 1) if parent else 0,
+            wire=wire.dumps(user_wire(chat, parent, text, agent=agent)),
+            parts=[{"id": "p1", "type": "text", "text": text}],
+            status=MessageStatus.COMPLETE, started_at=now, finished_at=now,
+        )
+        created_user = user_message
+    else:
+        created_user = None
+    model = (chat.snapshot.config or {}).get("model", "")
+    assistant = AgentMessage.objects.create(
+        chat=chat, parent=user_message, role=MessageRole.ASSISTANT,
+        depth=user_message.depth + 1, status=MessageStatus.STREAMING, model=model,
+    )
+    try:
+        with transaction.atomic():
+            run = AgentRun.objects.create(
+                chat=chat, user=user, website=chat.website, user_message=user_message,
+                assistant_message=assistant, trigger=trigger, status=RunStatus.QUEUED,
+                idempotency_key=idempotency_key,
+            )
+    except IntegrityError:
+        raise RunInProgress() from None
+    fields = {"current_leaf": assistant, "last_message_at": now}
+    if created_user is not None and trigger != RunTrigger.CONTINUE:
+        fields["preview"] = text[:CHAT_PREVIEW_MAX_LENGTH]
+        if parent is None and not chat.title and chat.title_source == TitleSource.AUTO:
+            fields["title"] = fallback_title(text)
+    AgentChat.objects.filter(id=chat.id).update(**fields)
+    for key, value in fields.items():
+        setattr(chat, key, value)
+    return StartedRun(user_message=created_user, assistant_message=assistant, run=run)
+
+
+def _replay(user, chat, key: str | None) -> StartedRun | None:
+    from apps.agent.models import AgentRun
+
+    if not key:
+        return None
+    run = (AgentRun.objects.select_related("user_message", "assistant_message")
+           .filter(user=user, idempotency_key=key).first())
+    if run is None:
+        return None
+    if run.chat_id != chat.id:
+        raise InvalidRequest("This Idempotency-Key was already used for another chat.")
+    return StartedRun(user_message=run.user_message, assistant_message=run.assistant_message,
+                      run=run, replayed=True)
+
+
+def _start(user, build) -> StartedRun:
+    """Run ``build`` under the user's lock, then dispatch the run it created."""
+    with transaction.atomic():
+        quota.lock_user(user)
+        started = build()
+    if not started.replayed:
+        dispatch_run(started.run.id)
+        for obj in (started.run, started.assistant_message, started.user_message):
+            if obj is not None:
+                obj.refresh_from_db()
+    return started
+
+
+def _locked_checks(user, chat) -> None:
+    """Allowance, send rate and concurrency, in the order the API reports them."""
+    quota.check_allowance(user)
+    quota.check_send_rate(user)
+    quota.check_chat_free(chat)
+    quota.check_user_slots(user)
+
+
+def _load_chat(chat):
+    from apps.agent.models import AgentChat
+
+    return AgentChat.objects.select_related("website", "snapshot").get(id=chat.id)
+
+
+def start_send(*, user, chat, text, parent_id=None, agent=None, idempotency_key=None) -> StartedRun:
+    from apps.agent.models import AgentChat, AgentMessage
+
+    text = clean_text(text)
+    agent = clean_agent(agent)
+    key = clean_idempotency_key(idempotency_key)
+    quota.check_configured()
+
+    def build() -> StartedRun:
+        current = _load_chat(chat)
+        replay = _replay(user, current, key)
+        if replay is not None:
+            return replay
+        if parent_id:
+            parent = AgentMessage.objects.filter(id=parent_id, chat=current).first()
+            if parent is None:
+                raise ResourceNotFound("Message not found.")
+        else:
+            parent = current.current_leaf
+        if parent is not None and parent.role != MessageRole.ASSISTANT:
+            raise InvalidRequest("A message can only follow a reply.")
+        _locked_checks(user, current)
+        if parent is None and agent and agent != current.entry_agent:
+            AgentChat.objects.filter(id=current.id).update(entry_agent=agent)
+            current.entry_agent = agent
+        return _create_turn(current, user=user, parent=parent, text=text, trigger=RunTrigger.SEND,
+                            agent=agent, idempotency_key=key)
+
+    return _start(user, build)
+
+
+def _message_in(user, website, message_id, *, role: str):
+    from apps.agent.models import AgentMessage
+
+    message = (AgentMessage.objects.select_related("chat", "chat__website", "chat__snapshot")
+               .filter(id=message_id, chat__website=website, chat__user=user).first())
+    if message is None or message.role != role:
+        raise ResourceNotFound("Message not found.")
+    return message
+
+
+def start_regenerate(*, user, website, message_id) -> StartedRun:
+    message = _message_in(user, website, message_id, role=MessageRole.ASSISTANT)
+    quota.check_configured()
+
+    def build() -> StartedRun:
+        chat = _load_chat(message.chat)
+        _locked_checks(user, chat)
+        return _create_turn(chat, user=user, parent=None, text=None,
+                            trigger=RunTrigger.REGENERATE, user_message=message.parent)
+
+    return _start(user, build)
+
+
+def start_edit(*, user, website, message_id, text) -> StartedRun:
+    message = _message_in(user, website, message_id, role=MessageRole.USER)
+    text = clean_text(text)
+    quota.check_configured()
+
+    def build() -> StartedRun:
+        chat = _load_chat(message.chat)
+        _locked_checks(user, chat)
+        return _create_turn(chat, user=user, parent=message.parent, text=text,
+                            trigger=RunTrigger.EDIT)
+
+    return _start(user, build)
+
+
+def start_continue(*, user, website, message_id) -> StartedRun:
+    message = _message_in(user, website, message_id, role=MessageRole.ASSISTANT)
+    if message.status != MessageStatus.TRUNCATED:
+        raise InvalidRequest("Only a reply that was cut off can be continued.")
+    quota.check_configured()
+
+    def build() -> StartedRun:
+        chat = _load_chat(message.chat)
+        _locked_checks(user, chat)
+        return _create_turn(chat, user=user, parent=message, text=CONTINUE_TEXT,
+                            trigger=RunTrigger.CONTINUE)
+
+    return _start(user, build)

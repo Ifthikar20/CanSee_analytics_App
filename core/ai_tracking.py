@@ -23,15 +23,29 @@ logger = logging.getLogger(__name__)
 #   Google    — https://ai.google.dev/pricing
 #   Perplexity — https://docs.perplexity.ai/docs/pricing
 PRICING = {
-    # Anthropic
+    # Anthropic. Optional cache rates: cache_write_5m / cache_write_1h /
+    # cache_read; a row without them prices cache tokens at 1.25x / 2x /
+    # 0.1x of "input" (Anthropic's standard multipliers).
+    "claude-opus-5-5": {
+        "input": 4.00, "output": 20.00,
+        "cache_write_5m": 5.00, "cache_write_1h": 8.00, "cache_read": 0.20,
+    },
+    "claude-opus-5": {
+        "input": 5.00, "output": 25.00,
+        "cache_write_5m": 6.25, "cache_write_1h": 10.00, "cache_read": 0.50,
+    },
+    "claude-opus-4-8": {
+        "input": 5.00, "output": 25.00,
+        "cache_write_5m": 6.25, "cache_write_1h": 10.00, "cache_read": 0.50,
+    },
     "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00},
     "claude-sonnet-4-5-20250929": {"input": 3.00, "output": 15.00},
     "claude-opus-4-1-20250805": {"input": 15.00, "output": 75.00},
     "claude-3-5-sonnet-20241022": {"input": 3.00, "output": 15.00},
     "claude-3-5-sonnet-latest": {"input": 3.00, "output": 15.00},
     "claude-sonnet-4-6": {"input": 3.00, "output": 15.00},
-    "claude-haiku-4-5-20251001": {"input": 0.80, "output": 4.00},
-    "claude-haiku-4-5": {"input": 0.80, "output": 4.00},
+    "claude-haiku-4-5-20251001": {"input": 1.00, "output": 5.00},
+    "claude-haiku-4-5": {"input": 1.00, "output": 5.00},
     "claude-3-haiku-20240307": {"input": 0.25, "output": 1.25},
     # OpenAI
     "gpt-4o-mini": {"input": 0.15, "output": 0.60},
@@ -62,6 +76,9 @@ PRICING = {
 
 # Map known model names to canonical provider keys used in AITokenUsage.provider.
 MODEL_PROVIDER = {
+    "claude-opus-5-5": "anthropic",
+    "claude-opus-5": "anthropic",
+    "claude-opus-4-8": "anthropic",
     "claude-sonnet-4-20250514": "anthropic",
     "claude-sonnet-4-5-20250929": "anthropic",
     "claude-opus-4-1-20250805": "anthropic",
@@ -87,15 +104,70 @@ MODEL_PROVIDER = {
 }
 
 
-def _estimate_cost(model_name: str, input_tokens: int, output_tokens: int) -> float:
-    """Calculate estimated USD cost based on model pricing."""
+# Anthropic server-side web search: $10 per 1,000 searches. Web fetch is
+# billed as tokens only.
+WEB_SEARCH_COST_PER_REQUEST_USD = 0.01
+
+# Default cache-token rates as multiples of a row's "input" price.
+_CACHE_RATE_MULTIPLIERS = {"cache_write_5m": 1.25, "cache_write_1h": 2.0, "cache_read": 0.1}
+
+
+def _cache_rate(pricing: dict, key: str) -> float:
+    rate = pricing.get(key)
+    if rate is None:
+        rate = pricing["input"] * _CACHE_RATE_MULTIPLIERS[key]
+    return rate
+
+
+def _estimate_cost(
+    model_name: str,
+    input_tokens: int,
+    output_tokens: int,
+    *,
+    cache_write_5m: int = 0,
+    cache_write_1h: int = 0,
+    cache_read: int = 0,
+    web_search_requests: int = 0,
+) -> float:
+    """Calculate estimated USD cost based on model pricing.
+
+    ``input_tokens`` is the uncached input (Anthropic's ``input_tokens``);
+    cache writes per TTL, cache reads and server web searches are priced
+    separately.
+    """
     pricing = PRICING.get(model_name, PRICING["default"])
     input_cost = (input_tokens / 1_000_000) * pricing["input"]
     output_cost = (output_tokens / 1_000_000) * pricing["output"]
+    cache_cost = 0.0
+    if cache_write_5m or cache_write_1h or cache_read:
+        cache_cost = (
+            cache_write_5m * _cache_rate(pricing, "cache_write_5m")
+            + cache_write_1h * _cache_rate(pricing, "cache_write_1h")
+            + cache_read * _cache_rate(pricing, "cache_read")
+        ) / 1_000_000
+    search_cost = web_search_requests * WEB_SEARCH_COST_PER_REQUEST_USD
     # Some providers (Perplexity Sonar) bill a flat per-request fee for the
     # web-search step in addition to tokens.
     flat = pricing.get("per_call", 0.0)
-    return round(input_cost + output_cost + flat, 6)
+    return round(input_cost + output_cost + cache_cost + search_cost + flat, 6)
+
+
+def estimate_cost(
+    model_name: str,
+    input_tokens: int,
+    output_tokens: int,
+    *,
+    cache_write_5m: int = 0,
+    cache_write_1h: int = 0,
+    cache_read: int = 0,
+    web_search_requests: int = 0,
+) -> float:
+    """Public form of ``_estimate_cost`` for pricing outside this module."""
+    return _estimate_cost(
+        model_name, input_tokens, output_tokens,
+        cache_write_5m=cache_write_5m, cache_write_1h=cache_write_1h,
+        cache_read=cache_read, web_search_requests=web_search_requests,
+    )
 
 
 def record_usage(
@@ -110,6 +182,10 @@ def record_usage(
     duration_ms: int = 0,
     metadata: dict | None = None,
     idempotency_key: str | None = None,
+    cache_write_5m: int = 0,
+    cache_write_1h: int = 0,
+    cache_read: int = 0,
+    web_search_requests: int = 0,
 ):
     """
     Record an AI API call's token usage.
@@ -122,6 +198,10 @@ def record_usage(
     sites (Celery acks_late tasks): a replay under the same key collapses
     to the original row instead of double-counting. Without a key each
     call gets a unique one (no dedupe semantics).
+
+    Prompt-cache tokens (writes per TTL, reads) and server web searches
+    are priced into the cost and kept in ``metadata``; ``total_tokens``
+    stays input + output.
 
     Example:
         from core.ai_tracking import record_usage
@@ -141,11 +221,25 @@ def record_usage(
         from apps.accounts.models import AITokenUsage
 
         total = input_tokens + output_tokens
-        cost = _estimate_cost(model_name, input_tokens, output_tokens)
+        cost = _estimate_cost(
+            model_name, input_tokens, output_tokens,
+            cache_write_5m=cache_write_5m, cache_write_1h=cache_write_1h,
+            cache_read=cache_read, web_search_requests=web_search_requests,
+        )
         # Auto-derive provider when caller leaves the default — keeps every
         # row consistent for the centralized "by provider" rollup.
         if provider == "anthropic" and model_name in MODEL_PROVIDER:
             provider = MODEL_PROVIDER[model_name]
+
+        metadata = dict(metadata or {})
+        for name, value in (
+            ("cache_write_5m_tokens", cache_write_5m),
+            ("cache_write_1h_tokens", cache_write_1h),
+            ("cache_read_tokens", cache_read),
+            ("web_search_requests", web_search_requests),
+        ):
+            if value:
+                metadata.setdefault(name, value)
 
         key = idempotency_key or uuid.uuid4().hex
         defaults = {
@@ -330,14 +424,20 @@ AI_SPEND_WARN_RATIO = 0.80
 def effective_ai_cap(user) -> float:
     """Monthly AI spend allowance in USD for ``user``. 0 = unlimited.
 
-    The plan is resolved from ACTUAL subscription status
-    (apps.billing.services.plan_limits.current_plan_for): an account
+    Organization members get their organization's plan cap, resolved the
+    same way plan_limits.get_limits resolves an org member's plan
+    (apps.billing.services.plan_limits.org_plan_for); only an actual
+    OrganizationMember row grants it. Everyone else is resolved from
+    ACTUAL subscription status (plan_limits.current_plan_for): an account
     without an active/trialing subscription is on the FREE plan and gets
     ``settings.AI_FREE_MONTHLY_CAP_USD`` (a small acquisition budget) —
     never a paid tier's allowance. The denormalized user.plan value is
     not consulted; it defaults to a paid tier and used to leak paid
-    allowances (and, via the org ENTERPRISE default, the $500 ceiling
-    that produced the fabricated 305M-token display).
+    allowances (and the $500 ceiling that produced the fabricated
+    305M-token display) to accounts outside any organization.
+    PAYWALL_ENABLED does not enter into it: with the paywall off an
+    individual without a subscription still has the free allowance,
+    never an unlimited one.
 
     Paid plans derive the cap from price: Pro $45/mo allows
     $45 * 0.65 = $29.25 of model cost per billing period. A manual
@@ -350,11 +450,14 @@ def effective_ai_cap(user) -> float:
         return 0.0
     from django.conf import settings
 
-    from apps.billing.services.plan_limits import current_plan_for
+    from apps.billing.services.plan_limits import current_plan_for, org_plan_for
     from core.utils.constants import PLAN_LIMITS, Plan
 
-    plan = current_plan_for(user)
-    limits = PLAN_LIMITS.get(plan) or PLAN_LIMITS[Plan.FREE]
+    plan = org_plan_for(user) or current_plan_for(user)
+    if plan not in PLAN_LIMITS:
+        # An unrecognised plan value grants nothing beyond the free tier.
+        plan = Plan.FREE
+    limits = PLAN_LIMITS[plan]
     manual = float(getattr(user, "monthly_ai_cost_cap_usd", 0) or 0)
 
     if plan == Plan.FREE:

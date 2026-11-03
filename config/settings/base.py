@@ -65,6 +65,7 @@ LOCAL_APPS = [
     "apps.search_console",
     "apps.search_gap",
     "apps.assistant",
+    "apps.agent",
     "apps.web_analytics",
     # Stub app — kept only to satisfy historical lazy FK references
     # from analytics migrations. All tables are managed=False.
@@ -336,6 +337,10 @@ CORS_ALLOW_HEADERS = [
     "x-request-id",
     "x-client-id",
     "x-csrftoken",
+    # Agent workspace: message POSTs dedupe on Idempotency-Key, and the
+    # event stream resumes from Last-Event-ID.
+    "idempotency-key",
+    "last-event-id",
 ]
 
 # ── STATIC & MEDIA ──
@@ -479,6 +484,53 @@ ASSISTANT_MAINTENANCE_MESSAGE = env(
 # Ingest each completed prompt run into the assistant's knowledge base
 # (apps.assistant.tasks.ingest_audit_knowledge).
 ASSISTANT_KNOWLEDGE_INGEST_ENABLED = env.bool("ASSISTANT_KNOWLEDGE_INGEST_ENABLED", default=True)
+
+# ── Agent workspace (apps.agent) ──
+# The Claude chat agent for SEO and GEO research. Fails closed: nothing
+# runs until AGENT_ENABLED is set. Runs execute only in the agent ASGI
+# process (AGENT_PROCESS); gunicorn workers answer the live endpoints with
+# 503 agent_unavailable.
+AGENT_ENABLED = env.bool("AGENT_ENABLED", default=False)
+AGENT_PROCESS = env.bool("AGENT_PROCESS", default=False)
+# "thread": a process-wide executor runs each turn. "inline": the request
+# runs it to completion (tests).
+AGENT_RUN_MODE = env("AGENT_RUN_MODE", default="thread")
+AGENT_MODEL = env("AGENT_MODEL", default="claude-opus-5-5")
+AGENT_EFFORT = env("AGENT_EFFORT", default="medium")
+AGENT_SUBAGENT_EFFORT = env("AGENT_SUBAGENT_EFFORT", default="medium")
+AGENT_TITLE_EFFORT = env("AGENT_TITLE_EFFORT", default="low")
+# max_tokens per request: the orchestrator, then each sub-agent.
+AGENT_MAX_TOKENS = env.int("AGENT_MAX_TOKENS", default=32000)
+AGENT_LANDING_MAX_TOKENS = env.int("AGENT_LANDING_MAX_TOKENS", default=64000)
+AGENT_ARTICLE_MAX_TOKENS = env.int("AGENT_ARTICLE_MAX_TOKENS", default=32000)
+AGENT_SHEET_MAX_TOKENS = env.int("AGENT_SHEET_MAX_TOKENS", default=16000)
+# Per-run ceilings: API requests, wall clock, model cost.
+AGENT_MAX_REQUESTS_PER_RUN = env.int("AGENT_MAX_REQUESTS_PER_RUN", default=24)
+AGENT_RUN_MAX_SECONDS = env.int("AGENT_RUN_MAX_SECONDS", default=1200)
+AGENT_RUN_MAX_COST_USD = env.float("AGENT_RUN_MAX_COST_USD", default=3.0)
+# Global executor size, and active runs allowed per user.
+AGENT_MAX_CONCURRENT_RUNS = env.int("AGENT_MAX_CONCURRENT_RUNS", default=4)
+AGENT_USER_ACTIVE_RUNS = env.int("AGENT_USER_ACTIVE_RUNS", default=1)
+# Prompt-cache TTL ("5m" or "1h") for the system prompt and the history.
+AGENT_CACHE_TTL = env("AGENT_CACHE_TTL", default="1h")
+# Server-side refusal fallback (beta server-side-fallback-2026-07-01).
+AGENT_FALLBACKS_ENABLED = env.bool("AGENT_FALLBACKS_ENABLED", default=True)
+# Anthropic's server-side web_search / web_fetch tools.
+AGENT_WEB_TOOLS_ENABLED = env.bool("AGENT_WEB_TOOLS_ENABLED", default=True)
+AGENT_WEB_SEARCH_MAX_USES = env.int("AGENT_WEB_SEARCH_MAX_USES", default=5)
+AGENT_WEB_FETCH_MAX_USES = env.int("AGENT_WEB_FETCH_MAX_USES", default=5)
+# Google results pages captured per query (SerpAPI bills per page).
+AGENT_SERP_MAX_PAGES = env.int("AGENT_SERP_MAX_PAGES", default=5)
+# Page fetches per user per day through the browse endpoint.
+AGENT_BROWSE_DAILY_LIMIT = env.int("AGENT_BROWSE_DAILY_LIMIT", default=300)
+# An event stream closes after AGENT_STREAM_MAX_SECONDS (the client
+# reconnects). Runs heartbeat every AGENT_HEARTBEAT_SECONDS and are marked
+# interrupted after AGENT_STALE_SECONDS without one.
+AGENT_STREAM_MAX_SECONDS = env.int("AGENT_STREAM_MAX_SECONDS", default=300)
+AGENT_HEARTBEAT_SECONDS = env.int("AGENT_HEARTBEAT_SECONDS", default=10)
+AGENT_STALE_SECONDS = env.int("AGENT_STALE_SECONDS", default=90)
+# Days a chat is kept after its last message; 0 keeps chats.
+AGENT_CHAT_RETENTION_DAYS = env.int("AGENT_CHAT_RETENTION_DAYS", default=0)
 
 # ── RAG vector index (optional) ──
 # "python" (default): retriever.py scores every (user, website) chunk in

@@ -15,6 +15,12 @@ LLM_SCAN_MODE = env("LLM_SCAN_MODE", default="inline")  # noqa: F405
 # before the ack, so dev uses a background thread instead.
 CHAT_EAGER_THREAD_DISPATCH = True
 
+# runserver is the agent process in dev: it serves the live endpoints and
+# runs turns on the background executor.
+AGENT_ENABLED = True
+AGENT_PROCESS = True
+AGENT_RUN_MODE = "thread"
+
 # Disable rate limiting in dev
 REST_FRAMEWORK["DEFAULT_THROTTLE_CLASSES"] = []  # noqa: F405
 

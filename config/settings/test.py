@@ -106,3 +106,9 @@ RAG_CHROMA_URL = ""
 # Deterministic free-plan allowance regardless of the developer's .env
 # (local dev raises it so the $1 default doesn't stall testing).
 AI_FREE_MONTHLY_CAP_USD = 1.0
+
+# The agent runs turns inline in the suite, against the fake Anthropic
+# client installed by apps/agent/tests (never the real API).
+AGENT_ENABLED = True
+AGENT_PROCESS = True
+AGENT_RUN_MODE = "inline"

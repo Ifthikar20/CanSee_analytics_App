@@ -45,6 +45,9 @@ urlpatterns = [
     path("api/v1/search-console/", include("apps.search_console.api.v1.urls")),
     path("api/v1/search-gap/", include("apps.search_gap.api.v1.urls")),
     path("api/v1/assistant/", include("apps.assistant.api.v1.urls")),
+    # Agent workspace. Its live/ routes are served by the agent process
+    # (nginx sends /api/v1/agent/live/ to the agent service).
+    path("api/v1/agent/", include("apps.agent.api.v1.urls")),
     # External traffic sources (GA4 / hosted tag / Cloudflare). NOT under
     # /api/v1/analytics/: that prefix's middleware audit-logs every GET,
     # and this surface is polled every 30s.

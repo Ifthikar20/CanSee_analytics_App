@@ -173,6 +173,35 @@ def subscription_state(sub) -> dict:
     }
 
 
+def org_plan_for(user):
+    """The plan the user's organization grants, or None outside an org.
+
+    Enterprise org members inherit the org's manually provisioned plan
+    (Business has no self-serve checkout). Mirrors User.effective_plan's
+    org branch WITHOUT its personal ``user.plan`` fallback, which defaults
+    to a paid tier and leaked paid features to unsubscribed accounts.
+    Legacy plan names map to the live tiers.
+    """
+    if user is None or not getattr(user, "pk", None):
+        return None
+    if not hasattr(user, "org_memberships"):
+        return None
+    org = getattr(user, "_org_cache", None)
+    if org is None:
+        # order_by matters: .first() on an unordered queryset gives an
+        # arbitrary row, so a user in two orgs would flap between plans.
+        membership = (
+            user.org_memberships.select_related("organization")
+            .order_by("created_at")
+            .first()
+        )
+        if membership is None:
+            return None
+        org = membership.organization
+        user._org_cache = org
+    return _LEGACY_MAP.get(org.plan, org.plan)
+
+
 def _resolve_plan_key(user):
     """Resolve the user's effective plan to a PLAN_LIMITS key."""
     # Paywall off: everyone gets the top tier so no feature or numeric
@@ -183,26 +212,9 @@ def _resolve_plan_key(user):
     # the old ``user.plan`` default provided.
     if user is None or not getattr(user, "pk", None):
         return Plan.PRO
-    # Enterprise org members inherit the org's manually provisioned plan
-    # (Business has no self-serve checkout). Mirrors User.effective_plan's
-    # org branch WITHOUT its personal ``user.plan`` fallback, which
-    # defaults to a paid tier and leaked paid features to unsubscribed
-    # accounts.
-    if hasattr(user, "org_memberships"):
-        org = getattr(user, "_org_cache", None)
-        if org is None:
-            # order_by matters: .first() on an unordered queryset gives an
-            # arbitrary row, so a user in two orgs would flap between plans.
-            membership = (
-                user.org_memberships.select_related("organization")
-                .order_by("created_at")
-                .first()
-            )
-            if membership:
-                org = membership.organization
-                user._org_cache = org
-        if org is not None:
-            return _LEGACY_MAP.get(org.plan, org.plan)
+    org_plan = org_plan_for(user)
+    if org_plan is not None:
+        return org_plan
     return current_plan_for(user)
 
 

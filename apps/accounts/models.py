@@ -403,6 +403,7 @@ class AITokenUsage(TimestampMixin):
         ("source_sentiment", "Source Sentiment"),
         ("source_relevance", "Source Relevance"),
         ("brand_research", "Brand Research"),
+        ("agent", "Agent workspace"),
     ]
 
     PROVIDER_CHOICES = [
