@@ -64,6 +64,7 @@ For each claim in <claims> decide one verdict:
 - contradicted: the evidence states something that cannot be true at the same time as the claim, about the same subject and the same scope: a different price for the same plan, a feature it says the product lacks, a different date for the same event.
 - not_verifiable: the evidence does not address the claim, addresses a different scope (another group, plan, period or measure, for example Fortune 100 when the claim is about Fortune 500), or only lists related features without settling the claim.
 When torn between contradicted and not_verifiable, choose not_verifiable: a contradiction is shown to the brand as an error in the engine's answer, so it must be certain.
+For every verdict also answer two questions. same_scope: is the evidence about the same subject, plan, group and period as the claim? certain: does the evidence leave no reading under which the claim is true? A contradicted verdict needs both to be true; otherwise the verdict is not_verifiable.
 Only the evidence counts; never use general knowledge.
 Return JSON that matches the schema: verdicts, one per claim id, each with claim_id, verdict, evidence_id (the fact or page id you relied on, or an empty string for not_verifiable), evidence_quote (the exact words from that fact or page, at most 300 characters, copied character for character, or an empty string) and note (one sentence of at most 160 characters saying why).
 """
@@ -99,6 +100,8 @@ VERIFY_SCHEMA = _obj({
         "evidence_id": _STRING,
         "evidence_quote": _STRING,
         "note": _STRING,
+        "same_scope": {"type": "boolean"},
+        "certain": {"type": "boolean"},
     })),
 })
 
@@ -143,6 +146,10 @@ class CheckedClaim(_Output):
     evidence_id: _text(16)
     evidence_quote: _text(300)
     note: _text(160)
+    # The model's own answers to "same subject and scope?" and "rules the
+    # claim out?"; a contradiction stands only when both are true.
+    same_scope: bool = False
+    certain: bool = False
 
 
 class Verification(_Output):
@@ -227,6 +234,9 @@ def validate_extraction(extraction: Extraction, answer: str) -> tuple[list[dict]
     return claims, themes
 
 
+NOT_RULED_OUT = "The evidence does not rule this claim out."
+
+
 def validate_verdicts(verification: Verification, claim_ids: set[str],
                       evidence: dict[str, dict]) -> dict[str, dict]:
     """``{claim id: verdict fields}`` (AnswerClaim fields). ``evidence`` maps
@@ -241,6 +251,11 @@ def validate_verdicts(verification: Verification, claim_ids: set[str],
             continue
         if item.verdict == "not_verifiable":
             out[cid] = _no_evidence("not_verifiable", item.note)
+            continue
+        if item.verdict == "contradicted" and not (item.same_scope and item.certain):
+            # Shown to the brand as an error in the engine's answer, so a
+            # contradiction the model is not sure of is not one.
+            out[cid] = _no_evidence("not_verifiable", NOT_RULED_OUT)
             continue
         source = evidence.get(item.evidence_id)
         quote = verbatim(item.evidence_quote, source["text"]) if source else ""
