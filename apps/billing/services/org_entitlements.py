@@ -84,13 +84,17 @@ def prompts_used_this_month(user) -> int:
     Counted at audit creation (len of the prompt list) — a prompt spends
     allowance once regardless of how many providers answer it. Python-side
     sum because ``prompts`` is a JSON list with no portable DB length.
+
+    Autopilot's audits (the ones an AutopilotRunPrompt points to) are left
+    out: the number means "prompts you queue yourself", so a daily run never
+    uses up the month and refuses the owner's own scans.
     """
     from apps.llm_ranking.models import LLMRankingAudit
 
     now = timezone.now()
     month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     prompt_lists = LLMRankingAudit.objects.filter(
-        created_by=user, created_at__gte=month_start,
+        created_by=user, created_at__gte=month_start, autopilot_rows__isnull=True,
     ).values_list("prompts", flat=True)
     return sum(len(p or []) for p in prompt_lists)
 

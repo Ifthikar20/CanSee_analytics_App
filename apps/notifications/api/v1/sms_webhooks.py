@@ -53,24 +53,27 @@ def _xml(body: str) -> HttpResponse:
     return HttpResponse(body, content_type="application/xml")
 
 
-def _find_subscription(from_number: str):
-    """Match the sender to a subscription by keyed digest.
+def _find_subscriptions(from_number: str) -> list:
+    """Every subscription of the sender's number (every account that added
+    it), newest first, matched by keyed digest.
 
     The stored number is encrypted and therefore unqueryable, which is why
-    the hash column exists. Opted-out rows are included on purpose: a
-    START from a lapsed subscriber has to find its row to resurrect it.
+    the hash column exists. Opted-out and pending rows are included on
+    purpose: STOP has to reach every row of the number, and a START from a
+    lapsed subscriber has to find its rows to resurrect them.
     """
     from apps.notifications.models import SmsSubscription
 
+    if not sms_service.normalize_phone(from_number):
+        return []
     digest = sms_service.hash_phone(from_number)
     if not digest:
-        return None
-    return (
+        return []
+    return list(
         SmsSubscription.objects
         .select_related("user")
         .filter(phone_hash=digest)
         .order_by("-created_at")
-        .first()
     )
 
 
@@ -117,16 +120,18 @@ def twilio_inbound(request):
 
     from_number = request.POST.get("From", "")
     body = (request.POST.get("Body", "") or "").strip()
-    subscription = _find_subscription(from_number)
+    subscriptions = _find_subscriptions(from_number)
 
-    # Keywords first, always.
-    keyword_reply = sms_service.handle_keyword(subscription, body)
+    # Keywords first, always, and for every row of the number.
+    keyword_reply = sms_service.handle_keyword(subscriptions, body)
     if keyword_reply is not None:
         return _xml(sms_service.twiml(keyword_reply))
 
-    if subscription is None:
+    if not subscriptions:
         return _xml(sms_service.twiml(NOT_REGISTERED))
-    if not subscription.is_active:
+    # A question is answered from the newest verified row's account.
+    subscription = next((s for s in subscriptions if s.is_active), None)
+    if subscription is None:
         # Pending or opted out: no answers, and no nagging either. HELP and
         # START still work above, which is the only escape hatch needed.
         return _xml(sms_service.twiml())

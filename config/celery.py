@@ -52,6 +52,14 @@ app.conf.task_routes = {
     "apps.analytics.tasks.prune_analytics_events": {"queue": "integrations"},
     "apps.analytics.tasks.prune_llm_results": {"queue": "integrations"},
     "apps.agent.tasks.purge_expired_agent_chats": {"queue": "integrations"},
+    # Autopilot: the plan and the engines are LLM work; Google and the text
+    # are third-party HTTP; the dispatcher and finalize are quick DB work.
+    # The exact names win over the glob.
+    "apps.autopilot.tasks.*": {"queue": "ai"},
+    "apps.autopilot.tasks.dispatch_autopilot": {"queue": "default"},
+    "apps.autopilot.tasks.finalize_run": {"queue": "default"},
+    "apps.autopilot.tasks.run_google": {"queue": "integrations"},
+    "apps.autopilot.tasks.deliver_text": {"queue": "integrations"},
 }
 
 app.conf.beat_schedule = {
@@ -89,6 +97,14 @@ app.conf.beat_schedule = {
     "sweep-stale-agent-runs": {
         "task": "apps.agent.tasks.sweep_stale_agent_runs",
         "schedule": crontab(minute="*"),
+    },
+    # ── Every 5 minutes ──
+    # Autopilot: starts each project's daily run once its local run time has
+    # passed, releases runs whose analysis ended, resumes silent stages and
+    # sends texts that waited for quiet hours. A cheap no-op when idle.
+    "autopilot-dispatch": {
+        "task": "apps.autopilot.tasks.dispatch_autopilot",
+        "schedule": crontab(minute="*/5"),
     },
     # ── Every 15 minutes ──
     "refresh-expiring-oauth-tokens": {

@@ -183,7 +183,7 @@ def _extract_brands(*, response_text, website, brand_name, keywords, audit_id, u
 
 
 def _query_with_retry(instance, prompt_text, *, user=None, website=None,
-                      audit_id=None, actor: str = "system"):
+                      audit_id=None, actor: str = "system", extra_metadata=None):
     """Query a provider, retrying once when it raises or returns a
     non-key transient failure. Returns the ProviderResult (which may
     still be succeeded=False) or None if both attempts raised.
@@ -196,7 +196,10 @@ def _query_with_retry(instance, prompt_text, *, user=None, website=None,
 
     The attribution kwargs make crawl spend visible and capped: an
     unattributed query() records nothing and bypasses the spend wall.
+    ``extra_metadata`` adds flat tags to the usage row (Autopilot's
+    ``feature`` and ``autopilot_run``); ``actor`` always wins.
     """
+    tags = {**(extra_metadata or {}), "actor": actor}
     last = None
     for attempt in (1, 2):
         try:
@@ -206,7 +209,7 @@ def _query_with_retry(instance, prompt_text, *, user=None, website=None,
                 website=website,
                 audit_id=audit_id,
                 module="prompt_library",
-                extra_metadata={"actor": actor},
+                extra_metadata=dict(tags),
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Provider query raised (attempt %d): %s", attempt, exc)
@@ -610,12 +613,19 @@ class EngineScan:
     engine. ``finish`` scores the audit and closes the crawl run, once. An
     answer that arrives after ``finish`` (a thread still waiting on its
     engine after Stop) is stored, but the audit is not scored again.
+
+    Spend goes to ``acting_user``, tagged ``actor`` ("user" for the agent,
+    "system" for Autopilot's daily run) and ``usage_tags`` on each answer's
+    usage row.
     """
 
-    def __init__(self, website: Website, prompt: Prompt, *, acting_user):
+    def __init__(self, website: Website, prompt: Prompt, *, acting_user, actor: str = "user",
+                 usage_tags: dict | None = None):
         self.website = website
         self.prompt = prompt
         self.acting_user = acting_user
+        self.actor = actor
+        self.usage_tags = dict(usage_tags or {})
         self.brand_name = getattr(website, "business_name", None) or website.name or "your brand"
         self.keywords = _website_keywords(website)
         self._lock = threading.Lock()
@@ -626,6 +636,13 @@ class EngineScan:
         self._responses = 0
         self._finished = False
         self._outcome: CrawlOutcome | None = None
+
+    @property
+    def audit_id(self) -> str | None:
+        """The scan's audit id once an engine has been asked, else None."""
+        with self._lock:
+            audit = self._audit
+        return str(audit.id) if audit is not None else None
 
     def _rows(self) -> LLMRankingAudit | None:
         """The audit to store answers on (with its crawl run), created on
@@ -686,7 +703,8 @@ class EngineScan:
             model_used = ""
         result = _query_with_retry(
             instance, self.prompt.text,
-            user=self.acting_user, website=self.website, audit_id=str(audit.id), actor="user",
+            user=self.acting_user, website=self.website, audit_id=str(audit.id),
+            actor=self.actor, extra_metadata=self.usage_tags or None,
         )
         if result is None:
             self._note_error(f"{provider_key}: query raised on both attempts")

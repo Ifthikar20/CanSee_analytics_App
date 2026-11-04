@@ -9,14 +9,31 @@ through Polar. Invoices are shown in Polar's billing portal (PortalView).
 import logging
 
 from rest_framework import status
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.billing.models import Subscription
-from apps.billing.services.plan_service import PlanService
+from apps.billing.services.plan_service import SELF_SERVE_PLANS, PlanService
 
 logger = logging.getLogger("billing")
+
+MONTHLY_ONLY = "Billing is monthly only."
+
+
+def _refused(code: str, message: str, http_status=status.HTTP_400_BAD_REQUEST) -> Response:
+    return Response(
+        {"success": False, "error": {"code": code, "message": message}}, status=http_status,
+    )
+
+
+def _plan_error(plan) -> Response | None:
+    """400 ``invalid_plan`` unless ``plan`` is one of the self-serve plans."""
+    from apps.billing.services.polar_billing import INVALID_PLAN
+
+    if plan not in SELF_SERVE_PLANS:
+        return _refused("invalid_plan", INVALID_PLAN)
+    return None
 
 
 def _safe_origin(request) -> str:
@@ -64,8 +81,8 @@ class BillingOverviewView(APIView):
     def get(self, request):
         from apps.billing.services import polar_billing
         from apps.billing.services.plan_limits import (
+            limits_block,
             plan_for_subscription,
-            projects_limit_for,
             subscription_state,
         )
         from core.utils.constants import SubscriptionStatus
@@ -153,13 +170,11 @@ class BillingOverviewView(APIView):
             # Resolved allowances (trial-aware: a live trial keeps the Free
             # project cap until the first charge). -1 = unlimited. Same
             # shape as the session payload's `limits` block.
-            "limits": {
-                "projects": projects_limit_for(request.user),
-            },
-            # False until the Polar token + product ids are configured —
-            # the frontend disables checkout and says so instead of
-            # letting the button fail silently.
-            "billing_ready": polar_billing.is_configured(),
+            "limits": limits_block(request.user),
+            # False until the Polar token and both plan product ids are
+            # configured — the frontend disables checkout and says so
+            # instead of letting the button fail silently.
+            "billing_ready": polar_billing.checkout_ready(),
             "subscription_status": subscription.status if subscription else "none",
             # Shared trial/tier vocabulary (same builder as the session
             # payload) so labels cannot drift between surfaces.
@@ -188,41 +203,36 @@ class BillingOverviewView(APIView):
 
 
 class PlansView(APIView):
-    """List all available plans."""
-    permission_classes = [IsAuthenticated]
+    """List the plans: Free, 100 prompts, 200 prompts, Business.
+
+    Public (the signed-out /pricing page reads it): the list is the same for
+    everyone, so no credentials are read.
+    """
+    authentication_classes = []
+    permission_classes = [AllowAny]
 
     def get(self, request):
         return Response(PlanService.get_all_plans())
 
 
 class CheckoutView(APIView):
-    """Create a Polar checkout session for the Pro plan.
+    """Create a Polar checkout session for a self-serve plan.
 
+    POST /api/v1/billing/checkout/  body: {"plan": "prompts_100" | "prompts_200"}.
     Subscribing always goes through Polar's hosted checkout; the Polar
     sandbox accepts test cards, so dev flows use the real checkout too.
+    Business requires a sales contact; Pro is no longer offered.
     """
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
-        plan = request.data.get("plan", "pro")
-        annual = bool(request.data.get("annual", False))
-
-        # Pro is the only self-serve tier; Business requires sales contact.
-        legacy_pro_names = {"pro", "individual", "starter", "growth"}
-        if plan not in legacy_pro_names:
-            return Response(
-                {
-                    "success": False,
-                    "error": {
-                        "code": "invalid_plan",
-                        "message": (
-                            "Business plans require a custom quote. "
-                            "Please contact sales@cansee.ai."
-                        ),
-                    },
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+        data = request.data if isinstance(request.data, dict) else {}
+        plan = data.get("plan")
+        refused = _plan_error(plan)
+        if refused is not None:
+            return refused
+        if data.get("annual"):
+            return _refused("invalid_plan", MONTHLY_ONLY)
 
         origin = _safe_origin(request)
 
@@ -231,7 +241,7 @@ class CheckoutView(APIView):
 
         try:
             url = polar_billing.create_checkout(
-                request.user, annual=annual, origin=origin,
+                request.user, plan=plan, origin=origin,
                 customer_ip=_client_ip(request),
             )
             return Response({"success": True, "data": {"checkout_url": url}})
@@ -395,10 +405,7 @@ class UpgradeNowView(APIView):
 
     def post(self, request):
         from apps.billing.services import polar_billing
-        from apps.billing.services.plan_limits import (
-            projects_limit_for,
-            subscription_state,
-        )
+        from apps.billing.services.plan_limits import limits_block, subscription_state
         from core.exceptions import CanseeException
 
         annual = request.data.get("annual", None)
@@ -422,47 +429,68 @@ class UpgradeNowView(APIView):
             "success": True,
             "data": {
                 "subscription": subscription_state(sub),
-                "limits": {"projects": projects_limit_for(request.user)},
+                "limits": limits_block(request.user),
             },
         })
 
 
 class ChangePlanView(APIView):
-    """Switch between monthly and annual Pro billing.
+    """Move an active subscription to the other self-serve plan.
 
-    POST /api/v1/billing/change-plan/  body: {"annual": bool} (required).
-    Active subscriptions settle the difference immediately; trialing ones
-    switch free and the new price applies when the trial converts.
+    POST /api/v1/billing/change-plan/  body: {"plan": "prompts_100" | "prompts_200"}.
+    The plan changes now: Polar charges the difference when the price goes
+    up and credits the unused part when it goes down (a Pro row still in
+    its trial switches free). Answers the subscription and the limits.
+
+    The legacy body {"annual": bool} keeps switching a Pro row between
+    monthly and annual billing; the self-serve plans are monthly only.
     """
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
         from apps.billing.services import polar_billing
-        from apps.billing.services.plan_limits import subscription_state
+        from apps.billing.services.plan_limits import (
+            limits_block,
+            subscription_state,
+            tier_for_subscription,
+        )
         from core.exceptions import CanseeException
+        from core.utils.constants import Plan
 
-        if "annual" not in request.data:
-            return Response(
-                {"success": False, "error": {"code": "invalid_request",
-                 "message": "Choose monthly or annual billing."}},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+        data = request.data if isinstance(request.data, dict) else {}
+        if "plan" in data:
+            refused = _plan_error(data.get("plan"))
+            if refused is not None:
+                return refused
+        elif "annual" in data:
+            current = Subscription.objects.filter(user=request.user).first()
+            if current is not None and tier_for_subscription(current) != Plan.PRO:
+                return _refused("invalid_plan", MONTHLY_ONLY)
+        else:
+            from apps.billing.services.polar_billing import INVALID_PLAN
+
+            return _refused("invalid_plan", INVALID_PLAN)
         try:
-            sub = polar_billing.change_billing_cycle(
-                request.user, annual=bool(request.data.get("annual")),
-            )
+            if "plan" in data:
+                sub = polar_billing.change_plan(request.user, plan=data["plan"])
+            else:
+                sub = polar_billing.change_billing_cycle(
+                    request.user, annual=bool(data.get("annual")),
+                )
         except CanseeException:
             raise
         except Exception as e:
-            logger.error("Billing cycle change failed: %s", e)
-            return Response(
-                {"success": False, "error": {"code": "billing_failed",
-                 "message": "We couldn't change your plan. Please try again."}},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+            logger.error("Plan change failed: %s", e)
+            return _refused("billing_failed", "We couldn't change your plan. Please try again.")
+        # The service re-synced the row; drop this instance's cached
+        # relation so the limits below see the new plan.
+        request.user.refresh_from_db()
         return Response({
             "success": True,
-            "data": {"subscription": subscription_state(sub)},
+            "data": {
+                "subscription": subscription_state(sub),
+                "limits": limits_block(request.user),
+            },
         })
 
 

@@ -7,10 +7,14 @@ class Segment(models.TextChoices):
 
 
 class Plan(models.TextChoices):
-    # ── Live model (2026-08): Free -> Pro $45/mo self-serve -> Business custom ──
+    # ── Live model (2026-11): Free -> 100 or 200 tracked prompts, monthly ->
+    # Business custom. Pro ($45/mo, 2026-08) is kept for its subscribers but
+    # no longer offered.
     FREE = "free", "Free"
     PRO = "pro", "Pro ($45/mo)"
     BUSINESS = "business", "Business (custom)"
+    PROMPTS_100 = "prompts_100", "100 prompts ($80/mo)"
+    PROMPTS_200 = "prompts_200", "200 prompts ($140/mo)"
     # Legacy aliases for migration compatibility — these still appear
     # on existing Subscription/User rows and must keep resolving to a
     # real plan via PLAN_LIMITS until a backfill migrates them.
@@ -27,6 +31,11 @@ class Plan(models.TextChoices):
 # audit reads it off the user's current plan (max_prompts_for_user) and
 # caps the prompt list accordingly. Bumping a user's tier widens the cap
 # on the next audit immediately.
+#
+# ``tracked_prompts`` caps the active (unarchived) prompts an account tracks
+# across its projects (apps.billing.services.tracked_prompts); -1 is
+# unlimited. ``autopilot`` (the daily run) and ``sms_digest`` (its one text
+# a day) are what plan_limits.plan_allows answers.
 PLAN_LIMITS = {
     # Free: what an account WITHOUT an active/trialing subscription gets.
     # The AI allowance is a small acquisition cost (settings.
@@ -48,6 +57,9 @@ PLAN_LIMITS = {
         # Dedicated prompt allowance per account per calendar month —
         # every prompt queued into an audit draws it down. -1 = unlimited.
         "monthly_prompts": 10,
+        "tracked_prompts": 5,
+        "autopilot": False,
+        "sms_digest": False,
     },
     # Pro carries the full self-serve feature set at $45/mo. The AI spend
     # wall (65% of price -> $29.25/mo of model cost) is what protects
@@ -66,6 +78,9 @@ PLAN_LIMITS = {
         "max_prompts_per_audit": 15,
         "max_audits_per_month": 30,           # daily cadence cap
         "monthly_prompts": 100,
+        "tracked_prompts": 100,
+        "autopilot": True,
+        "sms_digest": True,
     },
     Plan.BUSINESS: {
         "segment": Segment.ENTERPRISE,
@@ -83,7 +98,43 @@ PLAN_LIMITS = {
         # Per-SEAT default for enterprise orgs; each org can carry a
         # negotiated override (Organization.monthly_prompt_allowance).
         "monthly_prompts": 200,
+        "tracked_prompts": -1,
+        "autopilot": True,
+        "sms_digest": True,
     },
+}
+
+# The two self-serve plans share everything but the price and the tracked
+# prompts. Autopilot asks every tracked prompt every day, which would spend
+# a monthly prompt queue in one day, so ``monthly_prompts`` is unlimited:
+# the AI allowance (price x AI_SPEND_CAP_RATIO) is what bounds spend.
+_PROMPT_PLAN = {
+    "segment": Segment.INDIVIDUAL,
+    "price_yearly": 0,
+    "trial_days": 0,
+    "projects": 5,
+    "pageviews": 250_000,
+    "team_members": 5,
+    "ai_credits_monthly": 600,
+    "integrations": 10,
+    "competitors": 25,
+    "max_prompts_per_audit": 50,
+    "max_audits_per_month": -1,
+    "monthly_prompts": -1,
+    "autopilot": True,
+    "sms_digest": True,
+}
+PLAN_LIMITS[Plan.PROMPTS_100] = {**_PROMPT_PLAN, "price_monthly": 80, "tracked_prompts": 100}
+PLAN_LIMITS[Plan.PROMPTS_200] = {**_PROMPT_PLAN, "price_monthly": 140, "tracked_prompts": 200}
+
+# What each plan is called on the pricing window, the billing page and in
+# messages. One place, so renaming a plan is a one-line change.
+PLAN_NAMES = {
+    Plan.FREE: "Free",
+    Plan.PRO: "Pro",
+    Plan.BUSINESS: "Business",
+    Plan.PROMPTS_100: "100 prompts",
+    Plan.PROMPTS_200: "200 prompts",
 }
 
 # Legacy aliases — keep resolving so existing Subscription/User rows

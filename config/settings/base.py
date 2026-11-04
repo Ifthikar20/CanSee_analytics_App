@@ -69,6 +69,8 @@ LOCAL_APPS = [
     "apps.web_analytics",
     "apps.insights",
     "apps.boards",
+    "apps.prompt_box",
+    "apps.autopilot",
     # Stub app — kept only to satisfy historical lazy FK references
     # from analytics migrations. All tables are managed=False.
     "apps.leads",
@@ -440,6 +442,12 @@ POLAR_READS_ENABLED = env.bool("POLAR_READS_ENABLED", default=False)
 # hard 503s — the endpoint refuses to process unsigned payloads).
 POLAR_PRODUCT_PRO_MONTHLY_ID = env("POLAR_PRODUCT_PRO_MONTHLY_ID", default="")
 POLAR_PRODUCT_PRO_ANNUAL_ID = env("POLAR_PRODUCT_PRO_ANNUAL_ID", default="")
+# The two self-serve plans (100 and 200 tracked prompts, billed monthly, no
+# trial): product ids the owner creates in Polar. Checkout and plan changes
+# stay off until both are set. Keep the Pro ids above while any Pro
+# subscription exists: a product no setting names syncs as cancelled.
+POLAR_PRODUCT_PROMPTS_100_ID = env("POLAR_PRODUCT_PROMPTS_100_ID", default="")
+POLAR_PRODUCT_PROMPTS_200_ID = env("POLAR_PRODUCT_PROMPTS_200_ID", default="")
 POLAR_WEBHOOK_SECRET = env("POLAR_WEBHOOK_SECRET", default="")
 # Canonical event name meters filter on. Never change once events flow.
 POLAR_EVENT_NAME = "llm_usage"
@@ -646,7 +654,9 @@ SERP_PROVIDER = env("SERP_PROVIDER", default="")
 # a time and stops at the site, so MAX_DEPTH=100 costs at most 10 calls.
 SEARCH_GAP_MAX_DEPTH = env.int("SEARCH_GAP_MAX_DEPTH", default=100)
 SEARCH_GAP_RECHECK_HOURS = env.int("SEARCH_GAP_RECHECK_HOURS", default=24)
-SEARCH_GAP_DAILY_CHECKS_PER_WEBSITE = env.int("SEARCH_GAP_DAILY_CHECKS_PER_WEBSITE", default=100)
+# Manual rechecks per website in a rolling 24 hours: room for the user's own
+# checks after a 200-prompt Autopilot run (which uses its own quotas).
+SEARCH_GAP_DAILY_CHECKS_PER_WEBSITE = env.int("SEARCH_GAP_DAILY_CHECKS_PER_WEBSITE", default=250)
 SERPAPI_COST_PER_SEARCH_USD = env.float("SERPAPI_COST_PER_SEARCH_USD", default=0.015)
 # ScraperAPI bills credits from a monthly allowance: set your plan's dollar
 # cost per Google search to record it (0 records nothing, as on the free plan).
@@ -719,6 +729,55 @@ SHOPPING_MAX_ENGINE_ANSWERS = env.int("SHOPPING_MAX_ENGINE_ANSWERS", default=30)
 # ScraperAPI credits per Google Shopping page (its Google-domain rate; confirm
 # against the account balance before and after one check).
 SCRAPERAPI_SHOPPING_CREDITS = env.int("SCRAPERAPI_SHOPPING_CREDITS", default=25)
+
+# ── Ask AI (apps.prompt_box) ───────────────────────────────────────────
+# One buyer question asked several times per engine. Answers per engine per
+# question, answers per project per UTC day, answers asked at once in one
+# run, how runs execute (auto | celery | thread | inline, as
+# INSIGHTS_RUN_MODE) and how long a run may go without a heartbeat before
+# it is interrupted.
+PROMPT_BOX_MAX_SAMPLES = env.int("PROMPT_BOX_MAX_SAMPLES", default=10)
+PROMPT_BOX_DAILY_ANSWERS = env.int("PROMPT_BOX_DAILY_ANSWERS", default=100)
+PROMPT_BOX_CONCURRENCY = env.int("PROMPT_BOX_CONCURRENCY", default=3)
+PROMPT_BOX_RUN_MODE = env("PROMPT_BOX_RUN_MODE", default="auto")
+PROMPT_BOX_STALE_MINUTES = env.int("PROMPT_BOX_STALE_MINUTES", default=10)
+
+# ── Autopilot (apps.autopilot) ─────────────────────────────────────────
+# Once a day per project: every tracked prompt within the plan is asked to
+# each configured engine, Google page one is read, new answers that name the
+# brand are analyzed, then one text is sent. AUTOPILOT_ENABLED is the
+# deployment switch (off: the dispatcher starts nothing). Run modes as
+# above; the management command always runs inline.
+AUTOPILOT_ENABLED = env.bool("AUTOPILOT_ENABLED", default=True)
+AUTOPILOT_RUN_MODE = env("AUTOPILOT_RUN_MODE", default="auto")
+# Runs in progress at once across every project (manual runs included), and
+# prompts asked at once in one run.
+AUTOPILOT_MAX_ACTIVE_RUNS = env.int("AUTOPILOT_MAX_ACTIVE_RUNS", default=2)
+AUTOPILOT_PROMPT_CONCURRENCY = env.int("AUTOPILOT_PROMPT_CONCURRENCY", default=3)
+# The engines and Google steps stop claiming prompts after this many seconds
+# and hand over to a continuation (their soft time limit is this plus 360 s,
+# room for the prompts in flight). A run with no heartbeat this long is
+# interrupted.
+AUTOPILOT_STEP_SECONDS = env.int("AUTOPILOT_STEP_SECONDS", default=1200)
+AUTOPILOT_STALE_MINUTES = env.int("AUTOPILOT_STALE_MINUTES", default=30)
+# Share of the owner's monthly AI allowance Autopilot never spends: it is
+# kept for the user's own questions.
+AUTOPILOT_RESERVE_PCT = env.int("AUTOPILOT_RESERVE_PCT", default=10)
+# Google page one. The cadence a project's Autopilot starts with ("daily" or
+# "weekly"; weekly is the cheap default until the owner decides), how old a
+# successful check may be and still be reused on a daily and on a weekly
+# cadence, pages per project and per deployment per UTC day (25 ScraperAPI
+# credits a page) and requests at once in one run.
+AUTOPILOT_GOOGLE_CADENCE = env("AUTOPILOT_GOOGLE_CADENCE", default="weekly")
+AUTOPILOT_GOOGLE_REUSE_HOURS = env.int("AUTOPILOT_GOOGLE_REUSE_HOURS", default=20)
+AUTOPILOT_GOOGLE_WEEKLY_REUSE_HOURS = env.int("AUTOPILOT_GOOGLE_WEEKLY_REUSE_HOURS", default=164)
+AUTOPILOT_GOOGLE_PAGES_PER_PROJECT = env.int("AUTOPILOT_GOOGLE_PAGES_PER_PROJECT", default=200)
+AUTOPILOT_GOOGLE_PAGES_PER_DAY = env.int("AUTOPILOT_GOOGLE_PAGES_PER_DAY", default=1000)
+AUTOPILOT_GOOGLE_CONCURRENCY = env.int("AUTOPILOT_GOOGLE_CONCURRENCY", default=2)
+# How long the text waits for the analysis run, and the answers a prompt
+# needs in 7 days before it is ranked.
+AUTOPILOT_ANALYSIS_WAIT_MINUTES = env.int("AUTOPILOT_ANALYSIS_WAIT_MINUTES", default=15)
+AUTOPILOT_MIN_RANK_ANSWERS = env.int("AUTOPILOT_MIN_RANK_ANSWERS", default=4)
 
 # ── SMS (Twilio) ───────────────────────────────────────────────────────
 # The most intrusive channel in the product, so it is off by default and

@@ -54,6 +54,9 @@ urlpatterns = [
     path("api/v1/web-analytics/", include("apps.web_analytics.api.v1.urls")),
     path("api/v1/insights/", include("apps.insights.api.v1.urls")),
     path("api/v1/boards/", include("apps.boards.api.v1.urls")),
+    # Ask AI (the prompt box) and Autopilot (the daily run and its text).
+    path("api/v1/prompt-box/", include("apps.prompt_box.api.v1.urls")),
+    path("api/v1/autopilot/", include("apps.autopilot.api.v1.urls")),
 
     # Pixel ingestion (high throughput)
     path("api/v1/track/", include("apps.analytics.api.v1.pixel_urls")),

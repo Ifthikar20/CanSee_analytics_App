@@ -122,3 +122,8 @@ COUNTRY_CHECK_RUN_MODE = "inline"
 
 # Insights runs, likewise.
 INSIGHTS_RUN_MODE = "inline"
+
+# Ask AI and Autopilot runs, likewise (with "auto", eager Celery would start
+# daemon threads).
+PROMPT_BOX_RUN_MODE = "inline"
+AUTOPILOT_RUN_MODE = "inline"

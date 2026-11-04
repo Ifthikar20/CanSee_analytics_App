@@ -94,6 +94,9 @@ class PromptCreateSerializer(serializers.Serializer):
     models = serializers.ListField(
         child=serializers.CharField(), required=False, default=list,
     )
+    # False tracks the prompts without scanning them now (Ask AI's Track
+    # already has its answers; Autopilot asks it from its next run).
+    scan = serializers.BooleanField(required=False, default=True)
 
     def validate_models(self, value):
         from apps.llm_ranking.providers import list_model_variants

@@ -574,10 +574,7 @@ class SessionView(APIView):
 
         from apps.accounts.services.org_service import OrgService
         from apps.billing.services import polar_billing
-        from apps.billing.services.plan_limits import (
-            projects_limit_for,
-            subscription_state,
-        )
+        from apps.billing.services.plan_limits import limits_block, subscription_state
         from apps.websites.services.website_service import WebsiteService
 
         user = request.user
@@ -660,13 +657,15 @@ class SessionView(APIView):
         else:
             next_route = "app"
 
-        limits_block = {"projects": projects_limit_for(user)}
+        # Projects, tracked prompts ({limit, used}), Autopilot and the daily
+        # text, as the billing overview shows them; org members add seats.
+        limits = limits_block(user)
         if membership:
             from apps.billing.services.org_entitlements import seats_block
 
             seats = seats_block(membership.organization)
             if seats:
-                limits_block["seats"] = seats
+                limits["seats"] = seats
 
         return Response({
             "user": UserProfileSerializer(user).data,
@@ -678,7 +677,7 @@ class SessionView(APIView):
             "subscription": subscription,
             # Resolved server-side (trial-aware, paywall-aware) so the UI
             # never re-derives plan limits from the plan name. -1 = unlimited.
-            "limits": limits_block,
+            "limits": limits,
             "paywall_dismissed": user.paywall_dismissed_at is not None,
             "next_route": next_route,
         })

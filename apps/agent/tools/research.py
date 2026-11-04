@@ -714,11 +714,14 @@ def track_prompts(ctx: ToolContext, args) -> ToolResult:
     Only prompts the user wrote or was shown in an earlier message are
     tracked: the confirmation the system prompt asks for is checked here
     too. It does not start a scan: the agent asks the engines next with
-    check_ai_engines."""
+    check_ai_engines. Past the plan's tracked-prompt cap nothing is tracked
+    (an archived prompt it restores counts as added)."""
+    from apps.billing.services import tracked_prompts
     from apps.prompt_library.models import BrandPrompt, Prompt, PromptSource
     from apps.prompt_library.services._hash import text_hash
     from apps.prompt_library.services.industry_match import industry_for_website
     from apps.prompt_library.services.template_parser import extract_variables
+    from core.exceptions import CanseeException
 
     shown = _shown_to_user(ctx)
     unconfirmed = [item.text for item in args.prompts if query_key(item.text) not in shown]
@@ -730,6 +733,14 @@ def track_prompts(ctx: ToolContext, args) -> ToolResult:
             "they say yes.",
             summary="Needs the user's confirmation",
         )
+    try:
+        tracked_prompts.check_capacity(ctx.website, tracked_prompts.adding_count(
+            ctx.website,
+            text_hashes=[text_hash(" ".join(item.text.split())) for item in args.prompts],
+            restore=True,
+        ))
+    except CanseeException as exc:
+        raise ToolError(exc.message, summary="The plan's prompt limit is reached") from None
     industry = None
     created = []
     for item in args.prompts:

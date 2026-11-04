@@ -19,6 +19,7 @@ from rest_framework.permissions import IsAdminUser, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from apps.billing.services import tracked_prompts
 from apps.llm_ranking.models import LLMRankingAudit
 from apps.prompt_library.api.v1.serializers import (
     AutoTemplateRequestSerializer,
@@ -258,6 +259,9 @@ class WebsiteBrandPromptsView(TenantScopedAPIView):
         prompt = get_object_or_404(
             Prompt, id=serializer.validated_data["prompt_id"], is_active=True
         )
+        tracked_prompts.check_capacity(
+            website, tracked_prompts.adding_count(website, prompt_ids=[prompt.id]),
+        )
         bp, created = BrandPrompt.objects.get_or_create(
             website=website,
             prompt=prompt,
@@ -288,7 +292,16 @@ class BrandPromptDetailView(APIView):
     def patch(self, request, brand_prompt_id):
         bp = self._owned(request, brand_prompt_id)
         if "is_archived" in request.data:
-            bp.is_archived = bool(request.data["is_archived"])
+            archived = bool(request.data["is_archived"])
+            if bp.is_archived and not archived:
+                # Restoring makes the prompt tracked again: the plan's cap applies.
+                tracked_prompts.check_capacity(
+                    bp.website,
+                    tracked_prompts.adding_count(
+                        bp.website, prompt_ids=[bp.prompt_id], restore=True,
+                    ),
+                )
+            bp.is_archived = archived
             bp.save(update_fields=["is_archived", "updated_at"])
         return Response(BrandPromptSerializer(bp).data)
 
@@ -324,13 +337,12 @@ class WebsiteSamplePromptsView(TenantScopedAPIView):
 
     409 {"error": "synthesis_not_configured"} without a Claude key;
     502 {"error": "synthesis_failed"} when the call fails. Nothing is
-    substituted in either case.
+    substituted in either case. Only the prompts that fit the plan's
+    tracked-prompt cap are added; ``limited`` is true when some were left out.
     """
 
     def post(self, request, website_id):
-        from apps.llm_ranking.services.prompt_registrar import (
-            register_generated_prompts,
-        )
+        from apps.llm_ranking.services.prompt_registrar import register_within_plan
         from apps.prompt_library.services.sample_prompts import build_sample_prompts
         from core.exceptions import RateLimited
         from core.resilience import TokenBucket
@@ -386,7 +398,7 @@ class WebsiteSamplePromptsView(TenantScopedAPIView):
                 status=status.HTTP_422_UNPROCESSABLE_ENTITY,
             )
 
-        created = register_generated_prompts(items, website)
+        created, left_out = register_within_plan(items, website)
 
         return Response(
             {
@@ -397,13 +409,19 @@ class WebsiteSamplePromptsView(TenantScopedAPIView):
                 "created_count": created,
                 "total": len(items),
                 "source": result["source"],
+                "limited": left_out > 0,
             },
             status=status.HTTP_201_CREATED,
         )
 
 
 class WebsitePromptCreateView(TenantScopedAPIView):
-    """Create a manual templated prompt for a website."""
+    """Create a manual templated prompt for a website.
+
+    All or nothing: when the new prompts would pass the plan's tracked-prompt
+    cap, nothing is created (403 ``tracked_prompt_limit``). ``scan: false``
+    tracks without a scan (Ask AI's Track: no second spend).
+    """
 
     def post(self, request, website_id):
         from apps.prompt_library.services._hash import text_hash
@@ -413,6 +431,27 @@ class WebsitePromptCreateView(TenantScopedAPIView):
         serializer = PromptCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
+
+        # Each non-empty line becomes a separate prompt (matches the modal's
+        # "every line is a prompt" + bulk-upload behaviour). Template-only
+        # payloads (no newlines) collapse to a single prompt as before.
+        raw = (data.get("text") or "").strip()
+        template_text_in = (data.get("template_text") or "").strip()
+        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+        if not lines:
+            lines = [template_text_in] if template_text_in else []
+        # Per line: the template, the body and the canonical hash that finds
+        # its Prompt. The cap is checked on those hashes before anything is
+        # created.
+        planned = []
+        for line in lines:
+            template_text = template_text_in or line
+            body_for_text = line or template_text
+            planned.append((template_text, body_for_text, text_hash(template_text or body_for_text)))
+        tracked_prompts.check_capacity(
+            website,
+            tracked_prompts.adding_count(website, text_hashes=[h for _t, _b, h in planned]),
+        )
 
         industry = None
         topic_name = (data.get("topic") or "").strip()
@@ -439,22 +478,10 @@ class WebsitePromptCreateView(TenantScopedAPIView):
         location = (data.get("location") or "").strip()
         model_variants = data.get("models") or []
 
-        # Each non-empty line becomes a separate prompt (matches the modal's
-        # "every line is a prompt" + bulk-upload behaviour). Template-only
-        # payloads (no newlines) collapse to a single prompt as before.
-        raw = (data.get("text") or "").strip()
-        template_text_in = (data.get("template_text") or "").strip()
-        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
-        if not lines:
-            lines = [template_text_in] if template_text_in else []
-
         created_prompts = []
         brand_prompt_ids = []
-        for line in lines:
-            template_text = template_text_in or line
-            body_for_text = line or template_text
+        for template_text, body_for_text, canonical_hash in planned:
             variables = extract_variables(template_text)
-            canonical_hash = text_hash(template_text or body_for_text)
             prompt, _ = Prompt.objects.get_or_create(
                 text_hash=canonical_hash,
                 defaults=dict(
@@ -493,12 +520,15 @@ class WebsitePromptCreateView(TenantScopedAPIView):
         # prompts are saved either way, and ``scan_error`` says why no scan
         # started. A custom model selection routes through the per-prompt
         # crawler, the only path that honors BrandPrompt.model_variants.
-        scan_audit_id, scan_error = self._trigger_scan(
-            website, request.user, [p.text for p in created_prompts], location,
-            crawl_prompt_ids=(
-                [str(p.id) for p in created_prompts] if model_variants else None
-            ),
-        )
+        # ``scan: false`` skips it: Autopilot asks the prompt from its next run.
+        scan_audit_id, scan_error = None, None
+        if data.get("scan", True):
+            scan_audit_id, scan_error = self._trigger_scan(
+                website, request.user, [p.text for p in created_prompts], location,
+                crawl_prompt_ids=(
+                    [str(p.id) for p in created_prompts] if model_variants else None
+                ),
+            )
 
         payload = PromptSerializer(created_prompts[0]).data
         payload["brand_prompt_id"] = brand_prompt_ids[0]
@@ -2169,6 +2199,9 @@ class WebsiteSuggestionActionView(TenantScopedAPIView):
             return Response({"detail": "Prompt not found."},
                             status=status.HTTP_404_NOT_FOUND)
         if action == "accept":
+            tracked_prompts.check_capacity(
+                website, tracked_prompts.adding_count(website, prompt_ids=[prompt.id]),
+            )
             bp, _ = BrandPrompt.objects.get_or_create(website=website, prompt=prompt)
             # If the user had previously rejected this one, lift the
             # rejection so it doesn't keep being filtered out elsewhere.
@@ -2196,6 +2229,10 @@ class WebsiteSuggestionBulkView(TenantScopedAPIView):
 
         prompts = list(Prompt.objects.filter(is_active=True, id__in=ids))
         if action == "accept":
+            # All or nothing under the plan's tracked-prompt cap.
+            tracked_prompts.check_capacity(
+                website, tracked_prompts.adding_count(website, prompt_ids=[p.id for p in prompts]),
+            )
             BrandPrompt.objects.bulk_create(
                 [BrandPrompt(website=website, prompt=p) for p in prompts],
                 ignore_conflicts=True,

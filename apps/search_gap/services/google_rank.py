@@ -162,11 +162,15 @@ def serp_features(found: dict) -> dict:
     }
 
 
-def check(brand_prompt, *, force: bool = False, now=None):
+def check(brand_prompt, *, force: bool = False, now=None, depth: int | None = None,
+          enforce_daily_cap: bool = True):
     """Look up (or reuse) the Google rank for one tracked prompt.
 
     Raises NotConfigured without a SerpAPI key and DailyLimitReached when
-    the website has used its rolling 24h allowance.
+    the website has used its rolling 24h allowance. ``depth`` replaces
+    SEARCH_GAP_MAX_DEPTH (10 reads page one only, with SerpAPI too);
+    ``enforce_daily_cap=False`` skips the rolling cap (Autopilot applies
+    its own daily page quotas).
     """
     from apps.search_gap.models import GoogleRankCheck
 
@@ -188,16 +192,18 @@ def check(brand_prompt, *, force: bool = False, now=None):
         if recent:
             return recent
 
-    used = GoogleRankCheck.objects.filter(
-        website=website, checked_at__gte=now - timedelta(days=1),
-    ).count()
-    if used >= settings.SEARCH_GAP_DAILY_CHECKS_PER_WEBSITE:
-        raise DailyLimitReached()
+    if enforce_daily_cap:
+        used = GoogleRankCheck.objects.filter(
+            website=website, checked_at__gte=now - timedelta(days=1),
+        ).count()
+        if used >= settings.SEARCH_GAP_DAILY_CHECKS_PER_WEBSITE:
+            raise DailyLimitReached()
 
     query = brand_prompt.prompt.text.strip()
     gl, hl = locale(brand_prompt.location)
     apex = site_apex(website.url)
-    found = find_rank(query, apex, max_depth=settings.SEARCH_GAP_MAX_DEPTH, gl=gl, hl=hl)
+    depth_wanted = depth if depth is not None else settings.SEARCH_GAP_MAX_DEPTH
+    found = find_rank(query, apex, max_depth=depth_wanted, gl=gl, hl=hl)
     if found["error"]:
         logger.warning("search_gap: Google check failed for %r: %s", query, found["error"])
 

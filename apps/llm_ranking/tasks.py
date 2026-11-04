@@ -143,6 +143,17 @@ def dispatch_scheduled_audits() -> None:
             # owner carries the schedule from then on.
             cap_user = schedule.created_by or schedule.website.user
 
+            # ── 0. Autopilot asks the engines for this website today ──
+            from apps.autopilot.services.settings import covers
+
+            if "engines" in covers(schedule.website):
+                logger.info(
+                    "Skipping scheduled audit for %s: Autopilot covers it.",
+                    schedule.website.name,
+                )
+                _bump_next_run(schedule, now)
+                continue
+
             # ── 1. Skip if previous run still in flight ──────────────
             prev = schedule.last_audit
             if prev and prev.status in (

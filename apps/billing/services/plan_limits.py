@@ -17,6 +17,11 @@ from core.utils.constants import PLAN_LIMITS, Plan, SubscriptionStatus
 # (see polar_billing.reverify_ended_trial); this is the offline safety net.
 TRIAL_LAPSE_GRACE = timedelta(hours=24)
 
+# Plans a subscription row grants as themselves. Anything else on an
+# access-granting row (a legacy value) resolves through _LEGACY_MAP, else to
+# Pro: honour the payment rather than drop a paying account to Free.
+PAID_PLANS = (Plan.PROMPTS_100, Plan.PROMPTS_200, Plan.PRO, Plan.BUSINESS)
+
 
 def trial_end_for(sub):
     """End of the trial window for a TRIALING row, else None.
@@ -58,7 +63,7 @@ def plan_for_subscription(sub) -> str:
         and not trial_lapsed(sub)
     ):
         plan = _LEGACY_MAP.get(sub.plan, sub.plan)
-        if plan in (Plan.PRO, Plan.BUSINESS):
+        if plan in PAID_PLANS:
             return plan
         return Plan.PRO  # active sub on an unrecognized value: honor payment
     return Plan.FREE
@@ -130,13 +135,14 @@ def is_trialing_subscription(sub) -> bool:
 
 
 def tier_for_subscription(sub) -> str | None:
-    """The tier the row is FOR (pro|business, legacy names normalized),
-    regardless of status — for labels in non-access states such as
-    past_due ("Pro plan · payment issue"). None when there is no row."""
+    """The tier the row is FOR (one of PAID_PLANS, legacy names
+    normalized), regardless of status — for labels in non-access states
+    such as past_due ("Pro plan · payment issue"). None when there is no
+    row."""
     if sub is None:
         return None
     plan = _LEGACY_MAP.get(sub.plan, sub.plan)
-    return plan if plan in (Plan.PRO, Plan.BUSINESS) else Plan.PRO
+    return plan if plan in PAID_PLANS else Plan.PRO
 
 
 def subscription_state(sub) -> dict:
@@ -145,7 +151,7 @@ def subscription_state(sub) -> dict:
     One builder so every surface labels a trial, a paid plan and a lapsed
     row the same way:
       status               raw row status (or None)
-      plan                 resolved ACCESS tier: free|pro|business
+      plan                 resolved ACCESS tier: free, or one of PAID_PLANS
       tier                 subscribed tier regardless of status, or None
       is_paying            paywall gate (see is_paying_subscription)
       is_trialing          live free trial, not yet charged
@@ -230,6 +236,29 @@ def get_limits(user):
     """Return the PLAN_LIMITS dict for a user's effective plan."""
     plan_key = _resolve_plan_key(user)
     return PLAN_LIMITS.get(plan_key, PLAN_LIMITS[Plan.PRO])
+
+
+def plan_allows(user, feature: str) -> bool:
+    """Whether the user's effective plan includes ``feature``: ``autopilot``
+    (the daily run) or ``sms_digest`` (its one text a day). Paywall off,
+    every account is on Business and has both."""
+    return bool(get_limits(user).get(feature))
+
+
+def limits_block(user) -> dict:
+    """The resolved limits of the billing overview, the plan change answers
+    and the session payload (which adds ``seats`` for org members).
+
+    ``tracked_prompts`` is ``{"limit", "used"}`` with -1 for unlimited.
+    """
+    from apps.billing.services import tracked_prompts
+
+    return {
+        "projects": projects_limit_for(user),
+        "tracked_prompts": tracked_prompts.capacity(user),
+        "autopilot": plan_allows(user, "autopilot"),
+        "sms_digest": plan_allows(user, "sms_digest"),
+    }
 
 
 def projects_limit_for(user) -> int:

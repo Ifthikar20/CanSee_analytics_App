@@ -400,6 +400,7 @@ def track(website, user, idea, confirm) -> dict:
     """Make ``idea`` a tracked prompt and ask the configured engines now.
     Raises the contract 7 errors; a refusal from the scan (the plan's prompt
     allowance) keeps its own code and leaves nothing created."""
+    from apps.billing.services import tracked_prompts
     from apps.llm_ranking.services import audit_factory, scan_dispatch
     from apps.prompt_library.models import BrandPrompt, Prompt, PromptSource
     from apps.prompt_library.services._hash import text_hash
@@ -432,6 +433,11 @@ def track(website, user, idea, confirm) -> dict:
 
     keys = dict(zip(answer_window.ENGINE_KEYS, answer_window.ENGINE_ORDER, strict=True))
     text = idea.text
+    # The plan's tracked-prompt cap (403 tracked_prompt_limit); an archived
+    # prompt this restores counts as added.
+    tracked_prompts.check_capacity(
+        website, tracked_prompts.adding_count(website, text_hashes=[text_hash(text)], restore=True),
+    )
     with transaction.atomic():
         prompt, _created = Prompt.objects.get_or_create(
             text_hash=text_hash(text),

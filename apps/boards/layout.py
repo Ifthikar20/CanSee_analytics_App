@@ -20,8 +20,11 @@ if TYPE_CHECKING:
 
 SIZES = ("third", "half", "full")
 
-# Every widget key and its default size, in catalog order (contract 3).
+# Every widget key and its default size, in catalog order (contract 3; Ask AI
+# and Prompt ranking first, wave 4 contract 6).
 WIDGETS = {
+    "prompt-box": "full",
+    "ranking": "full",
     "summary": "full",
     "prompts": "full",
     "countries": "half",
@@ -43,13 +46,12 @@ WIDGETS = {
     "products": "half",
 }
 
-# Served while nothing is saved, and what Reset board restores. Callers
+# Served while nothing is saved, and what Reset board restores: Ask AI and
+# Prompt ranking (wave 4 contract 6). Saved layouts are not migrated. Callers
 # take copies (default_widgets), never these dicts.
 DEFAULT_LAYOUT = (
-    {"key": "summary", "size": "full"},
-    {"key": "prompts", "size": "full"},
-    {"key": "countries", "size": "half"},
-    {"key": "traffic", "size": "half"},
+    {"key": "prompt-box", "size": "full"},
+    {"key": "ranking", "size": "full"},
 )
 
 # An unknown key is quoted back in its error up to this many characters.
