@@ -370,10 +370,11 @@ def _skeleton(bucket_kind: str, now, count: int) -> list[dict]:
 
 def _breakdown_slices(api_token, zone_id, since, now, stats) -> dict:
     """Adaptive breakdowns: pages, devices, OS, browsers, countries.
-    One doc; failure empties all five (KPIs untouched)."""
+    One doc; failure empties all five (KPIs untouched) and says so with
+    ``failed``, so an empty slice never reads as "nothing recorded"."""
     empty = {
         "pages": [], "devices": [], "operating_systems": [],
-        "browsers": [], "countries": [], "flagged": [],
+        "browsers": [], "countries": [], "flagged": [], "failed": True,
     }
     zone = _zone(_post_graphql(
         api_token,
@@ -417,6 +418,7 @@ def _breakdown_slices(api_token, zone_id, since, now, stats) -> dict:
             {"name": row["name"], "pct": row["pct"], "visitors": row["count"]}
             for row in _named_estimates(zone.get("countries"), "clientCountryName", limit=10)
         ],
+        "failed": False,
     }
 
 
@@ -572,6 +574,9 @@ def _build_from_rollups(api_token, zone_id, period, dataset_key, zone_settings, 
             "operating_systems": slices["operating_systems"],
         },
         "countries": slices["countries"],
+        # True when the adaptive query failed: pages and devices are then
+        # empty because they were not loaded, not because none were seen.
+        "breakdowns_failed": slices["failed"],
     }
 
 
@@ -639,6 +644,7 @@ def _build_from_adaptive(api_token, zone_id, period, zone_settings, stats):
             "operating_systems": slices["operating_systems"],
         },
         "countries": slices["countries"],
+        "breakdowns_failed": slices["failed"],
     }
 
 

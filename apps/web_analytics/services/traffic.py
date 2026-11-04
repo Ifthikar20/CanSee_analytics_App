@@ -48,8 +48,13 @@ NOTE_CF_REQUESTS = (
     "Cloudflare counts every request to your site, including bots and crawlers, "
     "so these numbers are not visitors."
 )
+# Countries come from the daily rollups, which are not sampled; only the
+# adaptive page and device breakdowns are.
 NOTE_CF_SAMPLED = (
-    "Cloudflare samples its breakdowns, so countries, pages and devices are estimates."
+    "Cloudflare samples its page and device breakdowns, so those are estimates."
+)
+NOTE_CF_BREAKDOWNS_FAILED = (
+    "Cloudflare's page and device breakdowns could not be loaded just now."
 )
 NOTE_CF_REFERRERS = "Cloudflare does not report referrers on this plan."
 NOTE_CF_BREAKDOWN_HOURS = (
@@ -285,6 +290,7 @@ def _pixel(website, period: str, measured_since: str | None) -> dict:
         ),
         "pages": top_pages((row["url"], row["views"]) for row in pages),
         "devices": _devices(devices.get("devices")),
+        "breakdown_hours": None,
         "notes": _pixel_since_note(measured_since, start.date()),
     }
 
@@ -324,6 +330,7 @@ def _ga4(website, integration, period: str) -> dict | str:
         "referrers": _referrers(bundle.get("sources")),
         "pages": top_pages((row.get("url"), row.get("views")) for row in bundle.get("pages") or []),
         "devices": _devices((bundle.get("devices") or {}).get("devices")),
+        "breakdown_hours": None,
         "notes": [],
     }
 
@@ -336,12 +343,21 @@ def _cloudflare(website, integration, period: str) -> dict | str:
     if not totals["requests"]:
         return "no_data"
     # Pages and devices come from the dashboard bundle's sampled adaptive
-    # breakdowns, which the zone's plan may cap to a shorter window.
+    # breakdowns, which the zone's plan may cap to a shorter window. With
+    # no bundle, or one whose breakdown query failed, they were not
+    # measured: null with a note, never an empty list. A bundle cached
+    # before breakdowns_failed existed reads as not failed.
     bundle = source_resolver.fetch_bundle(website, "cloudflare", period, integration=integration)
-    notes = [NOTE_CF_REQUESTS, NOTE_CF_SAMPLED, NOTE_CF_REFERRERS]
-    hours = ((bundle or {}).get("overview") or {}).get("breakdown_window_hours")
-    if bundle is not None and hours and hours < PERIOD_HOURS[period]:
-        notes.append(NOTE_CF_BREAKDOWN_HOURS.format(hours=hours))
+    measured = bundle is not None and not bundle.get("breakdowns_failed")
+    hours = None
+    if measured:
+        notes = [NOTE_CF_REQUESTS, NOTE_CF_SAMPLED, NOTE_CF_REFERRERS]
+        window = (bundle.get("overview") or {}).get("breakdown_window_hours")
+        if window and window < PERIOD_HOURS[period]:
+            hours = window
+            notes.append(NOTE_CF_BREAKDOWN_HOURS.format(hours=hours))
+    else:
+        notes = [NOTE_CF_REQUESTS, NOTE_CF_BREAKDOWNS_FAILED, NOTE_CF_REFERRERS]
     return {
         "stale": bool(report.get("stale")) or bool(bundle and bundle.get("stale")),
         "measured_since": None,
@@ -364,9 +380,10 @@ def _cloudflare(website, integration, period: str) -> dict | str:
         "countries_unknown": report["unknown"],
         "referrers": None,
         "pages": top_pages(
-            (row.get("url"), row.get("views")) for row in (bundle or {}).get("pages") or []
-        ),
-        "devices": _devices(((bundle or {}).get("devices") or {}).get("devices")),
+            (row.get("url"), row.get("views")) for row in bundle.get("pages") or []
+        ) if measured else None,
+        "devices": _devices((bundle.get("devices") or {}).get("devices")) if measured else None,
+        "breakdown_hours": hours,
         "notes": notes,
     }
 
@@ -398,6 +415,7 @@ def traffic(website, *, period: str, source: str) -> dict:
             "referrers": [],
             "pages": [],
             "devices": [],
+            "breakdown_hours": None,
             "notes": [],
         }
     notes = list(body.pop("notes"))
@@ -439,7 +457,8 @@ def _country_part(website, source: str, integration, period: str, states: dict) 
         "pairs": found["countries"],
         "unknown": found["unknown"],
         "stale": bool(found.get("stale")),
-        "notes": [NOTE_CF_REQUESTS, NOTE_CF_SAMPLED] if source == "cloudflare" else [],
+        # Rollup countries are exact, so only the requests note applies.
+        "notes": [NOTE_CF_REQUESTS] if source == "cloudflare" else [],
     }
 
 

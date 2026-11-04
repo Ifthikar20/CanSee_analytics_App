@@ -68,6 +68,7 @@ LOCAL_APPS = [
     "apps.agent",
     "apps.web_analytics",
     "apps.insights",
+    "apps.boards",
     # Stub app — kept only to satisfy historical lazy FK references
     # from analytics migrations. All tables are managed=False.
     "apps.leads",
