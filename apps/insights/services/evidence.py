@@ -200,10 +200,13 @@ def _read(url: str) -> dict:
 
 def read_page(website, url: str) -> EvidencePage:
     """The stored read of ``url``, or a fresh one when it is older than
-    INSIGHTS_EVIDENCE_TTL_HOURS."""
+    INSIGHTS_EVIDENCE_TTL_HOURS or did not load. A failed read (a timeout,
+    a busy parser) is tried again by the next run instead of standing for
+    a day: kept, it would leave every claim checked meanwhile without that
+    page, stored as not verifiable."""
     fresh_after = timezone.now() - timedelta(hours=int(settings.INSIGHTS_EVIDENCE_TTL_HOURS))
     page = EvidencePage.objects.filter(website=website, url=url[:2000]).first()
-    if page is not None and page.read_at >= fresh_after:
+    if page is not None and page.read_at >= fresh_after and not page.error_code:
         return page
     result = _read(url)
     error = (result.get("error") or {}).get("code") or ""

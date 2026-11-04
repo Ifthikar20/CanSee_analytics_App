@@ -151,17 +151,29 @@ def _google_for(check, brand: dict) -> dict:
 
 
 def _site(website, all_brands: list[dict]) -> dict:
-    """``{brand key: readiness of its latest audited home page or None}``."""
-    from apps.insights.models import SiteAudit
+    """``{brand key: readiness of its latest audited home page or None}``.
+    Audits are read newest first only until every brand has one, and only
+    the pages of those audits are loaded (a project keeps every audit it
+    ever ran)."""
+    from apps.insights.models import SiteAudit, SiteAuditPage
 
     wanted = {b["apex"]: b["key"] for b in all_brands if b["apex"]}
     out = {b["key"]: None for b in all_brands}
-    for audit in (SiteAudit.objects.filter(website=website).order_by("-audited_at")
-                  .prefetch_related("pages")):
+    latest: dict = {}
+    audits = (SiteAudit.objects.filter(website=website).order_by("-audited_at")
+              .only("id", "domain", "home_url", "audited_at"))
+    for audit in audits.iterator(chunk_size=200) if wanted else ():
         key = wanted.get(extract_apex_domain((audit.domain or "").lower()))
-        if key is None or out[key] is not None:
-            continue
-        pages = list(audit.pages.all())
+        if key is not None and key not in latest:
+            latest[key] = audit
+            if len(latest) == len(wanted):
+                break
+    pages_of: dict = {}
+    for page in (SiteAuditPage.objects.filter(audit_id__in=[a.id for a in latest.values()])
+                 .order_by("fetched_at", "id")):
+        pages_of.setdefault(page.audit_id, []).append(page)
+    for key, audit in latest.items():
+        pages = pages_of.get(audit.id, [])
         home = next((p for p in pages if p.url == audit.home_url), pages[0] if pages else None)
         out[key] = {
             "audited_at": runs.iso(audit.audited_at),

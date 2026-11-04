@@ -226,12 +226,15 @@ def archive_product(product: TrackedProduct) -> None:
 
 
 def _latest(products, statuses=(DONE,)) -> dict:
-    """{product id: {(query, engine): newest result}} with these statuses."""
+    """{product id: {(query, engine): newest result}} with these statuses.
+    Only that newest row is read for each (product, question, engine): the
+    results of every check stay in the table, each with its answer text."""
     out: dict = {product.id: {} for product in products}
     rows = (
         ShoppingResult.objects
         .filter(product__in=products, status__in=statuses, checked_at__isnull=False)
-        .order_by("-checked_at")
+        .order_by("product_id", "query", "engine", "-checked_at")
+        .distinct("product_id", "query", "engine")
     )
     for row in rows:
         out[row.product_id].setdefault((row.query, row.engine), row)

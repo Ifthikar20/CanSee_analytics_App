@@ -133,12 +133,17 @@ def _parse(website, params) -> Plan:
     if not isinstance(raw, list) or any(not isinstance(u, str) for u in raw):
         raise _invalid("extra_urls", "Send the extra pages as a list of addresses.")
     extra: list[str] = []
+    seen: set[str] = set()
     for url in (u.strip() for u in raw):
-        if url and context.url_key(url) not in {context.url_key(e) for e in extra}:
-            extra.append(url)
-    if len(extra) > MAX_EXTRA_URLS:
-        raise CanseeException(f"This run is over the limit of {MAX_EXTRA_URLS} pages.",
-                              code="too_many", status_code=400)
+        key = context.url_key(url) if url else ""
+        if not url or key in seen:
+            continue
+        if len(extra) >= MAX_EXTRA_URLS:
+            # Refused at the first page over the limit, without reading the rest.
+            raise CanseeException(f"This run is over the limit of {MAX_EXTRA_URLS} pages.",
+                                  code="too_many", status_code=400)
+        seen.add(key)
+        extra.append(url)
     for url in extra:
         if len(url) > 2000 or not sourcing.same_site(url, website):
             raise _invalid("extra_urls", f"Use pages of {_domain(website)} only.")

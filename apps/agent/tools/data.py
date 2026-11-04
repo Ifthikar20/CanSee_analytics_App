@@ -25,6 +25,13 @@ MAX_SOURCES = 20
 MAX_ARTIFACTS = 20
 KNOWLEDGE_CHUNKS = 5
 KNOWLEDGE_CHARS = 800
+# The offerings mirror of brand_facts: the first entries, their
+# descriptions sharing this room. The bodies are in the context block
+# already (water-filled into its 24,000 characters); repeated whole, 40
+# entries of 4,000 characters made <brand> about 190,000 characters, far
+# past the user turn WRITER_INPUT_USD_MAX prices (contract 12c).
+BRAND_OFFERINGS = 20
+BRAND_OFFERING_CHARS = 6_000
 
 
 def tracked_prompt(website, prompt_id):
@@ -354,10 +361,15 @@ def _knowledge(ctx: ToolContext, query: str) -> tuple[list[dict], str | None]:
 
 def brand_facts(website) -> dict:
     """Website fields plus the active context entries: what writers may
-    rely on. ``offerings`` mirrors the Offerings entries (their first page
-    of the site as ``url``), the shape the ad campaign prompt names."""
+    rely on. ``offerings`` mirrors the first BRAND_OFFERINGS Offerings
+    entries (their first page of the site as ``url``), the shape the ad
+    campaign prompt names, with the descriptions water-filled into
+    BRAND_OFFERING_CHARS."""
     from apps.agent.services.context import agent_context, offerings_for_writers
+    from apps.agent.subagents.sourcing import water_fill
 
+    offerings = offerings_for_writers(website)[:BRAND_OFFERINGS]
+    descriptions = water_fill([o["description"] for o in offerings], BRAND_OFFERING_CHARS)
     competitors = [
         {"name": c.get("name"), "domain": c.get("domain") or ""}
         for c in (website.competitors or []) if isinstance(c, dict) and c.get("name")
@@ -370,7 +382,8 @@ def brand_facts(website) -> dict:
         "topics": [t for t in (website.topics or []) if isinstance(t, str)][:20],
         "competitors": competitors,
         "context": agent_context(website),
-        "offerings": offerings_for_writers(website),
+        "offerings": [{**offering, "description": description}
+                      for offering, description in zip(offerings, descriptions, strict=True)],
     }
 
 

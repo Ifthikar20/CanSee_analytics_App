@@ -65,10 +65,15 @@ def parse(body) -> Robots:
     Consecutive ``user-agent`` lines open one group and the rules after
     them belong to it; rules before any ``user-agent`` are ignored;
     ``sitemap`` lines are global; an empty ``allow`` or ``disallow`` is no
-    rule; lines that are not ``key: value`` are skipped.
+    rule but still a rule line, so a ``user-agent`` after it opens another
+    group (RFC 9309 2.1: ``User-agent: X`` then ``Disallow:`` lets X read
+    everything, whatever the next group says); lines that are not
+    ``key: value`` are skipped.
     """
     robots = Robots()
     current: Group | None = None
+    # Whether the open group has had a rule line (an empty one included).
+    ruled = False
     for raw in _LINE_BREAK.split(decode(body)):
         line = raw.split("#", 1)[0]
         if ":" not in line:
@@ -76,14 +81,17 @@ def parse(body) -> Robots:
         key, value = line.split(":", 1)
         key, value = key.strip().lower(), value.strip()
         if key == "user-agent":
-            if current is None or current.rules:
+            if current is None or ruled:
                 current = Group()
                 robots.groups.append(current)
+                ruled = False
             if value:
                 current.agents.append(value)
         elif key in ("allow", "disallow"):
-            if current is not None and value:
-                current.rules.append((key, value))
+            if current is not None:
+                ruled = True
+                if value:
+                    current.rules.append((key, value))
         elif key == "sitemap" and value:
             robots.sitemaps.append(value)
     return robots

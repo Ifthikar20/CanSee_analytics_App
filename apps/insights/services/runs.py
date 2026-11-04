@@ -823,13 +823,18 @@ def _run_error(run_id, errors: Counter | None) -> tuple[str, str]:
     return code, ITEM_MESSAGES.get(code, ITEM_MESSAGES["internal_error"])
 
 
-def finalize(run_id, *, errors: Counter | None = None):
+def finalize(run_id, *, errors: Counter | None = None, queued_only: bool = False):
     """End a run whose kind returned (or that will never run): units left
     unfinished end ``cancelled`` after Stop, else ``failed``; then the
-    status, the error, the cost and the finish time (contract 1e)."""
+    status, the error, the cost and the finish time (contract 1e).
+    ``queued_only`` (Stop of a queued run) leaves alone a run a worker
+    started in the meantime: that worker sees Stop and finalizes it once its
+    requests have returned, so their cost lands on the run."""
     with transaction.atomic():
         run = InsightRun.objects.select_for_update().filter(id=run_id).first()
         if run is None or run.status in TERMINAL:
+            return run
+        if queued_only and run.status != QUEUED:
             return run
         settled = run.units_done + run.units_failed + run.units_skipped + run.units_cancelled
         left = max(0, run.units_total - settled)
@@ -877,7 +882,8 @@ def cancel_run(run) -> InsightRun:
     InsightRun.objects.filter(id=run.id).update(cancel_requested=True)
     run.refresh_from_db()
     if run.status == QUEUED:
-        finalize(run.id)
+        # Checked again under the row lock: a worker may take it meanwhile.
+        finalize(run.id, queued_only=True)
         run.refresh_from_db()
     return run
 

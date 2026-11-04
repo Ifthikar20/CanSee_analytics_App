@@ -24,6 +24,15 @@ VERDICT_ORDER = {"contradicted": 0, "not_verifiable": 1, "unchecked": 2, "suppor
 MAX_CLAIMS = 200
 MAX_OCCURRENCES = 5
 MAX_CITED_URLS = 20
+# What the payloads read of a claim and its relations: the answer's public
+# id, never its text (a 90-day window holds thousands of claims, each of
+# which would otherwise carry its whole answer).
+CLAIM_FIELDS = (
+    "analysis", "prompt", "evidence_fact", "text", "text_key", "topic", "quote", "verdict",
+    "evidence_kind", "evidence_url", "evidence_quote", "note", "engine", "answered_at",
+    "analysis__result__public_id", "prompt__text", "evidence_fact__subject",
+    "evidence_fact__predicate", "evidence_fact__object", "evidence_fact__source_url",
+)
 
 
 def _claims(result_ids: list) -> list:
@@ -34,7 +43,7 @@ def _claims(result_ids: list) -> list:
                 analysis__result_id__in=result_ids[offset:offset + 1000],
                 analysis__version=aa.ANALYSIS_VERSION,
                 analysis__status=AnswerAnalysis.STATUS_DONE,
-            ).select_related("analysis__result", "evidence_fact", "prompt")
+            ).select_related("analysis__result", "evidence_fact", "prompt").only(*CLAIM_FIELDS)
         )
     return rows
 

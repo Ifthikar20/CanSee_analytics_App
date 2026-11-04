@@ -27,7 +27,6 @@ HTML_TYPES = ("text/html", "application/xhtml+xml")
 
 FOUND, INVALID, MISSING, FAILED = "found", "invalid", "missing", "failed"
 
-_LINK = re.compile(r"\[[^\]\n]*\]\([^)\s]+[^)\n]*\)")
 _LIST_ITEM = re.compile(r"^\s*(?:[-*+]|\d{1,3}[.)])\s+")
 _HTML_START = re.compile(r"^\s*(<!--.*?-->\s*)*<(!doctype\s+html|html)[\s>]", re.I | re.S)
 
@@ -49,6 +48,26 @@ def _is_html(resp, text: str = "") -> bool:
     return resp.content_type in HTML_TYPES or bool(_HTML_START.match(text[:2048]))
 
 
+def has_link(line: str) -> bool:
+    """Whether ``line`` holds a Markdown link ``[text](url)``: text without
+    ``]``, a url whose first character is neither ``)`` nor a space, then
+    ``)``. One pass over the line, because the file is a stranger's: the
+    regular expression this replaces backtracked for minutes on a single
+    unclosed link."""
+    last_paren = line.rfind(")")
+    opened = False
+    for i, char in enumerate(line):
+        if char == "[":
+            opened = True
+        elif char == "]":
+            first = line[i + 2:i + 3]
+            if (opened and line[i + 1:i + 2] == "(" and first and first != ")"
+                    and not first.isspace() and last_paren > i + 2):
+                return True
+            opened = False
+    return False
+
+
 def parse(text: str) -> dict:
     """``{valid, title, sections, links}`` of an llms.txt body."""
     if text.startswith("﻿"):
@@ -61,7 +80,7 @@ def parse(text: str) -> dict:
         "valid": True,
         "title": first[2:].strip()[:MAX_TITLE],
         "sections": sum(1 for line in lines if line.startswith("## ")),
-        "links": sum(1 for line in lines if _LIST_ITEM.match(line) and _LINK.search(line)),
+        "links": sum(1 for line in lines if _LIST_ITEM.match(line) and has_link(line)),
     }
 
 
