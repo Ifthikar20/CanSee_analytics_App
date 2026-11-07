@@ -39,6 +39,19 @@ their `*_SERVICE_URL` variables are unset, Django runs the same code in-process.
 
 ## Local setup
 
+The quickest way: with Docker Desktop running and `Cansee_analytics_UI_APP` cloned next
+to this repo, run
+
+```bash
+scripts/run-local.sh --user you@example.com "Your Name"
+```
+
+It creates a minimal `.env` if there is none, builds and starts Postgres, Redis and the
+API, waits for it, creates the login (asking for a password), and starts the UI at
+http://localhost:5173/login. Later runs need no `--user`. `scripts/run-local.sh stop`
+stops the containers and keeps the data; `--help` lists the other commands. The steps
+below do the same by hand.
+
 1. Create `.env` in the repo root. The dev settings need only a few values:
 
    ```bash
@@ -83,7 +96,9 @@ ruff check .   # the gate CI runs (.github/workflows/ci.yml)
 pytest         # needs Postgres on localhost:5432, user postgres/postgres (config/settings/test.py)
 ```
 
-The pytest suite is kept local-only (`tests/` is gitignored) and is not run in CI.
+The pytest suite lives in https://github.com/Ifthikar20/CanSee_analytics_Test under `backend/`
+(`tests/` is gitignored here); its `scripts/run-backend-tests.sh` mirrors it into this
+checkout and runs it. It is not run in CI.
 
 With `DEBUG=True` the OpenAPI schema is served at `/api/schema/`, with Swagger UI at
 `/api/schema/swagger/` and ReDoc at `/api/schema/redoc/`. They are not served in production.
