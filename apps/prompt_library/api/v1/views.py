@@ -448,9 +448,13 @@ class WebsitePromptCreateView(TenantScopedAPIView):
             template_text = template_text_in or line
             body_for_text = line or template_text
             planned.append((template_text, body_for_text, text_hash(template_text or body_for_text)))
+        # restore=True: an archived row is un-archived below, so it becomes
+        # tracked again and counts against the plan's cap.
         tracked_prompts.check_capacity(
             website,
-            tracked_prompts.adding_count(website, text_hashes=[h for _t, _b, h in planned]),
+            tracked_prompts.adding_count(
+                website, text_hashes=[h for _t, _b, h in planned], restore=True,
+            ),
         )
 
         industry = None
