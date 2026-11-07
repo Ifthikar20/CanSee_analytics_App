@@ -1,4 +1,7 @@
 -r base.txt
 
 gunicorn==23.*
+# ASGI server of the agent service (docker-compose.prod.yml, profile
+# "agent"); same pin as dev.txt and services/*.
+uvicorn==0.32.*
 sentry-sdk[django]==2.*

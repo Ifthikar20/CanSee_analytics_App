@@ -59,11 +59,10 @@ Cansee is a Django + Vue SaaS that measures and improves how a brand appears in 
 │                       EC2 (Ubuntu 22.04, t3.small)                 │
 │                                                                    │
 │   nginx ─┬──> /api/*  ──> web (Django + Gunicorn, ASGI)            │
-│          ├──> /ws/*   ──> web (Channels, Daphne via Gunicorn-asgi) │
 │          └──> /       ──> frontend (Vue 3 build artifact)          │
 │                                                                    │
 │   web ──┬──> Postgres 16  (audits, results, usage, accounts)       │
-│         ├──> Redis        (Channels layer + Celery broker)         │
+│         ├──> Redis        (cache + Celery broker)                  │
 │         └──> Celery worker + beat (queue: ai, default, …)          │
 │                                          │                         │
 │                                          ▼                         │
@@ -71,7 +70,7 @@ Cansee is a Django + Vue SaaS that measures and improves how a brand appears in 
 └────────────────────────────────────────────────────────────────────┘
 ```
 
-7 containers: `db`, `redis`, `web`, `celery` (worker + beat in one), `frontend` (build artifact), `nginx`, `openclaw` (currently disabled, `restart: "no"`).
+8 containers: `db`, `redis`, `web`, `celery` (worker + beat in one), `frontend` (build artifact), `nginx`, and the internal `intelligence` and `sources` services (section 8).
 
 ---
 
@@ -81,7 +80,7 @@ Cansee is a Django + Vue SaaS that measures and improves how a brand appears in 
 - **Layout:** `frontend/src/{api,pages,components,stores,router,layouts,composables,constants}/`.
 - **HTTP client:** `frontend/src/api/client.js` — single axios instance, baseURL `/api/v1`, request interceptor injects Bearer token + `X-Request-ID`, response interceptor unwraps `{success, data}` envelope, performs silent token refresh on 401 with a queued-request retry, and exponentially backs off on 429.
 - **LLM ranking UI:** `frontend/src/pages/LLMRankingPage.vue` (≈196 KB; the heaviest screen). Renders the Brand Overview dashboard: KPI cards (visibility %, citation share, brand rank, closest competitor), provider/time/topic filters, competitor visibility line chart, competitor rankings table, citation share trend, top sources, and a per-model usage breakdown.
-- **Realtime:** WebSockets exist (`apps/analytics/consumers.py` `LiveAnalyticsConsumer`, `apps/notifications/consumers.py` `NotificationConsumer`, ASGI wired in `config/asgi.py`) and are used for visitor analytics and notifications. The **LLM ranking audit pipeline does not stream over WebSocket**; it uses REST polling against `/audits/<aid>/logs/`.
+- **Realtime:** there is no WebSocket layer; `config/asgi.py` serves plain HTTP. The LLM ranking audit pipeline uses REST polling against `/audits/<aid>/logs/`.
 - **No "thinking"/reasoning UI:** the frontend renders final responses, mention extraction, sentiment, and per-call token cost. It does not display extended thinking traces.
 
 ---
@@ -109,7 +108,7 @@ Cansee is a Django + Vue SaaS that measures and improves how a brand appears in 
 
 ### Service layer — `apps/llm_ranking/services/ranking_service.py`
 `LLMRankingService`:
-1. **`generate_prompts()`** — pulls intent-balanced base prompts from `PromptLibrary` (recommendation, comparison, persona, etc.), then asks Claude (`claude-sonnet-4-20250514`, max 1024 tokens) to produce up to 10 natural-language variants.
+1. **Prompts** — an audit runs exactly the prompts the user saved; nothing is generated.
 2. **Per-provider query methods**, each returning `(succeeded, response_text, error_message)`:
    - `_query_claude()` → `anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)`, model `claude-sonnet-4-20250514`, system prompt enforces numbered lists for tool listings (so rank extraction is deterministic).
    - `_query_openai()` → `openai.OpenAI()`, model `gpt-4o-mini`.
@@ -230,7 +229,7 @@ Every LLM call funnels through `record_usage(...)`, which writes one row to `AIT
 ## 7. Deployment topology (recap)
 
 - **Image build:** all containers built on the host from the checked-out source by `docker compose -f docker/docker-compose.prod.yml up -d --build` inside `scripts/deploy.sh`. There is no registry; the host is the build farm.
-- **Resource limits:** db 300 M, redis 150 M, frontend (init) build, openclaw disabled, web 500 M, celery 400 M, nginx 50 M, intelligence 150 M, sources 150 M. Limits total ~1.7 GB on a 2 GB t3.small; a 2 GB swapfile is assumed but NOT provisioned by the script -- `deploy.sh` preflight warns when no swap is active and prints the commands to add one.
+- **Resource limits:** db 300 M, redis 150 M, frontend (init) build, web 500 M, celery 400 M, nginx 50 M, intelligence 150 M, sources 150 M. Limits total ~1.7 GB on a 2 GB t3.small; a 2 GB swapfile is assumed but NOT provisioned by the script -- `deploy.sh` preflight warns when no swap is active and prints the commands to add one.
 - **DB migrations:** `python manage.py migrate --noinput` runs at the end of `scripts/deploy.sh`. The new `apps/llm_ranking/migrations/0009_add_audit_logs.py` will be applied the next time deploy runs **after** it is committed and pushed.
 - **Frontend bundle:** the `frontend` service rebuilds via Vite at deploy time, so the `dist/` you see locally is irrelevant to prod — what matters is the source on the host at deploy time.
 - **No CI/CD deploy:** GitHub Actions only lints. Deploys are operator-driven SSH + script.
@@ -256,7 +255,7 @@ Pattern:
   `celery` can, over the Docker network.
 - **Auth:** static per-service bearer token (`INTELLIGENCE_AUTH_TOKEN`,
   `SOURCES_AUTH_TOKEN`) from `.env.prod`, injected into both the service
-  and its Django callers -- same pattern as `OPENCLAW_AUTH_TOKEN`. A
+  and its Django callers. A
   service with an empty token refuses requests (503) rather than failing
   open.
 - **Stateless services, stateful facades:** quotas (`core.quota`),

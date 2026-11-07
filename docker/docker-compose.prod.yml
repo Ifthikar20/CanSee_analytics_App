@@ -44,32 +44,12 @@ services:
       retries: 5
     restart: unless-stopped
 
+  # Published by the UI repo's CI (.github/workflows/build.yml) on every
+  # push to its main branch; `latest` is whatever UI main last built.
   frontend:
-    image: ghcr.io/ifthikar20/ftb-ui:${UI_VERSION:-latest}
+    image: ghcr.io/ifthikar20/cansee-ui:${UI_VERSION:-latest}
     volumes:
       - frontend_dist:/app/dist
-
-  openclaw:
-    build:
-      context: ../docker/openclaw
-      dockerfile: Dockerfile.openclaw
-    env_file: ../.env.prod
-    environment:
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
-      OPENCLAW_AUTH_TOKEN: ${OPENCLAW_AUTH_TOKEN:-cansee-openclaw-token}
-    volumes:
-      - openclaw_data:/home/user/.openclaw
-    deploy:
-      resources:
-        limits:
-          memory: 400M
-    healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:18789/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 30s
-    restart: "no"  # Disabled: OpenClaw gateway not yet functional, was crash-looping
 
   # Internal services: reachable only on the compose network via their
   # aliases; no published ports, no nginx routes, no public DNS. Auth is
@@ -123,14 +103,14 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+    # Local tag so the agent service runs the same build.
+    image: cansee.local/web:latest
     env_file: ../.env.prod
     environment:
       DJANGO_SETTINGS_MODULE: config.settings.prod
       DB_HOST: db
       REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/1
-      OPENCLAW_GATEWAY_URL: http://openclaw:18789
-      OPENCLAW_AUTH_TOKEN: ${OPENCLAW_AUTH_TOKEN:-cansee-openclaw-token}
     volumes:
       # collectstatic writes here, and nginx serves the same volume at
       # /static. Without this mount the two are different filesystems:
@@ -154,6 +134,50 @@ services:
       timeout: 10s
       retries: 3
       start_period: 15s
+    restart: unless-stopped
+
+  # Agent workspace process: serves /api/v1/agent/live/ (runs, event
+  # streams, browse) from the web image under uvicorn. Off unless the host
+  # enables the profile (COMPOSE_PROFILES=agent in docker/.env); nginx then
+  # answers those routes with 503 agent_unavailable. One worker: runs, the
+  # event buffer and the executor live in this process. A recreate ends
+  # in-flight runs as interrupted. config.agent_asgi is the plain Django
+  # ASGI app that also starts the run heartbeat when uvicorn loads it.
+  agent:
+    profiles: ["agent"]
+    image: cansee.local/web:latest
+    pull_policy: never
+    command: ["uvicorn", "config.agent_asgi:application", "--host", "0.0.0.0", "--port", "8000",
+              "--workers", "1", "--lifespan", "off", "--limit-concurrency", "200",
+              "--timeout-graceful-shutdown", "20", "--no-server-header"]
+    env_file: ../.env.prod
+    environment:
+      DJANGO_SETTINGS_MODULE: config.settings.agent
+      DB_HOST: db
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      MALLOC_ARENA_MAX: "2"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    stop_grace_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     restart: unless-stopped
 
   celery:
@@ -226,4 +250,3 @@ volumes:
   redis_data:
   static_files:
   frontend_dist:
-  openclaw_data:

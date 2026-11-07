@@ -47,7 +47,7 @@ class OnboardingScanView(APIView):
         serializer = OnboardingScanSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         url = serializer.validated_data["url"]
-        payload = run_onboarding_scan(url)
+        payload = run_onboarding_scan(url, user=request.user)
         return Response(to_dict(payload))
 
 

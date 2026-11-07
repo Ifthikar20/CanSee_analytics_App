@@ -133,8 +133,8 @@ class FlowService:
     @staticmethod
     def get_visitor_journeys(*, website_id: str, period: str = "30d", limit: int = 20) -> list:
         """
-        Return per-visitor session journeys with ML-driven intent scoring
-        and data-driven page recommendations.
+        Return per-visitor session journeys with a heuristic intent score
+        and page recommendations from converting sessions.
         """
         start, end = get_date_range(period)
         from collections import Counter
@@ -246,7 +246,7 @@ class FlowService:
             if sess.ended_at and sess.started_at:
                 duration_secs = int((sess.ended_at - sess.started_at).total_seconds())
 
-            # ── ML Intent Scoring ──
+            # ── Intent score (heuristic) ──
             # Score based on: depth, conversion correlation, page importance
             depth_score = min(len(pages) / 5.0, 1.0) * 30  # max 30 pts for depth
             conversion_score = sum(
@@ -299,7 +299,6 @@ class FlowService:
             v = sess.visitor
             journeys.append({
                 "visitor_hash": (v.fingerprint_hash or "")[:12],
-                "company": v.company_name or "",
                 "device": v.device_type or "",
                 "country": v.geo_country or "",
                 "browser": v.browser or "",
@@ -309,7 +308,7 @@ class FlowService:
                 "duration_secs": duration_secs,
                 "source": sess.source or "direct",
                 "started_at": sess.started_at.isoformat() if sess.started_at else None,
-                # ML-computed fields
+                # Heuristic fields
                 "intent_score": intent_score,
                 "intent_cls": intent_cls,
                 "intent_label": intent_label,

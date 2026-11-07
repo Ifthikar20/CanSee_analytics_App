@@ -80,8 +80,9 @@ class AssistantMessage(TimestampMixin):
     )
     role = models.CharField(max_length=16, choices=Role.choices)
     content = models.TextField()
-    # Whether the answer was backed by retrieved tenant facts. Persisted so
-    # a reloaded thread can still show the grounding badge it showed live.
+    # Whether real tenant data (figures, rows or knowledge-base passages)
+    # was in the prompt for this answer. Persisted so a reloaded thread can
+    # still show the grounding badge it showed live.
     grounded = models.BooleanField(default=False)
     # Which model produced this answer. Stored per message, not per
     # conversation: the configured provider can change between turns, and a

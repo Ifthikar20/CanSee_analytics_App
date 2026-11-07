@@ -21,8 +21,9 @@ would poison audit means and the dashboard KPI:
 * ``no_brand_claims``         — the answer never talks about the brand
                                 (that is a Visibility problem, not an
                                 alignment one);
-* ``embeddings_unavailable``  — hash-fallback vectors are non-semantic,
-                                so similarity would be noise.
+* ``embeddings_unavailable``  — no embedding could be produced (no key,
+                                a spent AI allowance, an API error), or
+                                the brand input has no model vectors yet.
 
 Contradiction detection deliberately stays with the Brand Security
 BS-FACT-001 judge (``services/security/detectors.py``); this module only
@@ -34,11 +35,15 @@ import logging
 import re
 from dataclasses import dataclass, field
 
+from django.db.models import Q
+
 from apps.brand_vault.models import BrandFact, FactStatus
-from apps.brand_vault.services.security.agents._helpers import brand_terms
+from apps.brand_vault.services.security.brand_terms import brand_terms
 from apps.brand_vault.services.security.detectors import iter_units
 from apps.rag.services.embedder import (
-    FALLBACK_MODEL,
+    OPENAI_DIM,
+    UNEMBEDDED_MODEL_NAMES,
+    EmbeddingUnavailable,
     cosine_similarity,
     embed_texts,
 )
@@ -47,9 +52,9 @@ logger = logging.getLogger("apps")
 
 ALIGNMENT_VERSION = "v1"
 
-# Reuse the only production-tuned cosine cutoff in the codebase
-# (accuracy_guard.SIMILARITY_THRESHOLD). Separate constants so the two
-# directions can diverge later without archaeology.
+# Cosine cutoff carried over from the retired Content Studio accuracy
+# guard. Separate constants so the two directions can diverge later
+# without archaeology.
 SUPPORT_THRESHOLD = 0.55
 COVERAGE_THRESHOLD = 0.55
 # Minimum cosine(fact, prompt) for a fact to count as "expected in this
@@ -142,25 +147,60 @@ def _fact_text(fact) -> str:
     return f"{fact.subject} {fact.predicate} {fact.object}"[:MAX_FACT_TEXT]
 
 
-def _load_facts(website) -> list[tuple[BrandFact, list[float]]]:
-    rows = (
-        BrandFact.objects
-        .filter(
-            website=website,
-            status__in=(FactStatus.APPROVED, FactStatus.AUTO),
-            version_to__isnull=True,
+def _current_facts(website):
+    from apps.rag.models import KnowledgeSource
+
+    return BrandFact.objects.filter(
+        website=website,
+        status__in=(FactStatus.APPROVED, FactStatus.AUTO),
+        version_to__isnull=True,
+    ).exclude(
+        # Auto-approved facts that older builds minted from mirrored AI
+        # answers or audit context were never reviewed and are not the
+        # brand's word. Approved facts were reviewed, so they stay.
+        Q(status=FactStatus.AUTO)
+        & Q(source_chunk__isnull=False)
+        & ~Q(
+            source_chunk__source__source_app=KnowledgeSource.SOURCE_APP_BRAND_INPUT,
+            source_chunk__source__kind__in=KnowledgeSource.BRAND_INPUT_KINDS,
         )
+    )
+
+
+def _load_facts(website) -> list[tuple[BrandFact, list[float]]]:
+    """Current facts with a model vector. Facts without one (embeddings
+    were unavailable) or with a legacy word-hash vector are left out."""
+    rows = (
+        _current_facts(website)
         .only("id", "subject", "predicate", "object", "embedding")[:MAX_FACTS]
     )
-    return [(f, f.embedding) for f in rows if f.embedding]
+    return [
+        (f, f.embedding) for f in rows
+        if f.embedding and len(f.embedding) == OPENAI_DIM
+    ]
 
 
-def _load_chunks(user, website) -> list[tuple[str, list[float]]]:
-    from apps.rag.models import KnowledgeChunk
+def _chunks(website):
+    """The website's Brand Input chunks.
 
+    The knowledge base also mirrors AI answers, findings and audit
+    context; comparing an answer against those would let AI output
+    "support" AI output, so only the brand's own material counts.
+    """
+    from apps.rag.models import KnowledgeChunk, KnowledgeSource
+
+    return KnowledgeChunk.objects.filter(
+        website=website,
+        source__source_app=KnowledgeSource.SOURCE_APP_BRAND_INPUT,
+        source__kind__in=KnowledgeSource.BRAND_INPUT_KINDS,
+    )
+
+
+def _load_chunks(website) -> list[tuple[str, list[float]]]:
+    """Brand Input chunks with a model vector; pending chunks are left out."""
     rows = (
-        KnowledgeChunk.objects
-        .filter(user=user, website=website)
+        _chunks(website)
+        .exclude(embedding_model__in=UNEMBEDDED_MODEL_NAMES)
         .only("id", "embedding")[:MAX_CHUNKS]
     )
     return [(str(c.id), c.embedding) for c in rows if c.embedding]
@@ -170,8 +210,7 @@ def _best_match(vec, fact_vecs, chunk_vecs):
     """Best cosine over all dimension-compatible comparators.
 
     Returns ``(similarity, kind, ref_id)``. Length mismatches are skipped
-    (retriever precedent) — this also neutralizes the 32/256/1536
-    cross-fallback incomparability quirk.
+    (retriever precedent).
     """
     best = (0.0, "", "")
     for fact, fvec in fact_vecs:
@@ -193,21 +232,21 @@ def compute_alignment(result) -> AlignmentResult:
     """Benchmark one stored response against the brand knowledge base."""
     audit = result.audit
     website = audit.website
-    # Two distinct users here. Brand Input chunks are scoped to the
-    # website owner, which is who ingested them — audit.created_by can
-    # differ (e.g. seeded audits). SPEND, however, belongs to whoever
-    # caused the work: the audit's creator, falling back to the owner
-    # for system-generated audits.
-    kb_user = getattr(website, "user", None) or audit.created_by
+    # Spend belongs to whoever caused the work: the audit's creator,
+    # falling back to the owner for system-generated audits.
     spend_user = audit.created_by or getattr(website, "user", None)
     actor = "user" if audit.created_by else "system"
 
     facts = _load_facts(website)
-    chunks = _load_chunks(kb_user, website)
+    chunks = _load_chunks(website)
     if not facts and not chunks:
+        # Brand input that exists but has no vectors yet cannot be
+        # compared; that is not the same as having no brand input.
+        if _current_facts(website).exists() or _chunks(website).exists():
+            return _skip(STATUS_EMBEDDINGS_UNAVAILABLE)
         return _skip(STATUS_NO_BRAND_INPUT)
 
-    terms = brand_terms(website, {})
+    terms = brand_terms(website)
     brand_name = (audit.business_name or "").strip()
     if brand_name and not any(t.lower() == brand_name.lower() for t in terms):
         terms = [brand_name] + terms
@@ -219,23 +258,21 @@ def compute_alignment(result) -> AlignmentResult:
 
     all_unit_texts = [u for u, _ in units]
     prompt_text = (result.prompt or "")[:2000]
-    vectors, model, _dim = embed_texts(
-        [prompt_text] + all_unit_texts,
-        user=spend_user,
-        website=website,
-        metadata={
-            "role": "alignment",
-            "actor": actor,
-            "audit_id": str(result.audit_id),
-            "result_id": str(result.id),
-        },
-    )
-    if model == FALLBACK_MODEL:
-        # Hash vectors are deliberately non-semantic; a similarity score
-        # computed from them is noise dressed as a number.
-        return _skip(STATUS_EMBEDDINGS_UNAVAILABLE)
-    if len(vectors) != len(all_unit_texts) + 1:
-        logger.warning("alignment embed count mismatch for result %s", result.id)
+    try:
+        vectors, model, _dim = embed_texts(
+            [prompt_text] + all_unit_texts,
+            user=spend_user,
+            website=website,
+            metadata={
+                "role": "alignment",
+                "actor": actor,
+                "audit_id": str(result.audit_id),
+                "result_id": str(result.id),
+            },
+        )
+    except EmbeddingUnavailable as exc:
+        # No vectors means no similarity; a score would be invented.
+        logger.info("alignment skipped for result %s: %s", result.id, exc.reason)
         return _skip(STATUS_EMBEDDINGS_UNAVAILABLE)
 
     prompt_vec = vectors[0]

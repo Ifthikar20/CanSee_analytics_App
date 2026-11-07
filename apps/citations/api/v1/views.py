@@ -426,7 +426,10 @@ class SourceScanDetailView(TenantScopedAPIView):
         scan = self.get_tenant_object(
             SourceScan.objects.filter(website=website), pk=scan_id
         )
-        from apps.citations.services.source_scan import derive_opportunities
+        from apps.citations.services.source_scan import (
+            derive_opportunities,
+            is_summary_derived,
+        )
 
         payload = _scan_summary(scan)
         # Key is "rows", not "results": the EnvelopeRenderer treats any
@@ -446,6 +449,9 @@ class SourceScanDetailView(TenantScopedAPIView):
                 "relevance_note": r.relevance_note,
                 "fetch_status": r.fetch_status,
                 "content_kind": r.content_kind,
+                # True when the page could not be read and its brands were
+                # taken from a Perplexity summary instead.
+                "summary_derived": is_summary_derived(r),
                 "word_count": r.word_count,
                 "brands": r.brands,
                 "analysis_error": r.analysis_error,

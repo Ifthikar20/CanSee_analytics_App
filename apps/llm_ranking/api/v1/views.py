@@ -15,7 +15,12 @@ from apps.llm_ranking.api.v1.serializers import (
     RunAuditSerializer,
 )
 from apps.llm_ranking.models import LLMRankingAudit, LLMRankingResult, LLMRankingSchedule
-from apps.llm_ranking.services.audit_factory import create_audit
+from apps.llm_ranking.services.audit_factory import (
+    NoLLMProviderConfigured,
+    configured_providers,
+    create_audit,
+    missing_provider_keys,
+)
 from core.views import TenantScopedAPIView, TenantScopedListAPIView
 
 logger = logging.getLogger("apps")
@@ -43,7 +48,6 @@ class LLMRankingAuditListView(TenantScopedListAPIView):
         serializer = RunAuditSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
-
 
         # Enforce the monthly AI allowance before queuing more work. The
         # cap derives from the plan price (65% of it) via effective_ai_cap;
@@ -78,11 +82,6 @@ class LLMRankingAuditListView(TenantScopedListAPIView):
         if not business_name:
             return Response(
                 {"error": "business_name is required (website has no name set)."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        if not industry:
-            return Response(
-                {"error": "industry is required (set one on the website or pass it in the request)."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -128,27 +127,29 @@ class LLMRankingAuditListView(TenantScopedListAPIView):
                 )
 
         # prompt_source is derived, not client-chosen: custom prompts are
-        # "vault", the saved Prompts-page list is "library". The request
-        # field is still accepted (and ignored) so older clients don't break.
+        # "vault", the saved Prompts-page list is "library".
         prompt_source = "vault" if data["custom_prompts"] else "library"
 
         # Provider filtering (implemented AND configured; stub providers in
         # PROVIDER_CHOICES dropped) happens inside create_audit so every
         # entry point applies the same rules.
-        audit = create_audit(
-            website=website,
-            user=request.user,
-            prompts=prompts,
-            providers=data.get("providers"),
-            business_name=business_name,
-            business_description=business_description,
-            industry=industry,
-            location=data.get("location", ""),
-            region=data.get("region", "global"),
-            keywords=keywords,
-            context_urls=data.get("context_urls", []),
-            prompt_source=prompt_source,
-        )
+        try:
+            audit = create_audit(
+                website=website,
+                user=request.user,
+                prompts=prompts,
+                providers=data.get("providers"),
+                business_name=business_name,
+                business_description=business_description,
+                industry=industry,
+                location=data.get("location", ""),
+                region=data.get("region", "global"),
+                keywords=keywords,
+                context_urls=data.get("context_urls", []),
+                prompt_source=prompt_source,
+            )
+        except NoLLMProviderConfigured as exc:
+            return Response(exc.response_body(), status=status.HTTP_409_CONFLICT)
 
         # Dispatch through the canonical scan dispatcher (Celery chord in
         # production). Under eager Celery (dev/tests) nothing is queued:
@@ -218,17 +219,14 @@ class LLMRankingPreflightView(TenantScopedAPIView):
         if prompt_count <= 0 or prompt_count > 50:
             return Response({"error": "prompt_count must be 1-50"}, status=400)
 
-        requested = request.data.get("providers") or list(PROVIDERS.keys())
+        requested = request.data.get("providers") or None
         # Filter to implemented + configured (mirrors AuditListView behaviour)
-        provider_keys = []
-        for key in requested:
-            if key not in PROVIDERS:
-                continue
-            cls = PROVIDERS[key]
-            if getattr(settings, cls.api_key_setting, ""):
-                provider_keys.append(key)
+        provider_keys = configured_providers(requested)
         if not provider_keys:
-            return Response({"error": "no providers configured"}, status=400)
+            return Response(
+                NoLLMProviderConfigured(missing_provider_keys(requested)).response_body(),
+                status=status.HTTP_409_CONFLICT,
+            )
 
         # Try to compute from historical AITokenUsage averages for this user;
         # fall back to defaults when there's nothing to learn from.
@@ -408,12 +406,21 @@ class LLMRankingAuditRunView(TenantScopedAPIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        requested = audit.providers_queried or None
+        if not configured_providers(requested):
+            return Response(
+                NoLLMProviderConfigured(missing_provider_keys(requested)).response_body(),
+                status=status.HTTP_409_CONFLICT,
+            )
+
         # Reset to pending and clear old results for re-runs
         if audit.status == LLMRankingAudit.STATUS_FAILED:
+            from apps.llm_ranking.services.ranking_service import SCORE_FIELDS
+
             audit.results.all().delete()
             audit.status = LLMRankingAudit.STATUS_PENDING
-            audit.overall_score = 0
-            audit.mention_rate = 0.0
+            for field in SCORE_FIELDS:
+                setattr(audit, field, None)
             audit.queries_completed = 0
             audit.total_queries = 0
             audit.error_message = ""
@@ -619,7 +626,7 @@ class LLMRankingPromptResultsView(TenantScopedAPIView):
         for idx, (prompt_text, group) in enumerate(prompt_groups.items(), start=1):
             succeeded = group["succeeded_count"]
             mentioned = group["mentioned_count"]
-            visibility = round(mentioned / succeeded * 100, 1) if succeeded else 0.0
+            visibility = round(mentioned / succeeded * 100, 1) if succeeded else None
 
             # Determine status
             expected = 1 if filter_provider else len(audit.providers_queried or [])
@@ -693,9 +700,10 @@ class LLMRankingProviderDetailView(TenantScopedAPIView):
         # Aggregate metrics
         succeeded = [r for r in results if r.query_succeeded]
         mentioned = [r for r in succeeded if r.is_mentioned]
-        mention_rate = round(len(mentioned) / len(succeeded) * 100, 1) if succeeded else 0.0
+        mention_rate = round(len(mentioned) / len(succeeded) * 100, 1) if succeeded else None
 
         ci_low, ci_high = wilson_ci(len(mentioned), len(succeeded))
+        confidences = [r.confidence_score for r in succeeded if r.confidence_score is not None]
 
         ranks = [r.mention_rank for r in mentioned if r.mention_rank is not None]
         avg_rank = round(sum(ranks) / len(ranks), 1) if ranks else None
@@ -771,16 +779,18 @@ class LLMRankingProviderDetailView(TenantScopedAPIView):
                 "failed": len(results) - len(succeeded),
                 "mentioned": len(mentioned),
                 "mention_rate": mention_rate,
-                "mention_rate_ci": [round(ci_low * 100, 1), round(ci_high * 100, 1)],
+                "mention_rate_ci": (
+                    [round(ci_low * 100, 1), round(ci_high * 100, 1)] if succeeded else None
+                ),
                 "avg_rank": avg_rank,
                 "sentiments": sentiments,
-                "avg_confidence": round(
-                    sum(r.confidence_score for r in succeeded) / len(succeeded), 1
-                ) if succeeded else 0,
+                "avg_confidence": (
+                    round(sum(confidences) / len(confidences), 1) if confidences else None
+                ),
                 "linked_count": sum(1 for r in mentioned if r.is_linked),
                 "avg_response_length": round(
                     sum(len(r.response_text) for r in succeeded) / len(succeeded)
-                ) if succeeded else 0,
+                ) if succeeded else None,
             },
             "top_competitors": top_competitors,
             "prompts": prompt_details,
@@ -1049,7 +1059,7 @@ class LLMRankingHistoryView(TenantScopedAPIView):
         for aid in audit_ids:
             total = per_audit_total_brand_mentions.get(aid, 0)
             our = per_audit_self_brand_mentions.get(aid, 0)
-            share = round(our / total * 100, 1) if total else 0.0
+            share = round(our / total * 100, 1) if total else None
             for audit in audits:
                 if audit["id"] == aid:
                     audit["citation_share"] = share
@@ -1062,7 +1072,7 @@ class LLMRankingHistoryView(TenantScopedAPIView):
             comps_for_audit = comp_list_by_audit.get(audit["id"], [])
             comps_for_audit.sort(key=lambda c: c["mention_count"], reverse=True)
             audit["competitors"] = comps_for_audit
-            audit.setdefault("citation_share", 0.0)
+            audit.setdefault("citation_share", None)
             audit.setdefault("citation_total", 0)
             audit.setdefault("citation_self", 0)
 
@@ -1095,9 +1105,9 @@ class LLMRankingProviderBreakdownView(TenantScopedAPIView):
                     "total_prompts": 0,
                     "succeeded": 0,
                     "mentioned": 0,
-                    "mention_rate": 0.0,
-                    "mention_rate_ci_lower": 0.0,
-                    "mention_rate_ci_upper": 0.0,
+                    "mention_rate": None,
+                    "mention_rate_ci_lower": None,
+                    "mention_rate_ci_upper": None,
                     "avg_rank": None,
                     "sentiments": {"positive": 0, "neutral": 0, "negative": 0},
                 }
@@ -1259,9 +1269,16 @@ class LLMRankingScheduleRunNowView(TenantScopedAPIView):
                 status=status.HTTP_409_CONFLICT,
             )
 
-        # Generate the prompts and create the audit row inline so the
-        # caller gets the audit_id back to poll.
-        from apps.llm_ranking.providers import PROVIDERS as PROV_REGISTRY
+        requested = schedule.providers or None
+        selected = configured_providers(requested)
+        if not selected:
+            return Response(
+                NoLLMProviderConfigured(missing_provider_keys(requested)).response_body(),
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        # Create the audit row inline so the caller gets the audit_id back
+        # to poll.
         from apps.llm_ranking.services.audit_runner import (
             NoSavedPromptsError,
             gather_saved_prompts,
@@ -1287,13 +1304,6 @@ class LLMRankingScheduleRunNowView(TenantScopedAPIView):
         from apps.billing.services.org_entitlements import check_prompt_allowance
 
         check_prompt_allowance(runner, len(prompts))
-
-        requested = schedule.providers or list(PROV_REGISTRY.keys())
-        selected = [
-            k for k in requested
-            if k in PROV_REGISTRY
-            and getattr(settings, PROV_REGISTRY[k].api_key_setting, "")
-        ] or ["claude"]
 
         audit = LLMRankingAudit.objects.create(
             website=website,
@@ -1331,8 +1341,8 @@ class LLMRankingScheduleRunNowView(TenantScopedAPIView):
 class ModelVariantsView(TenantScopedAPIView):
     """GET — list every selectable model variant grouped by provider.
 
-    Each variant is a `"<provider>:<model_id>"` choice the Model Test
-    picker can send back as a member of `models`. The response also
+    Each variant is a `"<provider>:<model_id>"` choice a saved prompt's
+    model selection (``BrandPrompt.model_variants``) can hold. The response also
     flags whether the underlying provider's API key is configured, so
     the UI can grey-out unavailable variants without a second call.
     """
@@ -1351,13 +1361,11 @@ class ModelVariantsView(TenantScopedAPIView):
 class DashboardSummaryView(TenantScopedAPIView):
     """Cross-feature rollup that powers the LLM Dashboard hero.
 
-    Aggregates real activity across the three sub-tools instead of
-    boilerplate audit data: prompts (BrandPrompt / Prompt), model
-    visibility (LLMRankingResult scoped to this website via audit),
-    Search Insights (SourceScan + derived opportunities), and AI
-    spend (AITokenUsage for the caller). Every section fails soft;
-    empty rollups return zeros rather than raising so the dashboard
-    is never blocked by one missing dependency.
+    Aggregates real activity across the three sub-tools: prompts
+    (BrandPrompt / Prompt), model visibility (LLMRankingResult scoped to
+    this website via audit), Search Insights (SourceScan + derived
+    opportunities), and AI spend (AITokenUsage for the caller). A rate
+    with nothing behind it is null, not 0.
     """
 
     def get(self, request, website_id):
@@ -1397,7 +1405,9 @@ def _prompt_coverage(website, since):
     return {
         "total_prompts": total_prompts,
         "measured_last_7d": measured_recent,
-        "avg_effectiveness": round(float(eff_agg["avg"] or 0), 2),
+        "avg_effectiveness": (
+            round(float(eff_agg["avg"]), 2) if eff_agg["avg"] is not None else None
+        ),
         "unique_prompt_ids_scanned": len(set(prompt_ids)),
     }
 
@@ -1493,7 +1503,7 @@ def _search_insights_summary(website, since):
         "total_scans": scans.count(),
         "scans_last_7d": total_recent,
         "own_brand_present_rate": (
-            round(own_present_count / total_recent, 2) if total_recent else 0.0
+            round(own_present_count / total_recent, 2) if total_recent else None
         ),
         "top_brands": top_brands,
     }
@@ -1645,13 +1655,6 @@ def _ai_spend_30d(user, since):
         "calls": agg["calls"] or 0,
         "top_provider": top_provider["provider"] if top_provider else None,
     }
-
-
-# Model Test + GEO endpoints removed 2026-07 — the multi-provider
-# probe use case moves to the Prompts page auto-measurement flow.
-# See git history if you need to resurrect the run_model_test task,
-# ModelTestRunView, ModelTestHistoryView, ModelTestStatusView,
-# GeoRewriteView, or GeoJudgeView.
 
 
 class VisibilityOverviewView(TenantScopedAPIView):

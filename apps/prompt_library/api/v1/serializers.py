@@ -11,7 +11,6 @@ from apps.prompt_library.models import (
     PromptSampleRun,
     PromptSchedule,
     PromptVariableSet,
-    TestEnvironment,
 )
 
 
@@ -25,6 +24,11 @@ class PromptSerializer(serializers.ModelSerializer):
     industry_slug = serializers.CharField(source="industry.slug", read_only=True)
     source_label = serializers.CharField(source="get_source_display", read_only=True)
     style_label = serializers.CharField(source="get_style_display", read_only=True)
+    # No demand signal is collected. The stored column ranks prompts by
+    # source type, recency and paraphrase count, so it is exposed as
+    # ``source_score``; ``demand_score`` stays in the payload as null.
+    demand_score = serializers.SerializerMethodField()
+    source_score = serializers.FloatField(source="demand_score", read_only=True)
 
     class Meta:
         model = Prompt
@@ -44,6 +48,7 @@ class PromptSerializer(serializers.ModelSerializer):
             "style",
             "style_label",
             "demand_score",
+            "source_score",
             "effectiveness_score",
             "effectiveness_components",
             "runs_count",
@@ -52,7 +57,6 @@ class PromptSerializer(serializers.ModelSerializer):
             "created_at",
         )
         read_only_fields = (
-            "demand_score",
             "effectiveness_score",
             "effectiveness_components",
             "runs_count",
@@ -63,6 +67,9 @@ class PromptSerializer(serializers.ModelSerializer):
             "style_label",
             "template_variables",
         )
+
+    def get_demand_score(self, obj) -> None:
+        return None
 
 
 class PromptCreateSerializer(serializers.Serializer):
@@ -87,6 +94,9 @@ class PromptCreateSerializer(serializers.Serializer):
     models = serializers.ListField(
         child=serializers.CharField(), required=False, default=list,
     )
+    # False tracks the prompts without scanning them now (Ask AI's Track
+    # already has its answers; Autopilot asks it from its next run).
+    scan = serializers.BooleanField(required=False, default=True)
 
     def validate_models(self, value):
         from apps.llm_ranking.providers import list_model_variants
@@ -234,39 +244,6 @@ class GenerateRelatedRequestSerializer(serializers.Serializer):
         if len(cleaned) < 3:
             raise serializers.ValidationError("Prompt is too short.")
         return cleaned
-
-
-class TestEnvironmentSerializer(serializers.ModelSerializer):
-    prompt_ids = serializers.SerializerMethodField()
-    prompt_count = serializers.SerializerMethodField()
-
-    class Meta:
-        model = TestEnvironment
-        fields = (
-            "id", "website", "name", "created_by",
-            "prompt_ids", "prompt_count",
-            "created_at", "updated_at",
-        )
-        read_only_fields = (
-            "id", "website", "created_by", "created_at", "updated_at",
-            "prompt_ids", "prompt_count",
-        )
-
-    def get_prompt_ids(self, obj) -> list[str]:
-        # IDs only on list/detail. Full BrandPrompt rows are fetched
-        # separately when the UI opens the env so the list payload stays small.
-        return [str(p.id) for p in obj.prompts.all()]
-
-    def get_prompt_count(self, obj) -> int:
-        return obj.prompts.count()
-
-    def validate_name(self, value: str) -> str:
-        value = (value or "").strip()
-        if not value:
-            raise serializers.ValidationError("Name is required.")
-        if len(value) > 120:
-            raise serializers.ValidationError("Name must be 120 characters or fewer.")
-        return value
 
 
 class PromptScheduleSerializer(serializers.ModelSerializer):

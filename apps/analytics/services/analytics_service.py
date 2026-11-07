@@ -17,24 +17,18 @@ class AnalyticsService:
         duration = end - start
         prev_start = start - duration
 
-        # One scan over Visitor covering both periods, three numbers out.
-        # Previously this was three separate COUNTs across two adjacent date
-        # windows. Widening the base filter to span both lets Postgres do it
-        # in a single pass. Both ranges include `start`, exactly as the
-        # separate queries did, so a visitor last seen at the boundary is
-        # still counted in both periods.
+        # One scan over Visitor covering both periods, two numbers out.
+        # Widening the base filter to span both windows lets Postgres count
+        # them in a single pass. Both ranges include `start`, so a visitor
+        # last seen at the boundary is counted in both periods.
         vc = Visitor.objects.filter(
             website_id=website_id,
             last_seen__range=(prev_start, end),
         ).aggregate(
             total=Count("id", filter=Q(last_seen__range=(start, end))),
-            hot=Count("id", filter=Q(
-                last_seen__range=(start, end), lead_score__gte=70,
-            )),
             prev=Count("id", filter=Q(last_seen__range=(prev_start, start))),
         )
         total_visitors = vc["total"]
-        hot_leads = vc["hot"]
         prev_visitors = vc["prev"]
 
         # Separate table, so this stays its own query.
@@ -44,16 +38,19 @@ class AnalyticsService:
             event_type="pageview",
         ).count()
 
+        # No visitors in the previous window leaves nothing to compare
+        # against, so growth is unknown (None), not 0%.
         growth_pct = (
-            ((total_visitors - prev_visitors) / prev_visitors * 100) if prev_visitors > 0 else 0
+            round((total_visitors - prev_visitors) / prev_visitors * 100, 1)
+            if prev_visitors > 0
+            else None
         )
 
         return {
             "period": period,
             "total_visitors": total_visitors,
             "total_pageviews": total_pageviews,
-            "hot_leads": hot_leads,
-            "visitor_growth_pct": round(growth_pct, 1),
+            "visitor_growth_pct": growth_pct,
         }
 
     @staticmethod

@@ -23,7 +23,6 @@ from apps.citations.services.domain_classifier import (
 from apps.citations.services.extractors import (
     CitationCandidate,
     GeminiGroundingExtractor,
-    LLMAssistedExtractor,
     PerplexityNativeExtractor,
     RegexExtractor,
 )
@@ -43,10 +42,8 @@ def _strategy_for_provider(provider: str) -> list:
         return [PerplexityNativeExtractor(), RegexExtractor()]
     if p == "gemini":
         return [GeminiGroundingExtractor(), RegexExtractor()]
-    # Anthropic / OpenAI / others: regex first, optional LLM-assisted.
-    # LLMAssistedExtractor is disabled by default (no-op) so the strategy
-    # collapses to regex unless callers flip the flag explicitly.
-    return [RegexExtractor(), LLMAssistedExtractor(enabled=False)]
+    # Every other provider: URLs the model wrote into the answer.
+    return [RegexExtractor()]
 
 
 def _dedupe_candidates(candidates: Iterable[CitationCandidate]) -> list[CitationCandidate]:

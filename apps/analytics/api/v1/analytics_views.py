@@ -143,9 +143,9 @@ class VisitorListView(TenantScopedAPIView):
             .annotate(event_count=Count("events"))
             .order_by("-last_seen")[:100]
             .values(
-                "id", "fingerprint_hash", "company_name", "geo_country",
+                "id", "fingerprint_hash", "geo_country",
                 "geo_city", "device_type", "browser", "os",
-                "first_seen", "last_seen", "visit_count", "lead_score", "event_count",
+                "first_seen", "last_seen", "visit_count", "event_count",
             )
         )
         return Response(list(visitors))

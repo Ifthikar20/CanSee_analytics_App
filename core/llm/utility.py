@@ -23,6 +23,17 @@ from __future__ import annotations
 
 from core.llm.base import LLMProvider, ProviderResult
 
+# What an unset LLM_CLAUDE_MODEL resolves to; matches the audit-side
+# ClaudeProvider.DEFAULT_MODEL (the cheapest current Claude model).
+DEFAULT_CLAUDE_MODEL = "claude-haiku-4-5"
+
+
+def configured_claude_model() -> str:
+    """The deployment's configured Claude model (settings.LLM_CLAUDE_MODEL)."""
+    from django.conf import settings
+
+    return getattr(settings, "LLM_CLAUDE_MODEL", "") or DEFAULT_CLAUDE_MODEL
+
 
 class ClaudeUtility(LLMProvider):
     name = "claude"
@@ -32,12 +43,12 @@ class ClaudeUtility(LLMProvider):
     rpm = 40
     burst = 15
 
-    def __init__(self, *, model: str, max_tokens: int = 1024,
-                 temperature: float | None = None):
+    # No sampling parameters: API version 2026-10-21 (anthropic SDK 2.x)
+    # rejects temperature/top_p/top_k on every model.
+    def __init__(self, *, model: str, max_tokens: int = 1024):
         super().__init__()
         self.model = model
         self.max_tokens = max_tokens
-        self.temperature = temperature
 
     def _call(self, *, prompt: str, system_prompt: str,
               region: str = "") -> ProviderResult:
@@ -49,8 +60,6 @@ class ClaudeUtility(LLMProvider):
             max_tokens=self.max_tokens,
             messages=[{"role": "user", "content": prompt}],
         )
-        if self.temperature is not None:
-            kwargs["temperature"] = self.temperature
         if system_prompt:
             kwargs["system"] = system_prompt
         resp = client.messages.create(**kwargs)

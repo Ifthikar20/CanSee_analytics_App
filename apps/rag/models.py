@@ -1,10 +1,10 @@
 """
-Per-user knowledge base for retrieval-augmented prompt construction.
+Per-website knowledge base for retrieval-augmented prompt construction.
 
 A KnowledgeSource is one URL the user (or their automated crawler) added
-to the knowledge base for a website. KnowledgeChunks are the embedded
-text segments extracted from that source — they are what the retriever
-searches at query time.
+to the knowledge base for a website. KnowledgeChunks are the text
+segments extracted from that source; the embedded ones are what the
+retriever searches at query time.
 
 Design notes:
 - Embeddings are stored as JSON arrays. Postgres JSONB handles this
@@ -45,6 +45,11 @@ class KnowledgeSource(TimestampMixin):
         (KIND_OTHER, "Other"),
         (KIND_AUDIT_CONTEXT, "Audit context"),
     ]
+    # Kinds that hold the brand's own material. Audit context is built by
+    # the audit pipeline (partly by an LLM), so it is not the brand's word.
+    BRAND_INPUT_KINDS = (
+        KIND_HOMEPAGE, KIND_BLOG, KIND_PRODUCT, KIND_DOCS, KIND_REVIEW, KIND_OTHER,
+    )
 
     STATUS_PENDING = "pending"
     STATUS_INGESTING = "ingesting"
@@ -66,6 +71,8 @@ class KnowledgeSource(TimestampMixin):
     SOURCE_APP_BRAND_INPUT = "brand_input"
     SOURCE_APP_LLM_RESPONSE = "llm_response"
     SOURCE_APP_SECURITY_ALERT = "security_alert"
+    # Written only by the removed agents feature; kept so historical rows
+    # still display a label.
     SOURCE_APP_AGENT_INSIGHT = "agent_insight"
     SOURCE_APP_SEARCH_QUERIES = "search_queries"
     SOURCE_APP_CITATIONS = "citations"
@@ -185,7 +192,7 @@ class AgentCrawlConsent(TimestampMixin):
 
 
 class KnowledgeChunk(TimestampMixin):
-    """One embedded text segment from a KnowledgeSource."""
+    """One text segment from a KnowledgeSource, with its embedding when available."""
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     source = models.ForeignKey(
@@ -205,9 +212,11 @@ class KnowledgeChunk(TimestampMixin):
     chunk_index = models.IntegerField(default=0)
     # Raw text — kept compact via the chunker (≤ ~400 words).
     text = models.TextField()
-    # Embedding vector. List of floats. Length = embedding model dim
-    # (1536 for OpenAI text-embedding-3-small, 256 for the deterministic
-    # fallback used in tests / when no API key is configured).
+    # Embedding vector. List of floats, length = embedding model dim
+    # (1536 for OpenAI text-embedding-3-small). Empty, with
+    # embedding_model "pending", when the chunk was stored while
+    # embeddings were unavailable; "hash-256" marks legacy word-hash
+    # vectors. Retrieval scores neither; embed_pending_chunks fills them.
     embedding = models.JSONField(default=list)
     embedding_model = models.CharField(max_length=100, blank=True)
     embedding_dim = models.IntegerField(default=0)

@@ -15,6 +15,15 @@ LLM_SCAN_MODE = env("LLM_SCAN_MODE", default="inline")  # noqa: F405
 # before the ack, so dev uses a background thread instead.
 CHAT_EAGER_THREAD_DISPATCH = True
 
+# runserver is the agent process in dev: it serves the live endpoints and
+# runs turns on the background executor. A dev stack served by several
+# processes (docker/docker-compose.yml runs gunicorn workers) sets
+# AGENT_PROCESS=false: each worker would keep its own runs and interrupt
+# the others' as orphans.
+AGENT_ENABLED = True
+AGENT_PROCESS = env.bool("AGENT_PROCESS", default=True)  # noqa: F405
+AGENT_RUN_MODE = "thread"
+
 # Disable rate limiting in dev
 REST_FRAMEWORK["DEFAULT_THROTTLE_CLASSES"] = []  # noqa: F405
 
@@ -51,8 +60,6 @@ LOGGING["loggers"]["audit"]["level"] = "WARNING"  # noqa: F405
 # Run Celery tasks synchronously in dev (no Redis/worker needed)
 CELERY_TASK_ALWAYS_EAGER = True
 CELERY_TASK_EAGER_PROPAGATES = True
-
-# Mock checkout so the paywall flow is walkable without Stripe keys.
 
 # Dev-only default so the ftb-min admin dashboard works out of the box
 # against the local container (prod must set ADMIN_OPS_KEY via env).

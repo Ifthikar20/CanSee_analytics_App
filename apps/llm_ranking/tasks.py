@@ -40,7 +40,7 @@ def run_llm_ranking_audit(self, *, audit_id: str) -> None:
             for provider in plan["providers"]
         ]
         if not cells:
-            # No work to do — flip to completed with an empty score.
+            # No work to do: finalise records the run as failed.
             aggregate_audit_results_task.delay([], audit_id=audit_id)
             return
 
@@ -143,6 +143,17 @@ def dispatch_scheduled_audits() -> None:
             # owner carries the schedule from then on.
             cap_user = schedule.created_by or schedule.website.user
 
+            # ── 0. Autopilot asks the engines for this website today ──
+            from apps.autopilot.services.settings import covers
+
+            if "engines" in covers(schedule.website):
+                logger.info(
+                    "Skipping scheduled audit for %s: Autopilot covers it.",
+                    schedule.website.name,
+                )
+                _bump_next_run(schedule, now)
+                continue
+
             # ── 1. Skip if previous run still in flight ──────────────
             prev = schedule.last_audit
             if prev and prev.status in (
@@ -208,15 +219,23 @@ def dispatch_scheduled_audits() -> None:
                 _bump_next_run(schedule, now)
                 continue
 
-            from django.conf import settings as _settings
-
-            from apps.llm_ranking.providers import PROVIDERS
-            requested = schedule.providers or list(PROVIDERS.keys())
-            selected_providers = [
-                key for key in requested
-                if key in PROVIDERS
-                and getattr(_settings, PROVIDERS[key].api_key_setting, "")
-            ] or ["claude"]
+            # ── 3c. At least one AI engine must have a key ────────────
+            # Missing keys are deployment state, not a schedule failure:
+            # skip and re-schedule without counting toward auto-pause.
+            from apps.llm_ranking.services.audit_factory import (
+                configured_providers,
+                missing_provider_keys,
+            )
+            selected_providers = configured_providers(schedule.providers or None)
+            if not selected_providers:
+                logger.warning(
+                    "Skipping scheduled audit for %s: no AI engine configured "
+                    "(missing %s).",
+                    schedule.website.name,
+                    ", ".join(missing_provider_keys(schedule.providers or None)),
+                )
+                _bump_next_run(schedule, now)
+                continue
 
             audit = LLMRankingAudit.objects.create(
                 website=schedule.website,
@@ -290,8 +309,3 @@ def _record_failure(schedule, now) -> None:
             schedule.id, schedule.consecutive_failures,
         )
     schedule.save(update_fields=update_fields)
-
-
-
-# Model Test + GEO helpers removed 2026-07; the multi-provider probe
-# use case moves to the Prompts page auto-measurement flow.

@@ -31,6 +31,8 @@ from collections import Counter, defaultdict
 from datetime import date, timedelta
 from urllib.parse import urlsplit
 
+from django.db.models import F
+
 from apps.citations.models import Citation, SourceClass
 
 # ── source_class -> dashboard domain-type bucket ──────────────────────────
@@ -787,7 +789,7 @@ def build_chat_detail(website, *, result_id: str) -> dict | None:
         for text in (
             PromptFanout.objects
             .filter(website=website, prompt_id=result.source_prompt_id)
-            .order_by("-confidence", "created_at")
+            .order_by(F("confidence").desc(nulls_last=True), "created_at")
             .values_list("text", flat=True)
         ):
             key = (text or "").strip().lower()

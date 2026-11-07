@@ -45,14 +45,23 @@ def period_spent_usd(user, period: Period | None = None) -> float:
 
 
 def allowance_status(user, period: Period | None = None, used_tokens: int | None = None) -> dict:
-    """The allowance block shared by every consumer (replaces _cap_status)."""
-    from apps.billing.services.plan_limits import current_plan_for
-    from core.ai_tracking import AI_SPEND_CAP_RATIO, AI_SPEND_WARN_RATIO, effective_ai_cap
+    """The allowance block shared by every consumer (replaces _cap_status).
+
+    ``plan`` names the plan the cap comes from (an org member's org plan,
+    else the user's own), so a usage line never reads "free" next to an
+    organization's allowance.
+    """
+    from core.ai_tracking import (
+        AI_SPEND_CAP_RATIO,
+        AI_SPEND_WARN_RATIO,
+        ai_allowance_plan,
+        effective_ai_cap,
+    )
 
     period = period or billing_period_for(user)
     spent = period_spent_usd(user, period)
     cap = effective_ai_cap(user)
-    plan = str(current_plan_for(user))
+    plan = str(ai_allowance_plan(user))
 
     manual = float(getattr(user, "monthly_ai_cost_cap_usd", 0) or 0)
     if cap <= 0:

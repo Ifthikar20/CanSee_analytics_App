@@ -108,10 +108,9 @@ class ContentEnricher:
 
         import requests
 
-        queries = [
-            f"{business_name} review",
-            f"best {industry} tools {business_name}",
-        ]
+        queries = [f"{business_name} review"]
+        if industry:
+            queries.append(f"best {industry} tools {business_name}")
         result["search_queries"] = queries
 
         own_domain = _normalize_domain(domain) if domain else ""

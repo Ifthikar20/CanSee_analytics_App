@@ -10,7 +10,6 @@ Multi-channel notification system — in-app, email, Slack, and Discord. Handles
 Event Source (any app)
   │
   ├── In-app: Notification.objects.create(...)
-  │     └── WebSocket push via Django Channels (routing.py)
   │
   ├── Email: SendGrid / Django send_mail
   │
@@ -48,11 +47,6 @@ Inbound chat commands (api/v1/chat_webhooks.py)
 | Audit completed | In-app | LLM ranking audit finishes |
 | Weekly report | Email, Slack/Discord | Monday 9 AM Celery beat |
 | Voice agent callback | In-app, email | Callback reminder due |
-
-## WebSocket Support
-
-- `routing.py` — Defines WebSocket URL patterns for real-time notification delivery.
-- Notifications can be pushed to connected clients instantly via Django Channels.
 
 ## Celery Tasks
 

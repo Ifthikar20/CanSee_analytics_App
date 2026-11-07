@@ -14,19 +14,56 @@ from apps.llm_ranking.providers import PROVIDERS
 from apps.llm_ranking.services.regions import region_for_country
 
 
+class NoLLMProviderConfigured(Exception):
+    """No requested AI engine has an API key, so nothing can be asked.
+
+    ``missing`` names the settings that would enable the engines. Views
+    answer with ``response_body()`` and HTTP 409.
+    """
+
+    code = "no_llm_provider_configured"
+
+    def __init__(self, missing: list[str]):
+        self.missing = list(missing)
+        super().__init__("No AI engine is configured.")
+
+    def response_body(self) -> dict:
+        return {"error": self.code, "missing": self.missing}
+
+
+def _implemented(requested: list[str] | None) -> list[str]:
+    keys = [k for k in (requested or []) if k in PROVIDERS]
+    return keys or list(PROVIDERS.keys())
+
+
 def configured_providers(requested: list[str] | None = None) -> list[str]:
     """Filter provider keys to those implemented AND configured.
 
     Unknown keys (stub providers advertised in PROVIDER_CHOICES) are
-    dropped so a run can never silently produce no results. Falls back to
-    ["claude"] so a misconfigured environment still queues a run.
+    dropped. Returns [] when none of the requested engines has a key.
     """
     keys = requested or list(PROVIDERS.keys())
-    configured = [
+    return [
         k for k in keys
         if k in PROVIDERS and getattr(settings, PROVIDERS[k].api_key_setting, "")
     ]
-    return configured or ["claude"]
+
+
+def missing_provider_keys(requested: list[str] | None = None) -> list[str]:
+    """API key settings that are unset for the requested engines."""
+    return [
+        PROVIDERS[k].api_key_setting
+        for k in _implemented(requested)
+        if not getattr(settings, PROVIDERS[k].api_key_setting, "")
+    ]
+
+
+def require_configured_providers(requested: list[str] | None = None) -> list[str]:
+    """``configured_providers`` that raises when the result is empty."""
+    providers = configured_providers(requested)
+    if not providers:
+        raise NoLLMProviderConfigured(missing_provider_keys(requested))
+    return providers
 
 
 def create_audit(
@@ -48,12 +85,14 @@ def create_audit(
     is omitted. ``region=None`` derives the region from ``location``;
     pass an explicit region (e.g. the client-selected one) to skip that.
 
+    Raises ``NoLLMProviderConfigured`` when no requested engine has a key.
     Every construction path spends the creator's monthly prompt
     allowance here — an audit that would overdraw it raises
     ``prompt_allowance_exceeded`` (403) before anything is queued.
     """
     from apps.billing.services.org_entitlements import check_prompt_allowance
 
+    providers_queried = require_configured_providers(providers)
     check_prompt_allowance(user, len(list(prompts)))
 
     return LLMRankingAudit.objects.create(
@@ -73,7 +112,7 @@ def create_audit(
         region=region if region is not None else region_for_country(location),
         keywords=list(keywords if keywords is not None else (website.topics or [])),
         prompts=list(prompts),
-        providers_queried=configured_providers(providers),
+        providers_queried=providers_queried,
         context_urls=list(context_urls or []),
         prompt_source=prompt_source,
     )

@@ -16,7 +16,6 @@ urlpatterns = [
     path("upgrade-now/", views.UpgradeNowView.as_view(), name="billing-upgrade-now"),
     path("change-plan/", views.ChangePlanView.as_view(), name="billing-change-plan"),
     path("portal/", views.PortalView.as_view(), name="billing-portal"),
-    path("invoices/", views.InvoiceListView.as_view(), name="billing-invoices"),
     path("token-usage/", views.AITokenUsageView.as_view(), name="billing-token-usage"),
     path("health/", BillingHealthView.as_view(), name="billing-health"),
     path("polar/webhook/", PolarWebhookView.as_view(), name="billing-polar-webhook"),

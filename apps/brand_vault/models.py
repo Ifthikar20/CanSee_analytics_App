@@ -132,9 +132,8 @@ class FactRevision(TimestampMixin):
 class ToneSample(TimestampMixin):
     """A short sample of brand-owned writing for voice modeling.
 
-    Phase 4's voice guard reads these to learn the brand's tone.
-    Each sample is a 80-300 word slice from a KnowledgeChunk, deduped
-    via ``text_hash`` so re-running the sampler is idempotent.
+    Retired with Content Studio's voice guard, its only reader: nothing
+    creates or reads these rows any more. Kept for existing rows.
     """
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -165,10 +164,10 @@ class ToneSample(TimestampMixin):
 
 
 class SafetyPrompt(TimestampMixin):
-    """A user-defined prompt monitored across AI models for brand-safety risks.
+    """A prompt the removed external-source security agents re-ran.
 
-    Phase 5 of the GEO platform. Each prompt is re-run on a schedule by the
-    safety monitor task; matches are recorded as ``SafetyAlert`` rows.
+    Retired: nothing creates or reads these rows any more. Kept so
+    existing rows, and ``SafetyAlert.prompt`` links to them, stay valid.
     """
 
     STATUS_ACTIVE = "active"
@@ -210,7 +209,11 @@ class SafetyPrompt(TimestampMixin):
 
 
 class SafetyAlert(TimestampMixin):
-    """A flagged finding raised by a Brand Security agent."""
+    """A Brand Security finding.
+
+    Raised by the response auditor; older rows came from the removed
+    external-source security agents.
+    """
 
     SEVERITY_HIGH = "high"
     SEVERITY_MEDIUM = "medium"
@@ -315,7 +318,7 @@ class SafetyAlert(TimestampMixin):
         default=generate_alert_reference,
     )
     # Stable detector code from the registry, e.g. "BS-SENT-001". Blank on
-    # legacy rows and on rows raised by the (dormant) external-source agents.
+    # legacy rows and on rows raised by the removed external-source agents.
     detector_code = models.CharField(max_length=20, blank=True, db_index=True)
     # Exactly which parts of `snippet` triggered the finding:
     # [{"start": int, "end": int, "text": str, "label": str}, ...].
@@ -374,7 +377,7 @@ class SafetyAlert(TimestampMixin):
         ]
         constraints = [
             # One alert per (response, detector). Only enforced where a
-            # result is linked — dormant-agent rows have result=NULL.
+            # result is linked — rows from the removed agents have result=NULL.
             models.UniqueConstraint(
                 fields=["website", "result", "detector_code"],
                 condition=models.Q(result__isnull=False) & ~models.Q(detector_code=""),
@@ -388,7 +391,11 @@ class SafetyAlert(TimestampMixin):
 
 
 class BrandSecurityAgent(TimestampMixin):
-    """Per-website configuration and status for one Brand Security agent."""
+    """Per-website state for one removed external-source security agent.
+
+    Retired: nothing creates or reads these rows any more. Kept for
+    existing rows.
+    """
 
     STATUS_IDLE = "idle"
     STATUS_QUEUED = "queued"
@@ -509,6 +516,7 @@ class BrandSecurityConfig(TimestampMixin):
         on_delete=models.CASCADE,
     )
     brand_terms = models.JSONField(default=list, blank=True)
+    # Only the removed security agents read this; kept for existing rows.
     negative_keywords = models.JSONField(default=list, blank=True)
     # Per-website switch for the LLM confirmation step on nuanced detectors.
     # The deployment-wide kill switch is settings.BRAND_SECURITY_JUDGE_ENABLED.

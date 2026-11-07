@@ -36,6 +36,11 @@ USER_AGENT = "Cansee/1.0 (source intelligence; +https://cansee.ai)"
 MAX_TEXT_CHARS = 20000
 MAX_REDDIT_COMMENTS = 40
 PAGE_TIMEOUT = 12.0
+# Whole-fetch bound (redirects and body included). PAGE_TIMEOUT applies per
+# socket operation, so a server dripping its body could otherwise hold a
+# worker indefinitely. Kept under the PAGE_TIMEOUT + 10 s the Django facade
+# waits for the sources service, so the service answers before it gives up.
+PAGE_DEADLINE = 20.0
 
 SEARCH_ENDPOINT = "https://api.perplexity.ai/search"
 CHAT_ENDPOINT = "https://api.perplexity.ai/chat/completions"
@@ -226,6 +231,7 @@ def read_reddit_thread(url: str) -> dict:
             json_url,
             headers={"User-Agent": USER_AGENT},
             timeout=PAGE_TIMEOUT,
+            deadline=PAGE_DEADLINE,
             max_bytes=3_000_000,
             allowed_content_types=("application/json", "text/plain"),
         )
@@ -407,7 +413,10 @@ def page_result_from_html(html: str) -> dict:
 def read_page(url: str) -> dict:
     """Fetch a regular page through the SSRF guard and extract its text."""
     try:
-        resp = safe_get(url, timeout=PAGE_TIMEOUT, headers={"User-Agent": USER_AGENT})
+        resp = safe_get(
+            url, timeout=PAGE_TIMEOUT, deadline=PAGE_DEADLINE,
+            headers={"User-Agent": USER_AGENT},
+        )
     except FetchError as exc:
         return result(fetch_error_status(str(exc)), "page", detail=str(exc))
     return page_result_from_html(resp.text)

@@ -9,6 +9,12 @@ Given a (website, url) pair (plus the acting user for attribution):
     4. Embed each chunk in a single batch call.
     5. Persist KnowledgeSource + KnowledgeChunk rows transactionally.
 
+When embeddings are unavailable (no key, a spent AI allowance, an API
+error) the chunks are still stored, without a vector and marked pending:
+the text stays usable (fact extraction reads it) and retrieval skips it.
+``embed_pending_chunks`` fills the vectors in later; re-ingesting an
+unchanged source does the same for that source.
+
 The pipeline is the only entrypoint that should be writing chunks —
 keep ad-hoc creation out of views and tasks so the (website, url)
 uniqueness invariant is respected. The knowledge base belongs to the
@@ -29,9 +35,19 @@ from apps.llm_ranking.services.domain_scanner import scan_domain
 from apps.rag.models import KnowledgeChunk, KnowledgeSource
 from apps.rag.services.chunker import chunk_text
 from apps.rag.services.crawler import crawl_site
-from apps.rag.services.embedder import embed_texts
+from apps.rag.services.embedder import (
+    PENDING_MODEL,
+    REASON_ALLOWANCE,
+    REASON_FAILED,
+    UNEMBEDDED_MODEL_NAMES,
+    EmbeddingUnavailable,
+    embed_texts,
+)
 
 logger = logging.getLogger("apps")
+
+# Chunks per embedding request when filling in pending vectors.
+EMBED_BATCH_SIZE = 64
 
 
 @dataclass
@@ -42,16 +58,29 @@ class IngestResult:
     chunk_count: int
     skipped_unchanged: bool = False
     error: str | None = None
+    # True when some of the source's chunks have no vector yet;
+    # embedding_reason is the embedder's reason code.
+    embeddings_pending: bool = False
+    embedding_reason: str = ""
 
 
-def _dispatch_auto_fact_extraction(website, kind: str) -> None:
-    """Auto-extract brand facts after fresh chunks land.
+@dataclass
+class EmbedPendingResult:
+    embedded: int = 0
+    remaining: int = 0
+    # Embedder reason code when a batch could not be embedded.
+    reason: str = ""
+
+
+def _dispatch_auto_fact_extraction(website, source: KnowledgeSource) -> None:
+    """Auto-extract brand facts after fresh Brand Input chunks land.
 
     Debounced so a 12-page crawl triggers one extraction pass, not
     twelve: the first ingest in the window claims the cache flag
     (cache.add is atomic) and schedules extraction 120s out so the rest
-    of the crawl's pages land first. audit_context is excluded — the
-    learning loop must never mint facts from LLM-generated context.
+    of the crawl's pages land first. Only Brand Input triggers it: facts
+    must never be minted from LLM-generated audit context or from the AI
+    answers and findings mirrored into the knowledge base.
     Extraction itself is idempotent (only chunks without facts are read),
     so overlapping dispatches are harmless.
     """
@@ -60,7 +89,10 @@ def _dispatch_auto_fact_extraction(website, kind: str) -> None:
 
         if not getattr(settings, "BRAND_VAULT_EXTRACTION_ENABLED", True):
             return
-        if kind == KnowledgeSource.KIND_AUDIT_CONTEXT:
+        if (
+            source.source_app != KnowledgeSource.SOURCE_APP_BRAND_INPUT
+            or source.kind not in KnowledgeSource.BRAND_INPUT_KINDS
+        ):
             return
         from django.core.cache import cache
 
@@ -72,6 +104,37 @@ def _dispatch_auto_fact_extraction(website, kind: str) -> None:
             )
     except Exception as exc:  # pragma: no cover — never block an ingest
         logger.debug("auto fact-extraction dispatch skipped: %s", exc)
+
+
+def _mirror_source(website_id, source_id) -> None:
+    """Copy a source's model vectors into the optional vector index.
+
+    Best-effort: Postgres is the source of truth and the index can be
+    rebuilt from it with ``rag_reindex``.
+    """
+    from apps.rag.services.vector_backends import get_backend
+
+    backend = get_backend()
+    if backend is None:
+        return
+    rows = list(
+        KnowledgeChunk.objects
+        .filter(source_id=source_id)
+        .exclude(embedding_model__in=UNEMBEDDED_MODEL_NAMES)
+        .only("id", "embedding")
+    )
+    rows = [r for r in rows if r.embedding]
+    if not rows:
+        return
+    try:
+        backend.replace_source(
+            website_id=website_id, source_id=source_id,
+            chunk_ids=[r.id for r in rows],
+            vectors=[r.embedding for r in rows],
+            dim=len(rows[0].embedding),
+        )
+    except Exception:
+        logger.warning("vector index mirror failed for source %s", source_id, exc_info=True)
 
 
 def ingest_url(
@@ -147,27 +210,46 @@ def ingest_url(
             source.status = KnowledgeSource.STATUS_READY
             source.last_ingested_at = timezone.now()
             source.save(update_fields=["status", "last_ingested_at", "updated_at"])
+            # Unchanged text keeps its chunks (and the facts linked to
+            # them); only vectors still missing are filled in. A failed
+            # repair leaves the source ready with its chunks pending.
+            try:
+                pending = embed_pending_chunks(source=source, user=user)
+            except Exception:
+                logger.warning(
+                    "pending-vector repair failed for source %s", source.id, exc_info=True,
+                )
+                pending = EmbedPendingResult(
+                    remaining=pending_chunks(source=source).count(),
+                    reason=REASON_FAILED,
+                )
             return IngestResult(
                 source_id=str(source.id), url=url,
                 status=source.status, chunk_count=source.chunk_count,
                 skipped_unchanged=True,
+                embeddings_pending=pending.remaining > 0,
+                embedding_reason=pending.reason,
             )
 
         chunks = chunk_text(page_text, default_label=page_title or url)
         if not chunks:
             raise RuntimeError("no chunks produced")
 
-        vectors, model, dim = embed_texts(
-            [c.text for c in chunks],
-            user=user, website=website,
-            metadata={"source_id": str(source.id)},
-        )
-        if len(vectors) != len(chunks):
-            raise RuntimeError("embedding count mismatch")
+        embedding_reason = ""
+        try:
+            vectors, model, dim = embed_texts(
+                [c.text for c in chunks],
+                user=user, website=website,
+                metadata={"source_id": str(source.id)},
+            )
+        except EmbeddingUnavailable as exc:
+            # Keep the text, store no vector, and mark the chunks pending.
+            embedding_reason = exc.reason
+            vectors, model, dim = [[] for _ in chunks], PENDING_MODEL, 0
 
         with transaction.atomic():
             KnowledgeChunk.objects.filter(source=source).delete()
-            new_rows = [
+            KnowledgeChunk.objects.bulk_create([
                 KnowledgeChunk(
                     source=source, user=user, website=website,
                     chunk_index=i, text=c.text,
@@ -178,35 +260,15 @@ def ingest_url(
                     recorded_at=recorded_at,
                 )
                 for i, c in enumerate(chunks)
-            ]
-            KnowledgeChunk.objects.bulk_create(new_rows)
+            ])
 
             # Mirror into the optional vector index once (and only once)
             # the transaction commits, so a rollback never leaves phantom
-            # vectors. UUID pks are client-generated, so the ids exist
-            # already. Best-effort: an index failure must never fail the
-            # ingest - Postgres is the source of truth and the index can
-            # be rebuilt from it.
-            from apps.rag.services.vector_backends import get_backend
-
-            backend = get_backend()
-            if backend is not None:
-                chunk_ids = [row.id for row in new_rows]
-                chunk_vectors = list(vectors)
-
-                def _mirror(wid=website.id, sid=source.id):
-                    try:
-                        backend.replace_source(
-                            website_id=wid, source_id=sid,
-                            chunk_ids=chunk_ids, vectors=chunk_vectors, dim=dim,
-                        )
-                    except Exception:
-                        logger.warning(
-                            "vector index mirror failed for source %s", sid,
-                            exc_info=True,
-                        )
-
-                transaction.on_commit(_mirror)
+            # vectors.
+            if not embedding_reason:
+                transaction.on_commit(
+                    lambda wid=website.id, sid=source.id: _mirror_source(wid, sid)
+                )
             source.title = (page_title or source.title)[:500]
             source.content_hash = digest
             source.chunk_count = len(chunks)
@@ -217,11 +279,13 @@ def ingest_url(
                 "last_ingested_at", "updated_at",
             ])
 
-        _dispatch_auto_fact_extraction(website, kind)
+        _dispatch_auto_fact_extraction(website, source)
 
         return IngestResult(
             source_id=str(source.id), url=url,
             status=source.status, chunk_count=len(chunks),
+            embeddings_pending=bool(embedding_reason),
+            embedding_reason=embedding_reason,
         )
 
     except Exception as exc:
@@ -276,3 +340,87 @@ def ingest_audit_context(
         title=f"Audit context {audit_id}",
         text=llm_context,
     )
+
+
+def pending_chunks(*, website_id=None, source=None):
+    """Chunks without a model vector: pending ones and legacy hash vectors."""
+    qs = KnowledgeChunk.objects.filter(embedding_model__in=UNEMBEDDED_MODEL_NAMES)
+    if website_id is not None:
+        qs = qs.filter(website_id=website_id)
+    if source is not None:
+        qs = qs.filter(source=source)
+    return qs
+
+
+def embed_pending_chunks(
+    *, website_id=None, source=None, user=None, batch_size: int = EMBED_BATCH_SIZE,
+) -> EmbedPendingResult:
+    """Embed chunks that have no model vector, in place.
+
+    Chunk rows keep their ids, so facts linked to them stay linked.
+    Spend goes to ``user`` when given (an interactive
+    re-ingest), otherwise to the website owner. A spent allowance skips
+    the rest of that website; any other refusal stops the run. The
+    result reports how many chunks are still pending and why.
+    """
+    from apps.websites.models import Website
+
+    qs = pending_chunks(website_id=website_id, source=source)
+    pairs = list(qs.order_by().values_list("website_id", "source_id").distinct())
+    result = EmbedPendingResult()
+    if not pairs:
+        return result
+
+    websites = Website.objects.select_related("user").in_bulk(
+        {wid for wid, _ in pairs}
+    )
+    skipped_websites: set = set()
+    for wid, sid in pairs:
+        if wid in skipped_websites:
+            continue
+        website = websites.get(wid)
+        if website is None:
+            continue
+        spend_user = user or getattr(website, "user", None)
+        chunks = list(
+            qs.filter(source_id=sid).order_by("chunk_index").only("id", "text")
+        )
+        embedded_here = 0
+        stop_reason = ""
+        for start in range(0, len(chunks), batch_size):
+            batch = chunks[start:start + batch_size]
+            try:
+                vectors, model, dim = embed_texts(
+                    [c.text for c in batch],
+                    user=spend_user, website=website,
+                    metadata={
+                        "source_id": str(sid),
+                        "actor": "user" if user is not None else "system",
+                    },
+                )
+            except EmbeddingUnavailable as exc:
+                stop_reason = exc.reason
+                break
+            now = timezone.now()
+            for chunk, vector in zip(batch, vectors, strict=True):
+                chunk.embedding = vector
+                chunk.embedding_model = model
+                chunk.embedding_dim = dim
+                chunk.updated_at = now
+            KnowledgeChunk.objects.bulk_update(
+                batch, ["embedding", "embedding_model", "embedding_dim", "updated_at"],
+            )
+            embedded_here += len(batch)
+
+        result.embedded += embedded_here
+        if embedded_here:
+            _mirror_source(wid, sid)
+        if stop_reason:
+            result.reason = stop_reason
+            if stop_reason == REASON_ALLOWANCE:
+                skipped_websites.add(wid)
+                continue
+            break
+
+    result.remaining = pending_chunks(website_id=website_id, source=source).count()
+    return result

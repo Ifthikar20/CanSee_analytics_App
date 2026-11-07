@@ -30,7 +30,8 @@ def mine_daily_prompts(industry_slug: str | None = None) -> dict:
 
 @shared_task(name="apps.prompt_library.tasks.compute_demand_scores")
 def compute_demand_scores() -> int:
-    """Refresh demand_score for every active prompt."""
+    """Refresh the source score (stored in Prompt.demand_score) for every
+    active prompt. The task keeps its registered name for the beat schedule."""
     from apps.prompt_library.services.scoring_service import refresh_all_scores
 
     return refresh_all_scores()
@@ -130,9 +131,21 @@ def dispatch_scheduled_prompt_scans() -> None:
     """
     from django.utils import timezone
 
+    from apps.citations.services import serp_google
+    from apps.llm_ranking.services.audit_factory import configured_providers
     from apps.prompt_library.models import PromptCrawlRun, PromptSchedule
 
     now = timezone.now()
+    # Without an AI engine key a crawl could only record failures, so the
+    # AI side is skipped; the Google recheck still runs when SerpAPI is set.
+    engines_configured = bool(configured_providers())
+    google_configured = serp_google.is_configured()
+    if not engines_configured and not google_configured:
+        logger.warning(
+            "Skipping scheduled prompt scans: no AI engine or SerpAPI key configured.",
+        )
+        return
+
     due = (
         PromptSchedule.objects
         # Archived prompts never run: the UI promises archiving stops them,
@@ -156,6 +169,22 @@ def dispatch_scheduled_prompt_scans() -> None:
             prompt = bp.prompt
             cap_user = schedule.created_by
 
+            # ── 0. Work Autopilot does for this website today ──────────
+            # Autopilot asks the engines and reads Google every day on its
+            # own; the schedule keeps only what Autopilot does not cover.
+            from apps.autopilot.services.settings import covers
+
+            covered = covers(website)
+            run_crawl = engines_configured and "engines" not in covered
+            run_google = google_configured and "google" not in covered
+            if not run_crawl and not run_google:
+                logger.info(
+                    "Skipping scheduled prompt scan for %s/%s: Autopilot covers it.",
+                    website.name, prompt.id,
+                )
+                _bump_prompt_next_run(schedule, now)
+                continue
+
             # ── 1. Skip if the previous crawl is still in flight ──────
             prev = (
                 PromptCrawlRun.objects
@@ -163,7 +192,9 @@ def dispatch_scheduled_prompt_scans() -> None:
                 .order_by("-created_at")
                 .first()
             )
-            if prev and prev.status in (
+            # (Only when this schedule crawls: with the engines covered, a
+            # crawl in flight is Autopilot's and the Google recheck goes on.)
+            if run_crawl and prev and prev.status in (
                 PromptCrawlRun.STATUS_PENDING,
                 PromptCrawlRun.STATUS_RUNNING,
             ):
@@ -192,11 +223,11 @@ def dispatch_scheduled_prompt_scans() -> None:
                 continue
 
             # ── 3. Run the single-prompt crawl ────────────────────────
-            crawl_prompt_for_website.delay(str(website.id), str(prompt.id))
+            if run_crawl:
+                crawl_prompt_for_website.delay(str(website.id), str(prompt.id))
 
             # ── 4. Recheck Google on the same cadence (search vs AI gap)
-            from apps.citations.services import serp_google
-            if serp_google.is_configured():
+            if run_google:
                 from apps.search_gap.tasks import check_google_rank
                 check_google_rank.delay(str(bp.id))
 

@@ -106,17 +106,3 @@ class DiscordService:
             )
             return False
         return False
-
-    @staticmethod
-    def send_hot_lead_alert(*, webhook_url: str, lead) -> bool:
-        """Send a hot lead alert to Discord."""
-        return DiscordService.send_message(
-            webhook_url=webhook_url,
-            title="Hot Lead Detected",
-            description=f"Score: **{lead.score}**",
-            fields=[
-                {"name": "Company", "value": lead.company or "Unknown", "inline": True},
-                {"name": "Website", "value": lead.website.name, "inline": True},
-            ],
-            color=0xef4444,
-        )

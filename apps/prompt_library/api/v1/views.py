@@ -19,6 +19,7 @@ from rest_framework.permissions import IsAdminUser, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from apps.billing.services import tracked_prompts
 from apps.llm_ranking.models import LLMRankingAudit
 from apps.prompt_library.api.v1.serializers import (
     AutoTemplateRequestSerializer,
@@ -35,7 +36,6 @@ from apps.prompt_library.api.v1.serializers import (
     PromptVariableSetSerializer,
     SmokeTestRequestSerializer,
     SynthesizeRequestSerializer,
-    TestEnvironmentSerializer,
     UseLibrarySampleRequestSerializer,
 )
 from apps.prompt_library.models import (
@@ -46,7 +46,6 @@ from apps.prompt_library.models import (
     PromptSource,
     PromptVariableSet,
     RejectedBrandPrompt,
-    TestEnvironment,
 )
 from apps.prompt_library.services.sampler_service import sample_prompts_for_audit
 from apps.websites.services.website_service import WebsiteService
@@ -68,6 +67,13 @@ def _public_model_error(raw: str) -> str:
     e = (raw or "").lower()
     if not e:
         return ""
+    # Answers the provider rejected as measurements (ClaudeProvider).
+    if e.startswith("refusal:"):
+        return "The model declined to answer this prompt."
+    if e.startswith(("max_tokens:", "pause_turn:")):
+        return "The model's answer was cut off before it finished."
+    if e.startswith("empty_answer:"):
+        return "The model returned no answer."
     if "rate limit" in e or "429" in e or "quota" in e or "overloaded" in e:
         return "The model was busy and will be retried on the next scan."
     if "timeout" in e or "timed out" in e:
@@ -253,6 +259,9 @@ class WebsiteBrandPromptsView(TenantScopedAPIView):
         prompt = get_object_or_404(
             Prompt, id=serializer.validated_data["prompt_id"], is_active=True
         )
+        tracked_prompts.check_capacity(
+            website, tracked_prompts.adding_count(website, prompt_ids=[prompt.id]),
+        )
         bp, created = BrandPrompt.objects.get_or_create(
             website=website,
             prompt=prompt,
@@ -283,7 +292,16 @@ class BrandPromptDetailView(APIView):
     def patch(self, request, brand_prompt_id):
         bp = self._owned(request, brand_prompt_id)
         if "is_archived" in request.data:
-            bp.is_archived = bool(request.data["is_archived"])
+            archived = bool(request.data["is_archived"])
+            if bp.is_archived and not archived:
+                # Restoring makes the prompt tracked again: the plan's cap applies.
+                tracked_prompts.check_capacity(
+                    bp.website,
+                    tracked_prompts.adding_count(
+                        bp.website, prompt_ids=[bp.prompt_id], restore=True,
+                    ),
+                )
+            bp.is_archived = archived
             bp.save(update_fields=["is_archived", "updated_at"])
         return Response(BrandPromptSerializer(bp).data)
 
@@ -311,19 +329,20 @@ class WebsiteSamplePromptsView(TenantScopedAPIView):
     POST /api/v1/prompt-library/websites/<website_id>/prompts/generate-samples/
     body: {"count": 1-15, default 10}
 
-    Reads the site first (if it has not been classified yet), then generates
-    prompts written for what the business ACTUALLY does — grounded in the
-    scraped description, using the right category words rather than a
-    hardcoded "software" default. Prompts are neutral by design (no brand
-    name in the text) so the first scan measures real visibility rather
-    than parroting the brand back. Re-running is safe: the registrar dedupes
-    on text hash.
+    Reads the site first (when the website has no description), then asks
+    Claude for prompts written for what the business actually does.
+    Prompts are neutral by design (no brand name in the text) so the first
+    scan measures real visibility rather than parroting the brand back.
+    Re-running is safe: the registrar dedupes on text hash.
+
+    409 {"error": "synthesis_not_configured"} without a Claude key;
+    502 {"error": "synthesis_failed"} when the call fails. Nothing is
+    substituted in either case. Only the prompts that fit the plan's
+    tracked-prompt cap are added; ``limited`` is true when some were left out.
     """
 
     def post(self, request, website_id):
-        from apps.llm_ranking.services.prompt_registrar import (
-            register_generated_prompts,
-        )
+        from apps.llm_ranking.services.prompt_registrar import register_within_plan
         from apps.prompt_library.services.sample_prompts import build_sample_prompts
         from core.exceptions import RateLimited
         from core.resilience import TokenBucket
@@ -342,7 +361,23 @@ class WebsiteSamplePromptsView(TenantScopedAPIView):
             count = 10
         count = max(1, min(count, 15))
 
-        result = build_sample_prompts(website, count=count, user=request.user)
+        from apps.prompt_library.services.context_generator import (
+            SynthesisFailed,
+            SynthesisNotConfigured,
+        )
+
+        try:
+            result = build_sample_prompts(website, count=count, user=request.user)
+        except SynthesisNotConfigured:
+            return Response(
+                {"error": "synthesis_not_configured"},
+                status=status.HTTP_409_CONFLICT,
+            )
+        except SynthesisFailed:
+            return Response(
+                {"error": "synthesis_failed"},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
         items = result["items"]
 
         # We could not learn enough about the site to build anything
@@ -363,7 +398,7 @@ class WebsiteSamplePromptsView(TenantScopedAPIView):
                 status=status.HTTP_422_UNPROCESSABLE_ENTITY,
             )
 
-        created = register_generated_prompts(items, website)
+        created, left_out = register_within_plan(items, website)
 
         return Response(
             {
@@ -374,13 +409,19 @@ class WebsiteSamplePromptsView(TenantScopedAPIView):
                 "created_count": created,
                 "total": len(items),
                 "source": result["source"],
+                "limited": left_out > 0,
             },
             status=status.HTTP_201_CREATED,
         )
 
 
 class WebsitePromptCreateView(TenantScopedAPIView):
-    """Create a manual templated prompt for a website."""
+    """Create a manual templated prompt for a website.
+
+    All or nothing: when the new prompts would pass the plan's tracked-prompt
+    cap, nothing is created (403 ``tracked_prompt_limit``). ``scan: false``
+    tracks without a scan (Ask AI's Track: no second spend).
+    """
 
     def post(self, request, website_id):
         from apps.prompt_library.services._hash import text_hash
@@ -390,6 +431,27 @@ class WebsitePromptCreateView(TenantScopedAPIView):
         serializer = PromptCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
+
+        # Each non-empty line becomes a separate prompt (matches the modal's
+        # "every line is a prompt" + bulk-upload behaviour). Template-only
+        # payloads (no newlines) collapse to a single prompt as before.
+        raw = (data.get("text") or "").strip()
+        template_text_in = (data.get("template_text") or "").strip()
+        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+        if not lines:
+            lines = [template_text_in] if template_text_in else []
+        # Per line: the template, the body and the canonical hash that finds
+        # its Prompt. The cap is checked on those hashes before anything is
+        # created.
+        planned = []
+        for line in lines:
+            template_text = template_text_in or line
+            body_for_text = line or template_text
+            planned.append((template_text, body_for_text, text_hash(template_text or body_for_text)))
+        tracked_prompts.check_capacity(
+            website,
+            tracked_prompts.adding_count(website, text_hashes=[h for _t, _b, h in planned]),
+        )
 
         industry = None
         topic_name = (data.get("topic") or "").strip()
@@ -405,39 +467,21 @@ class WebsitePromptCreateView(TenantScopedAPIView):
         elif data.get("industry_id"):
             industry = get_object_or_404(Industry, id=data["industry_id"], is_active=True)
         else:
-            # Pick a sensible default — the website's industry name maps
-            # back to an Industry slug if one matches, else any active one.
-            slug_hint = (getattr(website, "industry", "") or "").lower().strip().replace(" ", "-")
-            industry = (
-                Industry.objects.filter(slug=slug_hint, is_active=True).first()
-                or Industry.objects.filter(is_active=True).order_by("name").first()
+            # The website's own industry when it matches one; otherwise the
+            # inactive "Uncategorized" bucket, never an unrelated industry.
+            from apps.prompt_library.services.industry_match import (
+                industry_for_website,
             )
-        if industry is None:
-            return Response(
-                {"error": "no_industry_available"},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+            industry = industry_for_website(website)
 
         tags = [t.strip() for t in (data.get("tags") or []) if t and t.strip()]
         location = (data.get("location") or "").strip()
         model_variants = data.get("models") or []
 
-        # Each non-empty line becomes a separate prompt (matches the modal's
-        # "every line is a prompt" + bulk-upload behaviour). Template-only
-        # payloads (no newlines) collapse to a single prompt as before.
-        raw = (data.get("text") or "").strip()
-        template_text_in = (data.get("template_text") or "").strip()
-        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
-        if not lines:
-            lines = [template_text_in] if template_text_in else []
-
         created_prompts = []
         brand_prompt_ids = []
-        for line in lines:
-            template_text = template_text_in or line
-            body_for_text = line or template_text
+        for template_text, body_for_text, canonical_hash in planned:
             variables = extract_variables(template_text)
-            canonical_hash = text_hash(template_text or body_for_text)
             prompt, _ = Prompt.objects.get_or_create(
                 text_hash=canonical_hash,
                 defaults=dict(
@@ -478,27 +522,37 @@ class WebsitePromptCreateView(TenantScopedAPIView):
             return Response({"error": "no_prompts"}, status=status.HTTP_400_BAD_REQUEST)
 
         # Auto-scan: run the new prompts through the ranking pipeline so they
-        # start collecting mentions/citations. Best-effort — never blocks or
-        # fails the create if the queue or provider keys are unavailable.
-        # A custom model selection routes through the per-prompt crawler,
-        # the only path that honors BrandPrompt.model_variants.
-        scan_audit_id = self._trigger_scan(
-            website, request.user, [p.text for p in created_prompts], location,
-            crawl_prompt_ids=(
-                [str(p.id) for p in created_prompts] if model_variants else None
-            ),
-        )
+        # start collecting mentions/citations. Never fails the create: the
+        # prompts are saved either way, and ``scan_error`` says why no scan
+        # started. A custom model selection routes through the per-prompt
+        # crawler, the only path that honors BrandPrompt.model_variants.
+        # ``scan: false`` skips it: Autopilot asks the prompt from its next run.
+        scan_audit_id, scan_error = None, None
+        if data.get("scan", True):
+            scan_audit_id, scan_error = self._trigger_scan(
+                website, request.user, [p.text for p in created_prompts], location,
+                crawl_prompt_ids=(
+                    [str(p.id) for p in created_prompts] if model_variants else None
+                ),
+            )
 
         payload = PromptSerializer(created_prompts[0]).data
         payload["brand_prompt_id"] = brand_prompt_ids[0]
         payload["brand_prompt_ids"] = brand_prompt_ids
         payload["created_count"] = len(created_prompts)
         payload["scan_audit_id"] = scan_audit_id
+        payload["scan_error"] = scan_error
         return Response(payload, status=status.HTTP_201_CREATED)
 
     @staticmethod
     def _trigger_scan(website, user, prompts, location, crawl_prompt_ids=None):
         """Kick off a scan for freshly added prompts.
+
+        Returns ``(audit_id, error)``. ``error`` is None when a scan was
+        queued, the 409 body ``{"error": "no_llm_provider_configured",
+        "missing": [...]}`` when no AI engine has a key, ``{"error": code,
+        "message": ...}`` for a refusal such as the prompt allowance, and
+        ``{"error": "scan_not_started"}`` when queueing failed.
 
         Default: one LLM ranking audit over all created prompts. When
         ``crawl_prompt_ids`` is set (custom model selection), each prompt
@@ -506,6 +560,16 @@ class WebsitePromptCreateView(TenantScopedAPIView):
         pipeline always queries provider-default models and would ignore
         the selection.
         """
+        from apps.llm_ranking.services.audit_factory import (
+            NoLLMProviderConfigured,
+            configured_providers,
+            create_audit,
+            missing_provider_keys,
+        )
+        from core.exceptions import CanseeException
+
+        if not configured_providers():
+            return None, NoLLMProviderConfigured(missing_provider_keys()).response_body()
         try:
             if crawl_prompt_ids:
                 from apps.prompt_library.tasks import crawl_prompt_for_website
@@ -514,8 +578,7 @@ class WebsitePromptCreateView(TenantScopedAPIView):
                         str(website.id), str(prompt_id),
                         acting_user_id=str(user.id) if user else None,
                     )
-                return None
-            from apps.llm_ranking.services.audit_factory import create_audit
+                return None, None
             from apps.llm_ranking.services.scan_dispatch import dispatch_scan
 
             audit = create_audit(
@@ -525,10 +588,15 @@ class WebsitePromptCreateView(TenantScopedAPIView):
                 location=location or "",
             )
             dispatch_scan(str(audit.id))
-            return str(audit.id)
-        except Exception:  # pragma: no cover - scan is best-effort
+            return str(audit.id), None
+        except NoLLMProviderConfigured as exc:
+            return None, exc.response_body()
+        except CanseeException as exc:
+            # e.g. the monthly prompt allowance is used up.
+            return None, {"error": exc.code, "message": exc.message}
+        except Exception:  # pragma: no cover - the create must not fail
             logger.exception("auto-scan dispatch failed")
-            return None
+            return None, {"error": "scan_not_started"}
 
 
 class PromptPreviewView(APIView):
@@ -689,8 +757,8 @@ class PromptSynthesizeView(APIView):
         provider = get_synthesis_provider()
         if provider is None:
             return Response(
-                {"error": "no_synthesis_provider"},
-                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+                {"error": "synthesis_not_configured"},
+                status=status.HTTP_409_CONFLICT,
             )
 
         body = (
@@ -734,6 +802,12 @@ class PromptSynthesizeView(APIView):
                 items = [str(x) for x in json.loads(match.group()) if isinstance(x, str | int | float)]
             except Exception:
                 items = []
+        if not items:
+            return Response(
+                {"error": "synthesis_failed",
+                 "detail": "Prompt synthesis is temporarily unavailable."},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
         created = []
         for raw in items[: data["count"]]:
             envelope = auto_template(raw, user=request.user)
@@ -761,12 +835,15 @@ class PromptSynthesizeView(APIView):
 
 
 class PromptGenerateFromContextView(APIView):
-    """Generate ~20 templated prompts from a free-form context description.
+    """Generate ~20 prompts from a free-form context description.
 
     Calls the synthesis provider (DeepSeek when configured, Anthropic
     fallback). Optionally persists the generated prompts as ``Prompt`` rows
-    on a website's industry. Throttled per-user via ``TokenBucket`` to
-    keep one user from burning the API budget.
+    on the website's industry; persisting is refused (409
+    ``no_matching_industry``) when the website's industry matches none.
+    409 ``synthesis_not_configured`` / 502 ``synthesis_failed`` when nothing
+    can be generated. Throttled per-user via ``TokenBucket`` to keep one
+    user from burning the API budget.
     """
 
     permission_classes = [IsAuthenticated]
@@ -776,6 +853,8 @@ class PromptGenerateFromContextView(APIView):
     def post(self, request):
         from apps.prompt_library.services._hash import text_hash
         from apps.prompt_library.services.context_generator import (
+            SynthesisFailed,
+            SynthesisNotConfigured,
             generate_from_context,
         )
         from core.resilience import TokenBucket
@@ -795,37 +874,60 @@ class PromptGenerateFromContextView(APIView):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
 
-        items, provider_name = generate_from_context(
-            data["context"], count=data["count"], user=request.user,
-        )
+        industry = None
+        if data.get("persist"):
+            from apps.prompt_library.services.industry_match import matching_industry
 
-        persisted: list = []
-        if data.get("persist") and data.get("website_id"):
+            if not data.get("website_id"):
+                return Response(
+                    {"error": "website_id_required"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
             website = WebsiteService.get_for_user(
                 user=request.user, website_id=data["website_id"],
             )
-            slug_hint = (getattr(website, "industry", "") or "").lower().strip().replace(" ", "-")
-            industry = (
-                Industry.objects.filter(slug=slug_hint, is_active=True).first()
-                or Industry.objects.filter(is_active=True).order_by("name").first()
+            industry = matching_industry(website)
+            if industry is None:
+                return Response(
+                    {"error": "no_matching_industry",
+                     "detail": "Set the website's industry to one of the "
+                               "library industries before saving prompts."},
+                    status=status.HTTP_409_CONFLICT,
+                )
+
+        try:
+            items, provider_name = generate_from_context(
+                data["context"], count=data["count"], user=request.user,
             )
-            if industry is not None:
-                for item in items:
-                    template_text = item["template_text"]
-                    h = text_hash(template_text)
-                    if Prompt.objects.filter(industry=industry, text_hash=h).exists():
-                        continue
-                    prompt = Prompt.objects.create(
-                        industry=industry,
-                        text=item.get("preview_text") or template_text,
-                        template_text=template_text,
-                        template_variables=item["template_variables"],
-                        style=item["style"],
-                        intent_bucket=item["intent_bucket"],
-                        source=PromptSource.LLM_SYNTH,
-                        text_hash=h,
-                    )
-                    persisted.append(prompt)
+        except SynthesisNotConfigured:
+            return Response(
+                {"error": "synthesis_not_configured"},
+                status=status.HTTP_409_CONFLICT,
+            )
+        except SynthesisFailed:
+            return Response(
+                {"error": "synthesis_failed"},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        persisted: list = []
+        if industry is not None:
+            for item in items:
+                template_text = item["template_text"]
+                h = text_hash(template_text)
+                if Prompt.objects.filter(industry=industry, text_hash=h).exists():
+                    continue
+                prompt = Prompt.objects.create(
+                    industry=industry,
+                    text=item.get("preview_text") or template_text,
+                    template_text=template_text,
+                    template_variables=item["template_variables"],
+                    style=item["style"],
+                    intent_bucket=item["intent_bucket"],
+                    source=PromptSource.LLM_SYNTH,
+                    text_hash=h,
+                )
+                persisted.append(prompt)
 
         return Response({
             "generated": items,
@@ -850,6 +952,8 @@ class PromptGenerateRelatedView(APIView):
 
     def post(self, request):
         from apps.prompt_library.services.context_generator import (
+            SynthesisFailed,
+            SynthesisNotConfigured,
             generate_related_prompts,
         )
         from core.resilience import TokenBucket
@@ -869,9 +973,20 @@ class PromptGenerateRelatedView(APIView):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
 
-        items, provider_name = generate_related_prompts(
-            data["prompt"], count=data["count"], user=request.user,
-        )
+        try:
+            items, provider_name = generate_related_prompts(
+                data["prompt"], count=data["count"], user=request.user,
+            )
+        except SynthesisNotConfigured:
+            return Response(
+                {"error": "synthesis_not_configured"},
+                status=status.HTTP_409_CONFLICT,
+            )
+        except SynthesisFailed:
+            return Response(
+                {"error": "synthesis_failed"},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
         return Response({"generated": items, "provider": provider_name})
 
 
@@ -930,121 +1045,6 @@ class PromptToggleView(APIView):
             return Response({"error": "unknown_action"}, status=400)
         prompt.save(update_fields=["is_active", "updated_at"])
         return Response(PromptSerializer(prompt).data)
-
-
-# ── Test Environments ─────────────────────────────────────────────
-# An env is a named bucket of BrandPrompts on a Website. Created from
-# either the Saved view ("Add selected to env") or the Model Test page
-# ("Save current selection as env"). Lives in the same persistence so
-# both surfaces see the same data.
-
-
-class _EnvViewMixin:
-    """Shared helpers — load env scoped to a website the user owns."""
-
-    def _get_env(self, request, website_id, env_id) -> TestEnvironment:
-        website = self.get_website(website_id)
-        return self.get_tenant_object(
-            TestEnvironment.objects.filter(website=website), id=env_id,
-        )
-
-
-class TestEnvironmentListView(TenantScopedAPIView):
-    """GET (list) and POST (create) for envs on a single website."""
-
-    def get(self, request, website_id):
-        website = self.get_website(website_id)
-        qs = (
-            TestEnvironment.objects.filter(website=website)
-            .prefetch_related("prompts")
-            .order_by("-created_at")
-        )
-        return Response(TestEnvironmentSerializer(qs, many=True).data)
-
-    def post(self, request, website_id):
-        website = self.get_website(website_id)
-        serializer = TestEnvironmentSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        name = serializer.validated_data["name"]
-        if TestEnvironment.objects.filter(website=website, name=name).exists():
-            return Response(
-                {"error": f"An environment named '{name}' already exists."},
-                status=status.HTTP_409_CONFLICT,
-            )
-        env = TestEnvironment.objects.create(
-            website=website, name=name, created_by=request.user,
-        )
-        # Optional initial prompt ids — saves the FE a second POST.
-        prompt_ids = request.data.get("prompt_ids") or []
-        if isinstance(prompt_ids, list) and prompt_ids:
-            bps = BrandPrompt.objects.filter(
-                website=website, id__in=prompt_ids,
-            )
-            env.prompts.add(*bps)
-        return Response(
-            TestEnvironmentSerializer(env).data,
-            status=status.HTTP_201_CREATED,
-        )
-
-
-class TestEnvironmentDetailView(_EnvViewMixin, TenantScopedAPIView):
-    """GET (detail), PATCH (rename), DELETE for a single env."""
-
-    def get(self, request, website_id, env_id):
-        env = self._get_env(request, website_id, env_id)
-        return Response(TestEnvironmentSerializer(env).data)
-
-    def patch(self, request, website_id, env_id):
-        env = self._get_env(request, website_id, env_id)
-        new_name = (request.data.get("name") or "").strip()
-        if not new_name:
-            return Response({"error": "Name is required."},
-                            status=status.HTTP_400_BAD_REQUEST)
-        if (TestEnvironment.objects
-                .filter(website=env.website, name=new_name)
-                .exclude(id=env.id).exists()):
-            return Response(
-                {"error": f"An environment named '{new_name}' already exists."},
-                status=status.HTTP_409_CONFLICT,
-            )
-        env.name = new_name
-        env.save(update_fields=["name", "updated_at"])
-        return Response(TestEnvironmentSerializer(env).data)
-
-    def delete(self, request, website_id, env_id):
-        env = self._get_env(request, website_id, env_id)
-        env.delete()
-        return Response(status=status.HTTP_204_NO_CONTENT)
-
-
-class TestEnvironmentPromptsView(_EnvViewMixin, TenantScopedAPIView):
-    """Add/remove BrandPrompt rows from an env's prompt set.
-
-    POST   /<env_id>/prompts/  { brand_prompt_ids: [..] }
-    DELETE /<env_id>/prompts/  { brand_prompt_ids: [..] }
-    """
-
-    def post(self, request, website_id, env_id):
-        env = self._get_env(request, website_id, env_id)
-        ids = request.data.get("brand_prompt_ids") or []
-        if not isinstance(ids, list) or not ids:
-            return Response({"error": "brand_prompt_ids must be a non-empty list."},
-                            status=status.HTTP_400_BAD_REQUEST)
-        # Scope the lookup to this website so a malicious caller can't
-        # graft prompts from another tenant into this env.
-        bps = BrandPrompt.objects.filter(website=env.website, id__in=ids)
-        env.prompts.add(*bps)
-        return Response(TestEnvironmentSerializer(env).data)
-
-    def delete(self, request, website_id, env_id):
-        env = self._get_env(request, website_id, env_id)
-        ids = request.data.get("brand_prompt_ids") or []
-        if not isinstance(ids, list) or not ids:
-            return Response({"error": "brand_prompt_ids must be a non-empty list."},
-                            status=status.HTTP_400_BAD_REQUEST)
-        bps = BrandPrompt.objects.filter(website=env.website, id__in=ids)
-        env.prompts.remove(*bps)
-        return Response(TestEnvironmentSerializer(env).data)
 
 
 def _build_alignment_summary(website, answered_results) -> dict:
@@ -1132,7 +1132,7 @@ class BrandPromptDetailAggView(TenantScopedAPIView):
     that has run it on this website.
 
     Returns:
-      - prompt: text, intent, topic, demand_score, runs_count
+      - prompt: text, intent, topic, source_score, runs_count
       - status: "active" / "inactive" based on Prompt.is_active and
         whether the brand currently has it via BrandPrompt
       - per-brand visibility, sov, sentiment, position
@@ -1706,7 +1706,10 @@ class BrandPromptDetailAggView(TenantScopedAPIView):
                 "topic": prompt.industry.name if prompt.industry_id else "",
                 "location": bp_location,
                 "tags": bp_tags,
-                "demand_score": prompt.demand_score,
+                # No demand signal exists; source_score is the library's
+                # ranking score (source type, recency, paraphrase count).
+                "demand_score": None,
+                "source_score": prompt.demand_score,
                 "runs_count": prompt.runs_count,
                 "effectiveness_score": prompt.effectiveness_score,
                 "created_at": prompt.created_at.isoformat() if prompt.created_at else None,
@@ -1893,14 +1896,16 @@ class WebsiteSavedPromptsAggView(TenantScopedAPIView):
                 "style": p.style,
                 "tags": bp.tags or [],
                 "location": bp.location or "",
-                "demand_score": p.demand_score,
+                "demand_score": None,
+                "source_score": p.demand_score,
                 "runs_count": p.runs_count,
                 "is_active": p.is_active,
                 # Per-website archive state (drives the Active/Archived
                 # split); distinct from the global catalog p.is_active.
                 "is_archived": bp.is_archived,
                 "created_at": p.created_at.isoformat() if p.created_at else None,
-                "visibility_pct": 0,
+                # None until an engine has answered this prompt.
+                "visibility_pct": None,
                 "sentiment_score": None,
                 "avg_position": None,
                 "models_mentioned": [],
@@ -1937,7 +1942,7 @@ class WebsiteSavedPromptsAggView(TenantScopedAPIView):
             .filter(audit__website=website)
             .only(
                 "provider", "prompt", "is_mentioned", "mention_rank",
-                "sentiment", "created_at",
+                "sentiment", "created_at", "query_succeeded",
                 # Both are JSON columns already on the row; loading them
                 # here is what lets the loop below build the competitor and
                 # citation rollups without a second query.
@@ -1964,11 +1969,15 @@ class WebsiteSavedPromptsAggView(TenantScopedAPIView):
                 # provider -> [responses, mentioned]
                 "by_provider": defaultdict(lambda: [0, 0]),
             })
+            if r.created_at and (entry["last_run"] is None or r.created_at > entry["last_run"]):
+                entry["last_run"] = r.created_at
+            # A failed call is a run but not an answer: it counts toward
+            # last_run_at only.
+            if not r.query_succeeded:
+                continue
             entry["responses"] += 1
             if r.provider:
                 entry["by_provider"][r.provider][0] += 1
-            if r.created_at and (entry["last_run"] is None or r.created_at > entry["last_run"]):
-                entry["last_run"] = r.created_at
 
             # Competitors and citations are recorded for every response, not
             # only the ones that mention us: a prompt we are absent from
@@ -2081,7 +2090,7 @@ class WebsiteSavedPromptsAggView(TenantScopedAPIView):
 
         # Aggregate KPI for the strip above the table.
         with_vis = [r for r in rows if r["responses_seen"]]
-        avg_vis = round(sum(r["visibility_pct"] for r in with_vis) / len(with_vis), 0) if with_vis else 0
+        avg_vis = round(sum(r["visibility_pct"] for r in with_vis) / len(with_vis), 0) if with_vis else None
         with_sent = [r for r in rows if r["sentiment_score"] is not None]
         avg_sent = round(sum(r["sentiment_score"] for r in with_sent) / len(with_sent), 0) if with_sent else None
         with_pos = [r for r in rows if r["avg_position"] is not None]
@@ -2108,7 +2117,7 @@ class WebsiteSuggestedPromptsView(TenantScopedAPIView):
 
     Returns library prompts that:
       - Are active
-      - Match the website's industry (when we can resolve it)
+      - Match the website's industry (no suggestions when it matches none)
       - Are NOT already saved as BrandPrompts on this website
       - Have NOT been explicitly rejected via the × button
 
@@ -2120,25 +2129,29 @@ class WebsiteSuggestedPromptsView(TenantScopedAPIView):
 
     LIMIT = 25
 
-    def _resolve_industry(self, website):
-        slug = (website.industry or "").strip().lower()
-        if not slug:
-            return None
-        return (
-            Industry.objects.filter(is_active=True, slug__iexact=slug).first()
-            or Industry.objects.filter(is_active=True, name__iexact=website.industry).first()
-        )
-
     def get(self, request, website_id):
+        from apps.prompt_library.services.industry_match import matching_industry
+
         website = self.get_website(website_id)
+
+        industry = matching_industry(website)
+        if industry is None:
+            return Response({
+                "website_id": str(website.id),
+                "rows": [],
+                "topics": [],
+                "total": 0,
+                "reason": "no_matching_industry",
+            })
 
         saved_ids = BrandPrompt.objects.filter(website=website).values_list("prompt_id", flat=True)
         rejected_ids = RejectedBrandPrompt.objects.filter(website=website).values_list("prompt_id", flat=True)
 
-        qs = Prompt.objects.filter(is_active=True).exclude(id__in=list(saved_ids)).exclude(id__in=list(rejected_ids))
-        industry = self._resolve_industry(website)
-        if industry is not None:
-            qs = qs.filter(industry=industry)
+        qs = (
+            Prompt.objects.filter(is_active=True, industry=industry)
+            .exclude(id__in=list(saved_ids))
+            .exclude(id__in=list(rejected_ids))
+        )
 
         suggestions = list(
             qs.select_related("industry")
@@ -2154,7 +2167,8 @@ class WebsiteSuggestedPromptsView(TenantScopedAPIView):
                 "topic": p.industry.name if p.industry_id else "",
                 "intent_bucket": p.intent_bucket,
                 "style": p.style,
-                "demand_score": p.demand_score,
+                "demand_score": None,
+                "source_score": p.demand_score,
                 "suggested_at": p.created_at.isoformat() if p.created_at else None,
             })
 
@@ -2191,6 +2205,9 @@ class WebsiteSuggestionActionView(TenantScopedAPIView):
             return Response({"detail": "Prompt not found."},
                             status=status.HTTP_404_NOT_FOUND)
         if action == "accept":
+            tracked_prompts.check_capacity(
+                website, tracked_prompts.adding_count(website, prompt_ids=[prompt.id]),
+            )
             bp, _ = BrandPrompt.objects.get_or_create(website=website, prompt=prompt)
             # If the user had previously rejected this one, lift the
             # rejection so it doesn't keep being filtered out elsewhere.
@@ -2218,6 +2235,10 @@ class WebsiteSuggestionBulkView(TenantScopedAPIView):
 
         prompts = list(Prompt.objects.filter(is_active=True, id__in=ids))
         if action == "accept":
+            # All or nothing under the plan's tracked-prompt cap.
+            tracked_prompts.check_capacity(
+                website, tracked_prompts.adding_count(website, prompt_ids=[p.id for p in prompts]),
+            )
             BrandPrompt.objects.bulk_create(
                 [BrandPrompt(website=website, prompt=p) for p in prompts],
                 ignore_conflicts=True,
@@ -2248,7 +2269,7 @@ class PromptFanoutsView(TenantScopedAPIView):
         fanouts = list(
             PromptFanout.objects
             .filter(website=website, prompt=prompt)
-            .values("id", "text", "provider", "source", "confidence", "created_at")
+            .values("id", "text", "provider", "source", "created_at")
             .order_by("-created_at")[:50]
         )
         last_run = (
@@ -2289,6 +2310,18 @@ class PromptCrawlTriggerView(TenantScopedAPIView):
         except Prompt.DoesNotExist:
             return Response({"detail": "Prompt not found."},
                             status=status.HTTP_404_NOT_FOUND)
+
+        from apps.llm_ranking.services.audit_factory import (
+            NoLLMProviderConfigured,
+            configured_providers,
+            missing_provider_keys,
+        )
+
+        if not configured_providers():
+            return Response(
+                NoLLMProviderConfigured(missing_provider_keys()).response_body(),
+                status=status.HTTP_409_CONFLICT,
+            )
 
         # mode=missing: the page's silent gap-fill (query only models that
         # never answered). Default: full re-run of every configured model.

@@ -74,6 +74,17 @@ def _strip_junk_issues(brands: list[dict]) -> list[dict]:
     return brands
 
 
+# content_kind of a row whose brands were extracted from a Perplexity
+# summary because the page itself could not be read. Older rows used
+# "perplexity" for the same thing.
+SUMMARY_KIND = "summary"
+SUMMARY_KINDS = frozenset({SUMMARY_KIND, "perplexity"})
+
+
+def is_summary_derived(result) -> bool:
+    return (result.content_kind or "") in SUMMARY_KINDS
+
+
 # Lanes the UI draws a load sign for. Ordered as they run so the graph
 # fills left to right. "analysis" covers the per-URL read+extract loop,
 # which is the slow one; the discovery lanes finish in seconds.
@@ -350,11 +361,12 @@ def run_scan(scan: SourceScan) -> SourceScan:
         result.content_kind = content["kind"]
         result.word_count = content["word_count"]
         if content["status"] != "ok" or not content["text"].strip():
-            # Direct fetch failed (403, blocked, empty body). Try
-            # Perplexity as a URL-aware summarizer so we can still
-            # extract brands from sources our fetcher can't reach
-            # (Reddit anti-bot walls, paywalled sites). The summary
-            # replaces the article body for the Claude extraction step.
+            # Direct fetch failed (403, blocked, empty body). Perplexity
+            # can still summarize sources our fetcher can't reach (Reddit
+            # anti-bot walls, paywalled sites), and brands are extracted
+            # from that summary instead. fetch_status keeps the real fetch
+            # outcome and content_kind marks the row as summary-derived,
+            # so the row is never presented as a page we read.
             fallback = web_search.summarize_url_with_perplexity(
                 result.url,
                 query=scan.query,
@@ -362,14 +374,13 @@ def run_scan(scan: SourceScan) -> SourceScan:
             )
             if fallback and fallback.get("text", "").strip():
                 content = {
-                    "status": "ok",
-                    "kind": "perplexity",
+                    "status": content["status"],
+                    "kind": SUMMARY_KIND,
                     "text": fallback["text"],
                     "word_count": fallback.get("word_count") or len(fallback["text"].split()),
-                    "detail": "perplexity fallback",
+                    "detail": "perplexity summary",
                 }
-                result.fetch_status = "ok"
-                result.content_kind = "perplexity"
+                result.content_kind = SUMMARY_KIND
                 result.word_count = content["word_count"]
             else:
                 result.analysis_error = content["detail"] or "no content"
@@ -632,7 +643,9 @@ def derive_opportunities(scan: SourceScan) -> list[dict]:
     target = scan.website.name or ""
     opportunities = []
     for result in scan.results.all():
-        if not result.relevant or result.fetch_status != "ok":
+        # A summary can leave the user's brand out even when the page
+        # names it, so "competitors named, you are not" needs the page.
+        if not result.relevant or result.fetch_status != "ok" or is_summary_derived(result):
             continue
         # Hard gate: only surface sources with a comment/reply surface.
         # News, blogs, guides, review aggregators without user contribution

@@ -21,7 +21,9 @@ import base64
 import hashlib
 import hmac
 import logging
+import math
 import secrets
+import unicodedata
 
 from django.conf import settings
 from django.utils import timezone
@@ -44,13 +46,86 @@ STOP_WORDS = {"stop", "stopall", "unsubscribe", "cancel", "end", "quit"}
 START_WORDS = {"start", "unstop", "yes"}
 HELP_WORDS = {"help", "info"}
 
+# Where HELP points people (one place, so it is a one-line change).
+HELP_CONTACT = "support@cansee.ai"
 HELP_REPLY = (
-    "Cansee alerts. Reply STOP to unsubscribe, START to resume. "
-    "Ask a question in plain English and I'll answer from your account data. "
-    "Msg&data rates may apply."
+    "Cansee: Autopilot daily texts and alerts, about 1 msg a day per project. Text a "
+    "question to get an answer from your account data. Reply STOP to unsubscribe, START "
+    f"to resume. Help: {HELP_CONTACT}. Msg&data rates may apply."
 )
-STOP_REPLY = "You're unsubscribed from Cansee texts. Reply START to resume."
-START_REPLY = "You're resubscribed to Cansee alerts. Reply STOP to unsubscribe."
+STOP_REPLY = (
+    "You're unsubscribed from all Cansee texts, including daily digests. Reply START to "
+    "resume."
+)
+START_REPLY = "You're resubscribed to Cansee texts. Reply STOP to unsubscribe."
+
+# What a send came to (notify_status): sent; retryable when Twilio answered
+# 429 or 5xx; failed for anything else, a timeout or a lost connection
+# included (Twilio may have sent it, so it is never sent again).
+SENT = "sent"
+RETRYABLE = "retryable"
+FAILED = "failed"
+
+# -- GSM-7 -----------------------------------------------------------------------
+#
+# One character outside GSM-7 turns a whole text into UCS-2 (70 characters a
+# segment instead of 160), so texts are cleaned to the basic set and its
+# extension table (two septets each) before they are measured or sent.
+
+GSM7_BASIC = frozenset(
+    "@£$¥èéùìòÇ\nØø\rÅåΔ_ΦΓΛΩΠΨΣΘΞÆæßÉ !\"#¤%&'()*+,-./0123456789:;<=>?"
+    "¡ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÑÜ§¿abcdefghijklmnopqrstuvwxyzäöñüà"
+)
+GSM7_EXTENSION = frozenset("^{}\\[~]|€\f")
+_GSM7_MAP = {
+    "\u2018": "'", "\u2019": "'", "\u201a": "'", "\u201b": "'", "\u2032": "'", "\u00b4": "'",
+    "\u201c": '"', "\u201d": '"', "\u201e": '"', "\u201f": '"', "\u2033": '"',
+    "\u00ab": '"', "\u00bb": '"',
+    "\u2010": "-", "\u2011": "-", "\u2012": "-", "\u2013": "-", "\u2014": "-", "\u2015": "-",
+    "\u2212": "-",
+    "\u2026": "...",
+}
+
+
+def gsm7_text(text: str) -> str:
+    """``text`` in GSM-7: curly quotes become straight, dashes ``-``, the
+    ellipsis ``...``, other spaces a space, accents outside the set are
+    stripped (``á`` to ``a``) and anything else (emoji included) is dropped."""
+    out = []
+    for ch in text or "":
+        if ch in GSM7_BASIC or ch in GSM7_EXTENSION:
+            out.append(ch)
+        elif ch in _GSM7_MAP:
+            out.append(_GSM7_MAP[ch])
+        elif ch.isspace():
+            out.append(" ")
+        else:
+            out.append("".join(
+                c for c in unicodedata.normalize("NFKD", ch)
+                if c in GSM7_BASIC and not unicodedata.combining(c)
+            ))
+    return "".join(out)
+
+
+def is_gsm7(text: str) -> bool:
+    return all(ch in GSM7_BASIC or ch in GSM7_EXTENSION for ch in text or "")
+
+
+def gsm7_septets(text: str) -> int:
+    """Septets a GSM-7 text takes: two for an extension character."""
+    return sum(2 if ch in GSM7_EXTENSION else 1 for ch in text or "")
+
+
+def segments(text: str) -> int:
+    """Segments Twilio bills for ``text``: GSM-7 is one up to 160 septets,
+    else 153 a segment; anything else is UCS-2 (70, else 67 a segment)."""
+    if not text:
+        return 0
+    if is_gsm7(text):
+        septets = gsm7_septets(text)
+        return 1 if septets <= 160 else math.ceil(septets / 153)
+    units = len(text.encode("utf-16-le")) // 2
+    return 1 if units <= 70 else math.ceil(units / 67)
 
 
 def is_configured() -> bool:
@@ -126,21 +201,22 @@ def code_matches(subscription, code: str) -> bool:
 # -- outbound ------------------------------------------------------------
 
 
-def send_sms(to_e164: str, body: str) -> bool:
-    """Send one message. Returns False rather than raising: a failed alert
-    must not take down the scan or webhook that triggered it."""
+def _send(to_e164: str, body: str) -> str:
+    """Send one message; SENT, RETRYABLE or FAILED. Never raises: a failed
+    alert must not take down the scan or webhook that triggered it. Logs
+    never carry the body or the number."""
     if not is_enabled():
         logger.info("sms: skipped, channel disabled or unconfigured")
-        return False
+        return FAILED
     to = normalize_phone(to_e164)
     if not looks_like_phone(to):
         logger.warning("sms: refusing to send to a malformed number")
-        return False
+        return FAILED
 
     try:
         import requests
     except ImportError:  # pragma: no cover - requests is a hard dependency
-        return False
+        return FAILED
 
     sid = settings.TWILIO_ACCOUNT_SID
     payload = {
@@ -156,26 +232,42 @@ def send_sms(to_e164: str, body: str) -> bool:
             timeout=SEND_TIMEOUT,
         )
     except Exception as exc:
+        # A timeout or a lost connection: Twilio may have sent it.
         logger.warning("sms: send failed: %s", exc)
-        return False
+        return FAILED
 
+    if resp.status_code == 429 or 500 <= resp.status_code < 600:
+        logger.warning("sms: twilio returned HTTP %s (retryable)", resp.status_code)
+        return RETRYABLE
     if resp.status_code >= 300:
         # Never log the body: it contains the recipient number.
         logger.warning("sms: twilio returned HTTP %s", resp.status_code)
-        return False
-    return True
+        return FAILED
+    return SENT
+
+
+def send_sms(to_e164: str, body: str) -> bool:
+    """Send one message. Returns False rather than raising."""
+    return _send(to_e164, body) == SENT
+
+
+def notify_status(subscription, body: str) -> str:
+    """Send to a subscription, honouring its state: SENT, RETRYABLE (Twilio
+    answered 429 or 5xx) or FAILED (anything else, a timeout or a lost
+    connection included)."""
+    if subscription is None or not subscription.is_active:
+        return FAILED
+    status = _send(subscription.phone_e164, body)
+    if status == SENT:
+        subscription.last_message_at = timezone.now()
+        subscription.save(update_fields=["last_message_at", "updated_at"])
+    return status
 
 
 def notify(subscription, body: str) -> bool:
     """Send to a subscription, honouring its state. The only path alerts
     should use -- it is what makes an opt-out actually stick."""
-    if subscription is None or not subscription.is_active:
-        return False
-    sent = send_sms(subscription.phone_e164, body)
-    if sent:
-        subscription.last_message_at = timezone.now()
-        subscription.save(update_fields=["last_message_at", "updated_at"])
-    return sent
+    return notify_status(subscription, body) == SENT
 
 
 # -- inbound -------------------------------------------------------------
@@ -207,25 +299,45 @@ def verify_twilio_signature(request) -> bool:
     return hmac.compare_digest(expected, signature)
 
 
-def handle_keyword(subscription, body: str) -> str | None:
-    """Apply STOP / START / HELP. Returns the reply, or None if the message
-    was not a keyword and should be treated as a question.
+def handle_keyword(subscriptions, body: str) -> str | None:
+    """Apply STOP / START / HELP to every subscription of the sending
+    number. Returns the reply, or None if the message was not a keyword
+    and should be treated as a question.
+
+    STOP opts out every row, for every account, pending ones included.
+    START revives only opted-out rows that were verified once
+    (``consented_at`` set): a number someone else added but never verified
+    stays opted out, so the owner's START cannot make it textable by that
+    account.
 
     Checked before any other interpretation: an opt-out has to work even
     when everything downstream is failing.
     """
+    if subscriptions is None:
+        rows = []
+    elif hasattr(subscriptions, "status"):
+        rows = [subscriptions]
+    else:
+        rows = [s for s in subscriptions if s is not None]
     word = (body or "").strip().lower()
     if word in STOP_WORDS:
-        if subscription is not None:
+        now = timezone.now()
+        for subscription in rows:
+            if subscription.status == subscription.Status.OPTED_OUT:
+                continue
             subscription.status = subscription.Status.OPTED_OUT
-            subscription.opted_out_at = timezone.now()
+            subscription.opted_out_at = now
             subscription.save(update_fields=["status", "opted_out_at", "updated_at"])
         return STOP_REPLY
     if word in START_WORDS:
-        if subscription is not None and subscription.status == subscription.Status.OPTED_OUT:
-            subscription.status = subscription.Status.VERIFIED
-            subscription.opted_out_at = None
-            subscription.save(update_fields=["status", "opted_out_at", "updated_at"])
+        for subscription in rows:
+            if (
+                subscription.status == subscription.Status.OPTED_OUT
+                and subscription.consented_at is not None
+            ):
+                subscription.status = subscription.Status.VERIFIED
+                subscription.opted_out_at = None
+                subscription.save(update_fields=["status", "opted_out_at", "updated_at"])
         return START_REPLY
     if word in HELP_WORDS:
         return HELP_REPLY

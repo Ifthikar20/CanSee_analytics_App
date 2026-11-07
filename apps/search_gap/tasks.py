@@ -32,3 +32,25 @@ def check_google_rank(self, brand_prompt_id: str, force: bool = False) -> dict:
         )
         return {"error": "daily_limit"}
     return {"check_id": str(check.id), "position": check.position, "error": check.error}
+
+
+@shared_task(name="apps.search_gap.tasks.run_country_check", bind=True, max_retries=0,
+             soft_time_limit=900, time_limit=960)
+def run_country_check(self, run_id: str, country: str) -> dict:
+    """One country of a country check (COUNTRY_CHECK_RUN_MODE celery or
+    auto): its Google pages and engine answers, then the run may finish.
+
+    A country that runs out of time ends its unfinished cells as failed
+    rather than leaving the run waiting for the stale sweep.
+    """
+    from celery.exceptions import SoftTimeLimitExceeded
+
+    from apps.search_gap.services import country_checks
+
+    try:
+        country_checks.execute_country(run_id, country)
+    except SoftTimeLimitExceeded:
+        logger.warning("search_gap: country check %s timed out in %s", run_id, country)
+        country_checks.time_out_country(run_id, country)
+        return {"run_id": run_id, "country": country, "error": "timeout"}
+    return {"run_id": run_id, "country": country}

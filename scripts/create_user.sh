@@ -2,19 +2,19 @@
 #
 # Interactive create-user helper.
 #
-# Prompts for env (local / prod), email, password, and full name,
-# then creates the user — locally via the venv or on prod via docker
-# compose exec. Mirrors scripts/login.sh so the two halves of the
-# "I need a user" flow share the same UX.
+# Prompts for env (local / prod), email, full name and an optional
+# organization slug, then runs `manage.py create_user` locally or, on
+# prod, inside the web container over SSH. The password is typed at the
+# command's own hidden prompt; it is never passed as an argument.
 #
 # Public registration is disabled on prod (SIGNUPS_ENABLED=False), so
 # this script is the canonical way to provision an account.
 #
 # Usage:
-#   scripts/create_user.sh                                    # full prompts
-#   scripts/create_user.sh local                              # skip env prompt
-#   scripts/create_user.sh prod jane@example.com 'S3cure-Example!' # skip almost everything
-#   scripts/create_user.sh prod jane@example.com 'S3cure-Example!' "Jane Doe"
+#   scripts/create_user.sh                                   # full prompts
+#   scripts/create_user.sh local                             # skip env prompt
+#   scripts/create_user.sh prod jane@example.com "Jane Doe"
+#   scripts/create_user.sh prod jane@example.com "Jane Doe" acme   # join org "acme"
 
 set -euo pipefail
 
@@ -36,8 +36,8 @@ COMPOSE_FILE="docker/docker-compose.prod.yml"
 # ── Args (all optional) ──────────────────────────────────────────────
 env_choice="${1:-}"
 email_arg="${2:-}"
-password_arg="${3:-}"
-name_arg="${4:-}"
+name_arg="${3:-}"
+org_arg="${4:-}"
 
 # ── Env prompt ───────────────────────────────────────────────────────
 if [[ -z "$env_choice" ]]; then
@@ -52,27 +52,26 @@ if [[ -z "$env_choice" ]]; then
   esac
 fi
 
-# ── Credentials prompts ──────────────────────────────────────────────
+# ── Account prompts ──────────────────────────────────────────────────
 if [[ -z "$email_arg" ]]; then
   printf "${B}Email:${N} "
   read -r email_arg
 fi
 [[ -z "$email_arg" ]] && { printf "${R}Email is required.${N}\n" >&2; exit 1; }
 
-if [[ -z "$password_arg" ]]; then
-  printf "${B}Password:${N} "
-  stty -echo
-  read -r password_arg
-  stty echo
-  printf "\n"
-fi
-[[ -z "$password_arg" ]] && { printf "${R}Password is required.${N}\n" >&2; exit 1; }
-
 if [[ -z "$name_arg" ]]; then
-  printf "${B}Full name${N} ${D}(blank = Test User)${N}: "
+  printf "${B}Full name:${N} "
   read -r name_arg
-  [[ -z "$name_arg" ]] && name_arg="Test User"
 fi
+[[ -z "$name_arg" ]] && { printf "${R}Full name is required.${N}\n" >&2; exit 1; }
+
+if [[ $# -lt 4 ]]; then
+  printf "${B}Organization slug${N} ${D}(blank = none)${N}: "
+  read -r org_arg
+fi
+
+cmd_args=(create_user "$email_arg" "$name_arg")
+[[ -n "$org_arg" ]] && cmd_args+=(--org "$org_arg")
 
 # ── Confirm prod ─────────────────────────────────────────────────────
 if [[ "$env_choice" == "prod" ]]; then
@@ -85,35 +84,31 @@ if [[ "$env_choice" == "prod" ]]; then
   esac
 fi
 
-printf "\n${C}→ creating user...${N}\n"
+printf "\n${C}→ creating user (you will be asked for the password)...${N}\n"
 
 # ── Local path ───────────────────────────────────────────────────────
 if [[ "$env_choice" == "local" ]]; then
-  # Prefer the active virtualenv; fall back to system python.
-  if [[ -x "$REPO_DIR/venv/bin/python" ]]; then
+  # Prefer the project virtualenv; fall back to system python.
+  if [[ -x "$REPO_DIR/.venv/bin/python" ]]; then
+    py="$REPO_DIR/.venv/bin/python"
+  elif [[ -x "$REPO_DIR/venv/bin/python" ]]; then
     py="$REPO_DIR/venv/bin/python"
   else
     py="python3"
   fi
-  "$py" scripts/create_test_user.py "$email_arg" "$name_arg" --password "$password_arg"
-  exit $?
+  exec "$py" manage.py "${cmd_args[@]}"
 fi
 
 # ── Prod path ────────────────────────────────────────────────────────
 if [[ ! -f "$PEM_KEY" ]]; then
   printf "${R}PEM key not found at %s${N}\n" "$PEM_KEY" >&2
-  printf "Set PEM_KEY=/path/to/cansee-deploy.pem or place it in the repo root.\n" >&2
+  printf "Set PEM_KEY=/path/to/cansee-deploy.pem.\n" >&2
   exit 1
 fi
 
-SSH_OPTS=(-i "$PEM_KEY" -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR)
-
-# Escape single quotes inside the args so they survive the nested
-# shell on the EC2 host. We bash-escape each value and inline.
-esc() { printf "%q" "$1"; }
-
-remote_cmd="cd $REMOTE_DIR && \
-docker compose -f $COMPOSE_FILE exec -T web \
-python scripts/create_test_user.py $(esc "$email_arg") $(esc "$name_arg") --password $(esc "$password_arg")"
-
-ssh "${SSH_OPTS[@]}" "$EC2_USER@$EC2_HOST" "$remote_cmd"
+# -t gives the remote command a terminal, so the password prompt runs
+# inside the container and the password never leaves that session.
+printf -v quoted '%q ' "${cmd_args[@]}"
+exec ssh -t -i "$PEM_KEY" -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR \
+  "$EC2_USER@$EC2_HOST" \
+  "cd $REMOTE_DIR && docker compose -f $COMPOSE_FILE exec web python manage.py $quoted"

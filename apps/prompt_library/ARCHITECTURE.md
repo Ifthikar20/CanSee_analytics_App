@@ -19,19 +19,13 @@ mined corpus organised by a flat 20-row industry taxonomy.
 
 `Prompt.text_hash` is a sha256 of the normalised text. Combined with the
 `(industry, text_hash)` unique constraint it gives cheap exact-dedup at
-the DB layer; near-duplicate detection lives in the dedup service.
+the DB layer. There is no near-duplicate detection.
 
 ## Services
 
 * `miner_service` — pluggable miner with `RedditMiner`, `SerpApiMiner`,
   `LLMSynthMiner`. Each miner gracefully no-ops when its credentials
   are missing; the daily Celery task tolerates a half-configured env.
-* `paraphrase_service` — generates paraphrases via the existing
-  Anthropic provider, persisted as `PromptVariation`s with optional
-  embeddings.
-* `dedup_service` — cosine-similarity check against existing
-  variations; falls back to a trigram heuristic if the rag embedder is
-  unavailable.
 * `sampler_service` — stratified / recent / top-demand sampling. The
   stratified strategy assigns equal slots per intent bucket and
   back-fills under-quota buckets from leftovers. Always seeded for

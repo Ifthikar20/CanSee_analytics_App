@@ -2,24 +2,28 @@
 Regions catalog for geo-segmented LLM ranking audits.
 
 A region is a two-letter ISO country code plus a human label and the
-prompt-flavour string we splice into prompts to bias the LLM toward
-that geo's training-data examples.
+country code passed to engines that accept a user location.
 
-Selecting a region affects three places in the pipeline:
+Selecting a region affects two places in the pipeline:
 
-  1. ``LLMRankingService.generate_prompts`` — appends a region hint
-     to each prompt template ("... used by US companies").
-  2. ``providers.perplexity.PerplexityProvider`` — passes the region
-     to Perplexity's ``web_search_options.user_location`` so the
-     web-grounded search retrieves region-appropriate sources.
-  3. ``citation_geo.attribute_country`` — labels each citation URL
+  1. The providers — Perplexity gets the region as
+     ``web_search_options.user_location``; engines without a geo
+     parameter (Gemini, Grok) get ``region_system_instruction``.
+  2. ``citation_geo.attribute_country`` — labels each citation URL
      with the country derived from its ccTLD; the per-audit
      ``citation_countries`` aggregate is then a region-of-origin
      footprint for the brands that ranked.
+
+Country checks (apps.search_gap) label how each answer was localized:
+``searched`` when the engine's web search carried the country as the
+user's location, ``asked`` when the system instruction asked it to answer
+for the country instead.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
+
+from django.conf import settings
 
 REGION_GLOBAL = "global"
 REGION_US = "us"
@@ -34,32 +38,23 @@ REGION_AU = "au"
 class Region:
     code: str
     label: str
-    flavor: str           # spliced into prompts
     perplexity_country: str  # ISO-2 code passed to Perplexity user_location
 
 
 REGIONS: dict[str, Region] = {
-    REGION_GLOBAL: Region(REGION_GLOBAL, "Global", "", ""),
-    REGION_US: Region(REGION_US, "United States",
-                      "for US companies and customers", "US"),
-    REGION_CA: Region(REGION_CA, "Canada",
-                      "used by Canadian businesses", "CA"),
-    REGION_IN: Region(REGION_IN, "India",
-                      "popular in India", "IN"),
-    REGION_UK: Region(REGION_UK, "United Kingdom",
-                      "in the UK market", "GB"),
-    REGION_DE: Region(REGION_DE, "Germany",
-                      "used by German companies", "DE"),
-    REGION_AU: Region(REGION_AU, "Australia",
-                      "popular with Australian teams", "AU"),
+    REGION_GLOBAL: Region(REGION_GLOBAL, "Global", ""),
+    REGION_US: Region(REGION_US, "United States", "US"),
+    REGION_CA: Region(REGION_CA, "Canada", "CA"),
+    REGION_IN: Region(REGION_IN, "India", "IN"),
+    REGION_UK: Region(REGION_UK, "United Kingdom", "GB"),
+    REGION_DE: Region(REGION_DE, "Germany", "DE"),
+    REGION_AU: Region(REGION_AU, "Australia", "AU"),
 }
 
-# Broad ISO-3166 country catalog. The original six above keep their
-# hand-written flavours (tests depend on them); every other country is added
-# generically, keyed by its ISO-2 code (lower-case). Native geo (Perplexity /
-# Claude / GPT user_location) uses ``perplexity_country``; models without a
-# geo parameter (Gemini, Grok) instead get the location injected into their
-# system instruction via :func:`region_system_instruction`.
+# Broad ISO-3166 country catalog, keyed by ISO-2 code (lower-case). Native
+# geo (Perplexity / Claude / GPT user_location) uses ``perplexity_country``;
+# models without a geo parameter (Gemini, Grok) instead get the location
+# injected into their system instruction via :func:`region_system_instruction`.
 _COUNTRY_NAMES = {
     "GB": "United Kingdom", "FR": "France", "ES": "Spain", "IT": "Italy",
     "NL": "Netherlands", "SE": "Sweden", "IE": "Ireland", "RU": "Russia",
@@ -81,9 +76,7 @@ _COUNTRY_NAMES = {
     "LV": "Latvia", "LT": "Lithuania",
 }
 for _iso, _label in _COUNTRY_NAMES.items():
-    REGIONS.setdefault(
-        _iso.lower(), Region(_iso.lower(), _label, f"popular in {_label}", _iso),
-    )
+    REGIONS.setdefault(_iso.lower(), Region(_iso.lower(), _label, _iso))
 
 REGION_CHOICES = [(r.code, r.label) for r in REGIONS.values()]
 
@@ -142,25 +135,50 @@ def supported_countries() -> list[dict]:
     )
 
 
-def flavor_prompt(prompt_text: str, region_code: str) -> str:
-    """
-    Append the region's prompt flavour to a prompt without breaking the
-    sentence. ``GLOBAL`` returns the prompt unchanged.
+# Providers whose web search takes the user's location (Perplexity always
+# searches; Claude and GPT only with LLM_WEBSEARCH_ENABLED).
+SEARCH_LOCATED = ("perplexity", "claude", "gpt4")
+# Providers that append region_system_instruction themselves from ``region``.
+SELF_INSTRUCTED = ("gemini", "grok")
 
-    We append rather than rewrite so the intent type / placeholder
-    semantics from the prompt library stay intact.
-    """
-    region = get_region(region_code)
-    if not region.flavor:
-        return prompt_text
-    text = prompt_text.rstrip()
-    # Drop trailing punctuation, splice in the flavour, re-add a question mark
-    # if the original ended in one. Keeps "What are the best X?" → "What
-    # are the best X for US companies and customers?" reading naturally.
-    ends_q = text.endswith("?")
-    if ends_q:
-        text = text[:-1].rstrip()
-    if text.endswith((".", "!")):
-        text = text[:-1].rstrip()
-    text = f"{text} {region.flavor}"
-    return f"{text}?" if ends_q else f"{text}."
+METHOD_SEARCHED = "searched"
+METHOD_ASKED = "asked"
+
+
+def planned_country_method(provider_key: str) -> str:
+    """How a country answer from this provider will be localized."""
+    if provider_key == "perplexity":
+        return METHOD_SEARCHED
+    if provider_key in ("claude", "gpt4"):
+        return METHOD_SEARCHED if getattr(settings, "LLM_WEBSEARCH_ENABLED", False) else METHOD_ASKED
+    return METHOD_ASKED
+
+
+def answer_country_method(provider_key: str, result) -> str:
+    """How one answer was localized: ``searched`` only when the provider's
+    web search ran with the location (ProviderResult.searched)."""
+    if provider_key in SEARCH_LOCATED and getattr(result, "searched", False):
+        return METHOD_SEARCHED
+    return METHOD_ASKED
+
+
+def country_system_prompt(provider_key: str, country: str) -> str:
+    """The system prompt for a country answer, so every engine gets the
+    region instruction exactly once: Gemini and Grok add it themselves from
+    ``region``; the others get it here."""
+    from apps.llm_ranking.providers.claude import DEFAULT_SYSTEM
+
+    if provider_key in SELF_INSTRUCTED:
+        return DEFAULT_SYSTEM
+    instruction = region_system_instruction(region_for_country(country))
+    return f"{DEFAULT_SYSTEM}\n\n{instruction}" if instruction else DEFAULT_SYSTEM
+
+
+def engine_method_label(method: str, country: str | None) -> str:
+    """"Searched from GB" / "Asked to answer for GB"; without a country,
+    "... each country" (the plan before a check runs)."""
+    where = country.upper() if country else "each country"
+    if method == METHOD_SEARCHED:
+        return f"Searched from {where}"
+    return f"Asked to answer for {where}"
+

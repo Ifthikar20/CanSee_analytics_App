@@ -73,7 +73,7 @@ class WebsiteUpdateSerializer(serializers.Serializer):
 class WebsiteSettingsSerializer(serializers.ModelSerializer):
     class Meta:
         model = WebsiteSettings
-        fields = ["track_anonymous", "notify_hot_leads", "hot_lead_threshold", "weekly_report"]
+        fields = ["track_anonymous", "weekly_report"]
 
 
 class WebsiteMembershipSerializer(serializers.ModelSerializer):

@@ -145,22 +145,8 @@ class RedditMiner(BaseMiner):
                     "excerpt": selftext,
                     "source_url": ("https://www.reddit.com" + permalink) if permalink else "",
                     "intent_bucket": _classify_intent(title),
-                    "demand_score": _score_to_demand(d.get("score") or 0),
                 })
         return results
-
-
-def _score_to_demand(reddit_score: int) -> float:
-    """Map a Reddit upvote count to a 0..1 demand_score.
-
-    Reddit scores have a long tail. log10 keeps a 100-upvote thread
-    visibly above a 10-upvote one without letting a 5000-upvote outlier
-    saturate the bar.
-    """
-    import math
-    if reddit_score <= 0:
-        return 0.1
-    return min(1.0, 0.1 + math.log10(reddit_score + 1) / 4.0)
 
 
 class SerpApiMiner(BaseMiner):
@@ -297,8 +283,8 @@ def mine_for_industry(
     """Run each requested miner and persist new prompts.
 
     Returns a summary ``{source: count}`` dict. Exact duplicates (by
-    ``text_hash``) are skipped silently; near-duplicate detection lives
-    in :mod:`dedup_service` and runs at paraphrase time.
+    ``text_hash``) are skipped silently. Ranking scores are computed
+    nightly by :mod:`scoring_service`, not here.
     """
     summary: dict[str, int] = {}
     for source in sources:
@@ -323,8 +309,6 @@ def mine_for_industry(
                 "source_url": row.get("source_url", "") or "",
                 "excerpt": row.get("excerpt", "") or "",
             }
-            if "demand_score" in row and row["demand_score"] is not None:
-                defaults["demand_score"] = float(row["demand_score"])
             obj, was_created = Prompt.objects.get_or_create(
                 industry=industry,
                 text_hash=text_hash(text),

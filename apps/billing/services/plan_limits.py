@@ -17,6 +17,11 @@ from core.utils.constants import PLAN_LIMITS, Plan, SubscriptionStatus
 # (see polar_billing.reverify_ended_trial); this is the offline safety net.
 TRIAL_LAPSE_GRACE = timedelta(hours=24)
 
+# Plans a subscription row grants as themselves. Anything else on an
+# access-granting row (a legacy value) resolves through _LEGACY_MAP, else to
+# Pro: honour the payment rather than drop a paying account to Free.
+PAID_PLANS = (Plan.PROMPTS_100, Plan.PROMPTS_200, Plan.PRO, Plan.BUSINESS)
+
 
 def trial_end_for(sub):
     """End of the trial window for a TRIALING row, else None.
@@ -58,7 +63,7 @@ def plan_for_subscription(sub) -> str:
         and not trial_lapsed(sub)
     ):
         plan = _LEGACY_MAP.get(sub.plan, sub.plan)
-        if plan in (Plan.PRO, Plan.BUSINESS):
+        if plan in PAID_PLANS:
             return plan
         return Plan.PRO  # active sub on an unrecognized value: honor payment
     return Plan.FREE
@@ -130,13 +135,14 @@ def is_trialing_subscription(sub) -> bool:
 
 
 def tier_for_subscription(sub) -> str | None:
-    """The tier the row is FOR (pro|business, legacy names normalized),
-    regardless of status — for labels in non-access states such as
-    past_due ("Pro plan · payment issue"). None when there is no row."""
+    """The tier the row is FOR (one of PAID_PLANS, legacy names
+    normalized), regardless of status — for labels in non-access states
+    such as past_due ("Pro plan · payment issue"). None when there is no
+    row."""
     if sub is None:
         return None
     plan = _LEGACY_MAP.get(sub.plan, sub.plan)
-    return plan if plan in (Plan.PRO, Plan.BUSINESS) else Plan.PRO
+    return plan if plan in PAID_PLANS else Plan.PRO
 
 
 def subscription_state(sub) -> dict:
@@ -145,7 +151,7 @@ def subscription_state(sub) -> dict:
     One builder so every surface labels a trial, a paid plan and a lapsed
     row the same way:
       status               raw row status (or None)
-      plan                 resolved ACCESS tier: free|pro|business
+      plan                 resolved ACCESS tier: free, or one of PAID_PLANS
       tier                 subscribed tier regardless of status, or None
       is_paying            paywall gate (see is_paying_subscription)
       is_trialing          live free trial, not yet charged
@@ -173,6 +179,43 @@ def subscription_state(sub) -> dict:
     }
 
 
+def org_plan_for(user):
+    """The plan the user's organization grants, or None outside an org.
+
+    Enterprise org members inherit the org's manually provisioned plan
+    (Business has no self-serve checkout). Mirrors User.effective_plan's
+    org branch WITHOUT its personal ``user.plan`` fallback, which defaults
+    to a paid tier and leaked paid features to unsubscribed accounts.
+    Legacy plan names map to the live tiers.
+
+    None while ORG_FEATURES_ENABLED is off: the master switch keeps every
+    account plain B2C (the session and billing payloads show no org then),
+    so a membership staged before launch grants nothing until it is on.
+    """
+    from core.permissions.org import org_features_enabled
+
+    if user is None or not getattr(user, "pk", None):
+        return None
+    if not org_features_enabled():
+        return None
+    if not hasattr(user, "org_memberships"):
+        return None
+    org = getattr(user, "_org_cache", None)
+    if org is None:
+        # order_by matters: .first() on an unordered queryset gives an
+        # arbitrary row, so a user in two orgs would flap between plans.
+        membership = (
+            user.org_memberships.select_related("organization")
+            .order_by("created_at")
+            .first()
+        )
+        if membership is None:
+            return None
+        org = membership.organization
+        user._org_cache = org
+    return _LEGACY_MAP.get(org.plan, org.plan)
+
+
 def _resolve_plan_key(user):
     """Resolve the user's effective plan to a PLAN_LIMITS key."""
     # Paywall off: everyone gets the top tier so no feature or numeric
@@ -183,26 +226,9 @@ def _resolve_plan_key(user):
     # the old ``user.plan`` default provided.
     if user is None or not getattr(user, "pk", None):
         return Plan.PRO
-    # Enterprise org members inherit the org's manually provisioned plan
-    # (Business has no self-serve checkout). Mirrors User.effective_plan's
-    # org branch WITHOUT its personal ``user.plan`` fallback, which
-    # defaults to a paid tier and leaked paid features to unsubscribed
-    # accounts.
-    if hasattr(user, "org_memberships"):
-        org = getattr(user, "_org_cache", None)
-        if org is None:
-            # order_by matters: .first() on an unordered queryset gives an
-            # arbitrary row, so a user in two orgs would flap between plans.
-            membership = (
-                user.org_memberships.select_related("organization")
-                .order_by("created_at")
-                .first()
-            )
-            if membership:
-                org = membership.organization
-                user._org_cache = org
-        if org is not None:
-            return _LEGACY_MAP.get(org.plan, org.plan)
+    org_plan = org_plan_for(user)
+    if org_plan is not None:
+        return org_plan
     return current_plan_for(user)
 
 
@@ -212,30 +238,27 @@ def get_limits(user):
     return PLAN_LIMITS.get(plan_key, PLAN_LIMITS[Plan.PRO])
 
 
-def check_feature(user, feature_key):
-    """Return True if the user's plan includes the boolean feature."""
-    limits = get_limits(user)
-    value = limits.get(feature_key)
-    if isinstance(value, bool):
-        return value
-    # Numeric limits: -1 means unlimited, otherwise check > 0
-    if isinstance(value, int):
-        return value != 0
-    return False
+def plan_allows(user, feature: str) -> bool:
+    """Whether the user's effective plan includes ``feature``: ``autopilot``
+    (the daily run) or ``sms_digest`` (its one text a day). Paywall off,
+    every account is on Business and has both."""
+    return bool(get_limits(user).get(feature))
 
 
-def get_numeric_limit(user, feature_key):
-    """Return the numeric limit (or -1 for unlimited)."""
-    limits = get_limits(user)
-    return limits.get(feature_key, 0)
+def limits_block(user) -> dict:
+    """The resolved limits of the billing overview, the plan change answers
+    and the session payload (which adds ``seats`` for org members).
 
+    ``tracked_prompts`` is ``{"limit", "used"}`` with -1 for unlimited.
+    """
+    from apps.billing.services import tracked_prompts
 
-def is_within_limit(user, feature_key, current_usage):
-    """Check whether current usage is within the plan limit."""
-    limit = get_numeric_limit(user, feature_key)
-    if limit == -1:
-        return True  # unlimited
-    return current_usage < limit
+    return {
+        "projects": projects_limit_for(user),
+        "tracked_prompts": tracked_prompts.capacity(user),
+        "autopilot": plan_allows(user, "autopilot"),
+        "sms_digest": plan_allows(user, "sms_digest"),
+    }
 
 
 def projects_limit_for(user) -> int:
@@ -258,14 +281,3 @@ def projects_limit_for(user) -> int:
         return free_cap if raw == -1 else min(raw, free_cap)
     return raw
 
-
-def get_segment(user):
-    """Return the user's segment (individual or enterprise)."""
-    limits = get_limits(user)
-    return limits.get("segment", "individual")
-
-
-def get_visible_tabs(user):
-    """Return the list of visible sidebar tabs for the user's plan."""
-    limits = get_limits(user)
-    return limits.get("tabs", [])

@@ -1,27 +1,26 @@
 """
 Per-user daily call-budget primitive backed by the Django cache.
 
-Used by feature services in apps/llm_ranking/services/ (Google CSE,
-G-Eval judge, GEO content rewrite) to apply a flat per-user daily cap
-on third-party API calls. Each service owns its own ``namespace`` so
-budgets don't bleed across features.
+Used by feature services (Perplexity search, Search Console, GA4) to
+apply a flat daily cap on third-party API calls. Each service owns its
+own ``namespace`` so budgets don't bleed across features.
 
 Pattern:
 
     from core.quota import DailyQuota
 
-    cse_quota = DailyQuota(
-        namespace="gcse",
-        setting_name="GOOGLE_CSE_DAILY_LIMIT_PER_USER",
-        default_limit=100,
+    search_quota = DailyQuota(
+        namespace="pplx_search",
+        setting_name="PERPLEXITY_SEARCH_DAILY_LIMIT_PER_USER",
+        default_limit=200,
     )
 
-    if not cse_quota.consume(user_id):
+    if not search_quota.consume(user_id):
         return REFUSED
     ... make API call ...
 
-    cse_quota.remaining(user_id)   # how many calls left today
-    cse_quota.limit(user_id)        # what the cap is
+    search_quota.remaining(user_id)   # how many calls left today
+    search_quota.limit(user_id)        # what the cap is
 
 The counter key is ``<namespace>:quota:<user_id|'anon'>:<YYYYMMDD>``
 in the project cache (Redis in prod, locmem in tests). TTL is 26h so
@@ -68,10 +67,25 @@ class DailyQuota:
         """
         Reserve ``n`` calls. Returns False (and does NOT increment) when
         the call would exceed the daily cap.
+
+        Atomic: callers on several threads or processes at once (country
+        check workers, research agents) each count, and never both take
+        the last call. A read-then-write would let them all read the same
+        count and write back one increment between them.
         """
         key = self._key(user_id)
-        used = int(cache.get(key) or 0)
-        if used + n > self.limit(user_id):
+        limit = self.limit(user_id)
+        cache.add(key, 0, timeout=_TTL_SECONDS)
+        try:
+            used = cache.incr(key, n)
+        except ValueError:
+            # The bucket expired between add() and incr().
+            cache.add(key, 0, timeout=_TTL_SECONDS)
+            used = cache.incr(key, n)
+        if used > limit:
+            try:
+                cache.decr(key, n)
+            except ValueError:
+                pass  # the bucket expired meanwhile: nothing to give back
             return False
-        cache.set(key, used + n, timeout=_TTL_SECONDS)
         return True

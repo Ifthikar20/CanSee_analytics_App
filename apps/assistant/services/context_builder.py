@@ -6,9 +6,9 @@ Two layers, both scoped to the (user, website) the view already resolved:
    "ask" command (traffic + visibility + security + usage headlines).
 2. Question-routed provider sections (apps.assistant.services.providers)
    that reach into the rest of the product — per-prompt metrics, the
-   saved prompt library, Search Console, citations, audits, content
-   briefs, agents, the knowledge base — loading only the slices the
-   question is actually about.
+   saved prompt library, Search Console, citations, audits, the
+   knowledge base — loading only the slices the question is actually
+   about.
 
 Everything degrades to "" so a failure anywhere still lets the assistant
 answer from whatever else it has.
@@ -16,6 +16,7 @@ answer from whatever else it has.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 
 logger = logging.getLogger("apps")
 
@@ -25,6 +26,14 @@ logger = logging.getLogger("apps")
 MAX_CONTEXT_CHARS = 9000
 # Per-section ceiling so one chatty subsystem cannot starve the others.
 MAX_SECTION_CHARS = 2600
+
+
+@dataclass(frozen=True)
+class FactBlock:
+    text: str
+    # True when a question-routed section carried real figures or rows.
+    # The shared headline pack is always present, so it does not count.
+    grounded: bool
 
 
 def _base_fact_block(user, website) -> str:
@@ -42,14 +51,14 @@ def _base_fact_block(user, website) -> str:
         return ""
 
 
-def build_fact_block(user, website=None, question: str = "") -> str:
-    """Return the grounding block for one question, or "".
+def build_fact_block(user, website=None, question: str = "") -> FactBlock:
+    """Return the grounding block for one question.
 
     ``question`` selects which product areas to load; passing "" keeps
-    the old behaviour (headline facts only), which is what the
-    Slack/Discord path and the agent-chat context still want.
+    only the headline facts.
     """
     parts: list[str] = []
+    data_headers: list[str] = []
 
     base = _base_fact_block(user, website)
     if base:
@@ -59,19 +68,24 @@ def build_fact_block(user, website=None, question: str = "") -> str:
         try:
             from apps.assistant.services.providers import build_sections
 
-            for label, lines in build_sections(user, website, question):
-                body = "\n".join(lines)[:MAX_SECTION_CHARS]
-                parts.append(f"=== {label} ===\n{body}")
+            for section in build_sections(user, website, question):
+                header = f"=== {section.label} ==="
+                body = "\n".join(section.lines)[:MAX_SECTION_CHARS]
+                parts.append(f"{header}\n{body}")
+                if section.has_data:
+                    data_headers.append(header)
         except Exception:
             logger.warning("assistant provider sections failed", exc_info=True)
 
     if not parts:
-        return ""
+        return FactBlock(text="", grounded=False)
 
     block = (
         "Live Cansee account data for the selected website. Answer from "
         "these figures; never invent numbers. If something the user asked "
         "for is not here, say so and name the Cansee page that has it.\n\n"
         + "\n\n".join(parts)
-    )
-    return block[:MAX_CONTEXT_CHARS]
+    )[:MAX_CONTEXT_CHARS]
+    # A data section cut off by the ceiling never reached the model.
+    grounded = any(header in block for header in data_headers)
+    return FactBlock(text=block, grounded=grounded)

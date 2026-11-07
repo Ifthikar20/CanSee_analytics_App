@@ -10,6 +10,16 @@ from celery import shared_task
 logger = logging.getLogger("apps")
 
 
+def _result_dict(result) -> dict:
+    return {
+        "source_id": result.source_id, "url": result.url,
+        "status": result.status, "chunk_count": result.chunk_count,
+        "skipped_unchanged": result.skipped_unchanged, "error": result.error,
+        "embeddings_pending": result.embeddings_pending,
+        "embedding_reason": result.embedding_reason,
+    }
+
+
 @shared_task(
     name="apps.rag.tasks.ingest_url",
     bind=True, max_retries=2, default_retry_delay=30, acks_late=True,
@@ -28,12 +38,7 @@ def ingest_url_task(self, *, user_id: int, website_id: str, url: str,
     result = ingest_url(
         user=user, website=website, url=url, kind=kind, title=title,
     )
-    return {
-        "source_id": result.source_id, "url": result.url,
-        "status": result.status, "chunk_count": result.chunk_count,
-        "skipped_unchanged": result.skipped_unchanged,
-        "error": result.error,
-    }
+    return _result_dict(result)
 
 
 @shared_task(
@@ -55,11 +60,4 @@ def ingest_site_task(self, *, user_id: int, website_id: str, seed_url: str,
         user=user, website=website, seed_url=seed_url,
         page_cap=page_cap, depth=depth,
     )
-    return [
-        {
-            "source_id": r.source_id, "url": r.url,
-            "status": r.status, "chunk_count": r.chunk_count,
-            "skipped_unchanged": r.skipped_unchanged, "error": r.error,
-        }
-        for r in results
-    ]
+    return [_result_dict(r) for r in results]

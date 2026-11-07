@@ -154,10 +154,7 @@ Celery Task (ai queue)
   │     ├── Google Search for competitive context
   │     └── Build enriched system prompt for Claude
   │
-  ├── Generate prompts
-  │     ├── Load industry-matched prompt pack (JSON)
-  │     ├── Intent-balanced sampling (recommendation, comparison, use_case, ...)
-  │     └── Claude generates 4 additional natural-language variants
+  ├── Load the saved prompts (the user's own list; nothing is generated)
   │
   ├── For each (prompt × provider):
   │     ├── Query the LLM API
@@ -195,14 +192,13 @@ Celery Task (ai queue)
 
 | Method | What it does |
 |---|---|
-| `generate_prompts()` | Loads intent-balanced prompts from `PromptLibrary`, then asks Claude for 4 additional natural-language variants. Returns `[{text, type}]`, capped at 10. |
-| `_query_claude()` | Calls `claude-sonnet-4-20250514` with enriched system prompt (includes scraped website data). |
-| `_query_openai()` | Calls `gpt-4o-mini` via OpenAI SDK. |
-| `_query_gemini()` | Calls `gemini-1.5-flash` via Google Generative AI SDK. |
-| `_query_perplexity()` | Calls `llama-3.1-sonar-small-128k-online` via REST (web-grounded). |
+| `prepare_audit()` | Loads the audit, builds the enriched system prompt and the (prompt x provider) cells. |
+| `run_audit_cell()` | Queries one provider for one prompt through `apps/llm_ranking/providers`, extracts the mention data and stores an `LLMRankingResult`. |
+| `run_audit_sync()` | Runs every cell in-process (dev and tests). |
+| `finalise_audit()` | Aggregates the answered cells into the scores. A run with no answered query ends FAILED with NULL scores. |
 | `_analyze_mention()` | Heuristic fallback — regex-based rank extraction from numbered lists, lexicon-based sentiment classification. |
 | `compute_overall_score()` | Aggregates results into 0-100 score with Wilson CI on mention rate. |
-| `run_audit()` | Main orchestrator — enrichment → prompts → per-provider queries → extraction → aggregation. Writes `audit_logs` after each step. |
+| `generate_recommendations()` | Turns per-funnel-stage visibility into recommendations. |
 | `generate_recommendations()` | Returns actionable advice based on mention rate, avg rank, missing providers, negative sentiment. |
 
 ### `extraction_service.py` — `HaikuExtractionService`
@@ -232,25 +228,11 @@ Multi-source context aggregation for Claude's system prompt:
 3. **Google Search** — queries `"{business} review"` and `"best {industry} tools {business}"`, extracts snippets and competitor names.
 4. **Combined context** — assembles `=== MAIN WEBSITE ===`, `=== ADDITIONAL PAGES ===`, `=== WHAT GOOGLE SAYS ===` sections injected into Claude's system prompt.
 
-### `prompt_library.py` — `PromptLibrary`
+### `prompt_library.py` — intent metadata
 
-Intent-balanced prompt generation from JSON packs:
-
-| Pack | File | Matches |
-|---|---|---|
-| Default | `prompt_packs/default.json` | Always loaded |
-| SaaS | `prompt_packs/saas.json` | Industries containing "saas" |
-| E-commerce | `prompt_packs/ecommerce.json` | "ecommerce", "e-commerce", "dtc" |
-| Legal | `prompt_packs/legal.json` | "legal", "law", "attorney" |
-| Agency | `prompt_packs/agency.json` | "agency", "marketing" |
-| Healthcare | `prompt_packs/healthcare.json` | "health", "clinic", "telehealth" |
-
-**Intent priority weights** (controls sampling):
-```
-recommendation: 2    comparison: 2     use_case: 2
-alternatives:   1    category:   1     persona:  1
-review:         1    local:      1 (only if location provided)
-```
+Maps a prompt's intent to its funnel stage (`funnel_stage_for`) and to the
+rationale shown under each prompt row (`rationale_for`). It generates no
+prompt text: audits run only the prompts the user saved.
 
 ---
 

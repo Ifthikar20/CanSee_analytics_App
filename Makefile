@@ -17,9 +17,8 @@ help:
 	@echo "  make shell         Open Django shell"
 	@echo "  make run           Start dev server"
 	@echo "  make celery        Start Celery worker"
-	@echo "  make seed          Seed development data"
 	@echo "  make check-all     Run lint + type check + tests"
-	@echo "  make prod-build    Ruff + Vite prod bundle (mirrors CI + EC2)"
+	@echo "  make prod-build    Ruff, the same gate as CI lint"
 	@echo "  make prod-build-docker  Build prod Docker images locally"
 
 install:
@@ -42,7 +41,7 @@ format:
 	isort .
 
 shell:
-	DJANGO_SETTINGS_MODULE=$(SETTINGS_DEV) $(MANAGE) shell_plus
+	DJANGO_SETTINGS_MODULE=$(SETTINGS_DEV) $(MANAGE) shell
 
 run:
 	DJANGO_SETTINGS_MODULE=$(SETTINGS_DEV) $(MANAGE) runserver 0.0.0.0:8000
@@ -52,9 +51,6 @@ celery:
 
 celery-beat:
 	celery -A config.celery beat --loglevel=info --scheduler=django_celery_beat.schedulers:DatabaseScheduler
-
-seed:
-	DJANGO_SETTINGS_MODULE=$(SETTINGS_DEV) $(PYTHON) scripts/seed_data.py
 
 check-all: lint
 	mypy apps/ config/ core/ --ignore-missing-imports
@@ -66,13 +62,13 @@ generate-key:
 superuser:
 	DJANGO_SETTINGS_MODULE=$(SETTINGS_DEV) $(MANAGE) createsuperuser
 
-# Mirrors what CI Lint and the EC2 build do — runs ruff only now that the
-# frontend lives in the ftb-ui repo and is built by its own GitHub Action.
+# Mirrors what CI Lint does — ruff only. The frontend lives in its own
+# repo and is built and published by that repo's GitHub Action.
 prod-build:
 	@echo "▶ Ruff (same gate as CI Lint)"
 	ruff check .
 	@echo ""
-	@echo "✓ Prod build OK. UI bundle is built and published by ftb-ui CI."
+	@echo "✓ Prod build OK. The UI bundle is built and published by the UI repo's CI."
 
 # Heavier: builds the actual prod Docker images locally. Needs
 # .env.prod on disk. Use this when you want to verify Dockerfile or

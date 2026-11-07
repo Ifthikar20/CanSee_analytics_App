@@ -26,7 +26,7 @@ class PerplexityProvider(LLMProvider):
                 {"role": "system", "content": system_prompt or DEFAULT_SYSTEM},
                 {"role": "user", "content": prompt},
             ],
-            "max_tokens": 1024,
+            "max_tokens": 4096,
         }
         # Perplexity respects ``web_search_options.user_location`` and
         # biases the web grounding step toward that country. The other
@@ -67,4 +67,6 @@ class PerplexityProvider(LLMProvider):
             output_tokens=int(usage.get("completion_tokens", 0)),
             raw=body,
             citations=citations,
+            # Sonar lists its sources only when it searched the web.
+            searched=bool(citations),
         )

@@ -100,15 +100,3 @@ class TeamsService:
             f"Teams webhook returned {response.status_code}: {response.text[:200]}"
         )
         return False
-
-    @staticmethod
-    def send_hot_lead_alert(*, webhook_url: str, lead) -> bool:
-        """Send a hot-lead alert to Teams."""
-        return TeamsService.send_message(
-            webhook_url=webhook_url,
-            title="Hot lead detected",
-            text=(
-                f"Score **{lead.score}** on {lead.website.name}"
-                + (f" — {lead.company}" if lead.company else "")
-            ),
-        )

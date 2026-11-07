@@ -3,8 +3,10 @@ Polar-backed billing: product catalog, checkout, plan sync, portal.
 
 Replaces the Stripe checkout path. The flow:
 
-  1. `polar_billing_bootstrap` creates the Pro products in Polar
-     (monthly $45 / annual $450, 7-day trial) and their ids go into env.
+  1. The owner creates the two plan products in Polar (100 prompts $80 and
+     200 prompts $140, monthly, no trial) and their ids go into env
+     (POLAR_PRODUCT_PROMPTS_100_ID, POLAR_PRODUCT_PROMPTS_200_ID). The Pro
+     products (`polar_billing_bootstrap`) stay for Pro subscribers.
   2. CheckoutView -> create_checkout() -> redirect the user to Polar's
      hosted checkout (sandbox accepts Stripe test cards).
   3. The user returns to /dashboard?checkout=success&checkout_id=... and
@@ -31,16 +33,31 @@ from django.db import transaction
 from django.utils import timezone
 
 from apps.billing.models import Subscription
-from apps.billing.services.plan_limits import trial_ended
+from apps.billing.services.plan_limits import tier_for_subscription, trial_ended
 from apps.metering import polar_client
 from core.exceptions import CanseeException
 from core.logging.audit_logger import audit_log
-from core.utils.constants import Plan, SubscriptionStatus
+from core.utils.constants import (
+    PLAN_LIMITS,
+    PLAN_NAMES,
+    Plan,
+    SubscriptionStatus,
+    legacy_plan_key,
+)
 
 logger = logging.getLogger("billing")
 
 PRODUCT_PRO_MONTHLY = "Cansee Pro (Monthly)"
 PRODUCT_PRO_ANNUAL = "Cansee Pro (Annual)"
+
+# The self-serve plans and the setting holding each one's Polar product id.
+# No product id is written in code.
+PLAN_PRODUCT_SETTINGS = {
+    Plan.PROMPTS_100: "POLAR_PRODUCT_PROMPTS_100_ID",
+    Plan.PROMPTS_200: "POLAR_PRODUCT_PROMPTS_200_ID",
+}
+CHECKOUT_NOT_READY = "Checkout isn't set up yet."
+INVALID_PLAN = "Choose the 100 or 200 prompt plan."
 
 # Polar subscription status -> local SubscriptionStatus. Anything that
 # still grants access maps to ACTIVE/TRIALING; terminal states to
@@ -61,11 +78,37 @@ _STATUS_MAP = {
 }
 
 
+def product_id_for(plan) -> str:
+    """The Polar product id of a self-serve plan ("" when unset or not one)."""
+    setting = PLAN_PRODUCT_SETTINGS.get(plan)
+    return str(getattr(settings, setting, "") or "") if setting else ""
+
+
+def _pro_product_ids() -> set[str]:
+    return {
+        pid for pid in (
+            settings.POLAR_PRODUCT_PRO_MONTHLY_ID,
+            settings.POLAR_PRODUCT_PRO_ANNUAL_ID,
+        ) if pid
+    }
+
+
 def is_configured() -> bool:
+    """Polar can be reached and knows at least one of our products: enough
+    to sync, confirm, open the portal, cancel and resume, upgrade a trial
+    and take webhooks, so deploying before the plan products exist never
+    strands a paying Pro customer."""
     return bool(
         polar_client.is_configured()
-        and settings.POLAR_PRODUCT_PRO_MONTHLY_ID
-        and settings.POLAR_PRODUCT_PRO_ANNUAL_ID
+        and (_pro_product_ids() or any(product_id_for(p) for p in PLAN_PRODUCT_SETTINGS))
+    )
+
+
+def checkout_ready() -> bool:
+    """Checkout and plan changes can run: the token and both plan products."""
+    return bool(
+        polar_client.is_configured()
+        and all(product_id_for(p) for p in PLAN_PRODUCT_SETTINGS)
     )
 
 
@@ -78,7 +121,33 @@ def _require_configured() -> None:
         )
 
 
+def _require_checkout_ready() -> None:
+    if not checkout_ready():
+        raise CanseeException(
+            CHECKOUT_NOT_READY, code="billing_not_configured", status_code=503,
+        )
+
+
+def _require_self_serve(plan) -> None:
+    if not isinstance(plan, str) or plan not in PLAN_PRODUCT_SETTINGS:
+        raise CanseeException(INVALID_PLAN, code="invalid_plan", status_code=400)
+
+
+def _require_pro_product(annual: bool) -> str:
+    """The Pro product of one cadence, for the Pro-only paths: is_configured()
+    no longer implies the Pro products are set."""
+    product_id = _product_id_for(annual)
+    if not product_id:
+        raise CanseeException(
+            "Billing is not configured yet. Please try again later.",
+            code="billing_not_configured",
+            status_code=503,
+        )
+    return product_id
+
+
 def _product_id_for(annual: bool) -> str:
+    """The Pro product of one cadence (Pro subscribers only)."""
     return (
         settings.POLAR_PRODUCT_PRO_ANNUAL_ID
         if annual
@@ -87,10 +156,13 @@ def _product_id_for(annual: bool) -> str:
 
 
 def _plan_for_product(product_id: str) -> str | None:
-    if product_id in (
-        settings.POLAR_PRODUCT_PRO_MONTHLY_ID,
-        settings.POLAR_PRODUCT_PRO_ANNUAL_ID,
-    ):
+    """The plan a Polar product grants. Never matches an unset setting."""
+    if not product_id:
+        return None
+    for plan in PLAN_PRODUCT_SETTINGS:
+        if product_id == product_id_for(plan):
+            return plan
+    if product_id in _pro_product_ids():
         return Plan.PRO
     return None
 
@@ -178,9 +250,11 @@ def reverify_ended_trial(user, sub):
         return sub
 
 
-def create_checkout(user, *, annual: bool, origin: str, customer_ip: str = "") -> str:
-    """Create a Polar checkout for Pro; returns the hosted checkout URL."""
-    _require_configured()
+def create_checkout(user, *, plan: str, origin: str, customer_ip: str = "") -> str:
+    """Create a Polar checkout for a self-serve plan (100 or 200 prompts,
+    monthly); returns the hosted checkout URL."""
+    _require_self_serve(plan)
+    _require_checkout_ready()
 
     sub = Subscription.objects.filter(user=user).first()
     if not (
@@ -226,10 +300,10 @@ def create_checkout(user, *, annual: bool, origin: str, customer_ip: str = "") -
     # re-verifies the checkout against the API before granting anything.
     success_url = f"{origin}/billing?checkout=success&checkout_id={{CHECKOUT_ID}}"
     common = {
-        "product_ids": [_product_id_for(annual)],
+        "product_ids": [product_id_for(plan)],
         "external_customer_id": str(user.id),
         "success_url": success_url,
-        "metadata": {"plan": str(Plan.PRO), "annual": annual},
+        "metadata": {"plan": str(plan)},
         "customer_ip_address": customer_ip or None,
     }
     try:
@@ -251,7 +325,7 @@ def create_checkout(user, *, annual: bool, origin: str, customer_ip: str = "") -
     audit_log(
         "billing.checkout_created",
         user=user,
-        metadata={"checkout_id": str(checkout.id), "annual": annual, "provider": "polar"},
+        metadata={"checkout_id": str(checkout.id), "plan": str(plan), "provider": "polar"},
     )
     url = str(checkout.url)
     # Match the app's light theme on the hosted page.
@@ -315,7 +389,7 @@ def _lookup_managed_subscription(user, subscription_id):
     subscription that dropped out of it is indistinguishable there
     between "charge failed" (past_due), "dunning exhausted" (unpaid) and
     "canceled". The by-id read carries the real status. None means gone,
-    not ours, or not a Pro product — callers fall back to CANCELED.
+    not ours, or not one of our products — callers fall back to CANCELED.
     ``PolarUnavailable`` propagates on purpose: the local row is left
     untouched rather than guessed (webhook -> 500 -> Polar redelivers;
     request-path callers catch and log).
@@ -471,7 +545,7 @@ def upgrade_trial_now(user, *, annual: bool | None = None) -> Subscription:
     if annual is not None:
         want = "year" if annual else "month"
         if sub.interval != want:
-            product_id = _product_id_for(annual)
+            product_id = _require_pro_product(annual)
 
     polar_client.update_subscription_plan(
         sub.polar_subscription_id, end_trial_now=True, product_id=product_id,
@@ -518,7 +592,7 @@ def change_billing_cycle(user, *, annual: bool) -> Subscription:
 
     polar_client.update_subscription_plan(
         sub.polar_subscription_id,
-        product_id=_product_id_for(annual),
+        product_id=_require_pro_product(annual),
         proration_behavior=(
             "invoice" if sub.status == SubscriptionStatus.ACTIVE else None
         ),
@@ -529,6 +603,69 @@ def change_billing_cycle(user, *, annual: bool) -> Subscription:
         metadata={
             "subscription_id": sub.polar_subscription_id,
             "annual": annual,
+        },
+    )
+    synced = sync_from_customer_state(user)
+    return synced or sub
+
+
+def _price_monthly(plan) -> int:
+    raw = PLAN_LIMITS.get(legacy_plan_key(plan or ""), {}).get("price_monthly") or 0
+    return raw if isinstance(raw, int | float) and raw > 0 else 0
+
+
+def change_plan(user, *, plan: str) -> Subscription:
+    """Move an active subscription (a self-serve plan, or Pro) to the
+    product of ``plan``, now.
+
+    Moving up invoices the difference at once (proration "invoice"); moving
+    down credits the unused part to the next invoice ("prorate"). A Pro row
+    still in its free trial swaps for free (no proration), as
+    change_billing_cycle does: the new price applies when the trial converts.
+    """
+    _require_self_serve(plan)
+    _require_checkout_ready()
+    sub = Subscription.objects.filter(user=user).first()
+    if not sub or not sub.polar_subscription_id:
+        raise CanseeException(
+            "No subscription to update.", code="no_subscription", status_code=400,
+        )
+    # The self-serve plans have no trial: a trialing row is a Pro trial.
+    trialing_pro = (
+        sub.status == SubscriptionStatus.TRIALING and tier_for_subscription(sub) == Plan.PRO
+    )
+    if sub.status != SubscriptionStatus.ACTIVE and not trialing_pro:
+        raise CanseeException(
+            "Your subscription can't change plans right now.",
+            code="not_active",
+            status_code=400,
+        )
+    if sub.plan == plan:
+        raise CanseeException(
+            f"You're already on {PLAN_NAMES[plan]}.",
+            code="already_on_plan",
+            status_code=400,
+        )
+
+    if trialing_pro:
+        proration = None
+    elif _price_monthly(plan) > _price_monthly(sub.plan):
+        proration = "invoice"
+    else:
+        proration = "prorate"
+    polar_client.update_subscription_plan(
+        sub.polar_subscription_id,
+        product_id=product_id_for(plan),
+        proration_behavior=proration,
+    )
+    audit_log(
+        "billing.plan_changed",
+        user=user,
+        metadata={
+            "subscription_id": sub.polar_subscription_id,
+            "from": sub.plan,
+            "to": str(plan),
+            "proration": proration,
         },
     )
     synced = sync_from_customer_state(user)

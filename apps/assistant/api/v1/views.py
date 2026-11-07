@@ -17,8 +17,14 @@ Availability: settings.ASSISTANT_ENABLED is a deployment-wide
 entitlement/maintenance switch. When it is off, /ask/ returns 503 with
 the configured maintenance message and the UI degrades to a maintenance
 card instead of the composer.
+
+When no answer can be produced, /ask/ returns 503
+``assistant_not_configured`` (no AI provider key) or 502
+``assistant_failed`` (the provider call failed), as
+{"error": {"code", "message"}}, and stores nothing for that turn.
 """
 from django.conf import settings
+from django.db import transaction
 from django.db.models import Count
 from django.db.models.functions import Coalesce
 from django.utils import timezone
@@ -33,7 +39,12 @@ from apps.assistant.api.v1.serializers import (
     ConversationSummarySerializer,
 )
 from apps.assistant.models import AssistantConversation, AssistantMessage
-from apps.assistant.services.orchestrator import answer
+from apps.assistant.services.orchestrator import (
+    NOT_CONFIGURED_MESSAGE,
+    AssistantUnavailable,
+    answer,
+    get_assistant_provider,
+)
 from core.resilience import TokenBucket
 from core.views.base import TenantScopedAPIView
 
@@ -64,15 +75,25 @@ def _ask_bucket(user_id) -> TokenBucket:
 
 class AssistantStatusView(APIView):
     """Feature availability, so the UI can hide the trigger or show a
-    maintenance card without first firing a failing question."""
+    maintenance or "not available yet" card without first firing a
+    failing question. ``configured`` is False when no AI provider key
+    is set."""
 
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
         enabled = _is_enabled()
+        configured = get_assistant_provider() is not None
+        if not enabled:
+            message = _maintenance_message()
+        elif not configured:
+            message = NOT_CONFIGURED_MESSAGE
+        else:
+            message = ""
         return Response({
             "enabled": enabled,
-            "message": "" if enabled else _maintenance_message(),
+            "configured": configured,
+            "message": message,
         })
 
 
@@ -109,47 +130,58 @@ class AssistantAskView(TenantScopedAPIView):
             conversation = AssistantConversation.objects.filter(
                 pk=data["conversation_id"], website=website, user=request.user,
             ).first()
-        if conversation is None:
-            conversation = AssistantConversation.objects.create(
-                website=website, user=request.user,
-                title=AssistantConversation.title_from(question),
-            )
 
         # History comes from the stored thread when we have one: the client
         # copy is a mirror, and the database is the record of what was
         # actually said.
-        history = [
-            {"role": m.role, "content": m.content}
-            for m in conversation.messages.all()
-        ][-_MAX_HISTORY:]
+        history = []
+        if conversation is not None:
+            history = [
+                {"role": m.role, "content": m.content}
+                for m in conversation.messages.all()
+            ][-_MAX_HISTORY:]
         if not history:
             history = (data.get("history") or [])[-_MAX_HISTORY:]
 
-        result = answer(
-            user=request.user,
-            website=website,
-            question=question,
-            history=history,
-        )
+        try:
+            result = answer(
+                user=request.user,
+                website=website,
+                question=question,
+                history=history,
+            )
+        except AssistantUnavailable as exc:
+            # A turn without an answer is not part of the conversation:
+            # nothing is stored, and no thread is opened for it.
+            return Response(
+                {"error": {"code": exc.code, "message": exc.message}},
+                status=503 if exc.code == AssistantUnavailable.NOT_CONFIGURED else 502,
+            )
 
-        AssistantMessage.objects.create(
-            conversation=conversation, role=AssistantMessage.Role.USER,
-            content=question,
-        )
-        AssistantMessage.objects.create(
-            conversation=conversation, role=AssistantMessage.Role.ASSISTANT,
-            content=result.get("answer") or "",
-            grounded=bool(result.get("grounded")),
-            model=(result.get("model") or "")[:80],
-        )
-        fields = ["last_message_at", "updated_at"]
-        conversation.last_message_at = timezone.now()
-        # A thread opened from the sidebar has no title until its first
-        # question arrives.
-        if not conversation.title:
-            conversation.title = AssistantConversation.title_from(question)
-            fields.append("title")
-        conversation.save(update_fields=fields)
+        with transaction.atomic():
+            if conversation is None:
+                conversation = AssistantConversation.objects.create(
+                    website=website, user=request.user,
+                    title=AssistantConversation.title_from(question),
+                )
+            AssistantMessage.objects.create(
+                conversation=conversation, role=AssistantMessage.Role.USER,
+                content=question,
+            )
+            AssistantMessage.objects.create(
+                conversation=conversation, role=AssistantMessage.Role.ASSISTANT,
+                content=result["answer"],
+                grounded=bool(result.get("grounded")),
+                model=(result.get("model") or "")[:80],
+            )
+            fields = ["last_message_at", "updated_at"]
+            conversation.last_message_at = timezone.now()
+            # A thread opened from the sidebar has no title until its first
+            # question arrives.
+            if not conversation.title:
+                conversation.title = AssistantConversation.title_from(question)
+                fields.append("title")
+            conversation.save(update_fields=fields)
 
         return Response({**result, "conversation_id": str(conversation.id)})
 
