@@ -43,6 +43,11 @@ ssl/
 coverage.xml
 htmlcov/
 .tox/
+# The pytest suite is kept local-only and is not committed.
+# (Matches every tests/ package and the root conftest.py; prod code such as
+#  apps/prompt_library/services/smoke_test.py and scripts/*_test.py are unaffected.)
+tests/
+/conftest.py
 
 # IDEs
 .idea/
