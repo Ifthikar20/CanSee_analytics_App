@@ -8,7 +8,13 @@ or tweak rather than type from scratch.
 Steps:
     1. ``apps.llm_ranking.services.domain_scanner.scan_domain``
        — homepage scrape: name, description, products / features /
-       selling points, and an industry hint ("" when unknown)
+       selling points, an industry hint ("" when unknown) and a bounded
+       excerpt of the page's visible text
+    1b. ``_extract_brand_profile`` — one Claude pass over that excerpt for
+       industry, offerings, audience and voice. Every value must be backed
+       by the page's own text; anything unsupported stays empty so the
+       wizard shows it as missing. It only fills what step 1 left empty.
+    1c. ``_safe_site_logo`` — the site's logo URL (cached crawler)
     2. ``_polish_description`` — short Claude pass that rewrites the meta
        description into 1-2 sentences; the scraped text is used as-is
        without a Claude key
@@ -22,13 +28,25 @@ in any step leaves that field empty so the user can fill it by hand.
 """
 from __future__ import annotations
 
+import json
 import logging
+import re
 from dataclasses import asdict, dataclass, field
 from urllib.parse import urlparse
 
 from core.llm import ClaudeUtility
 
 logger = logging.getLogger("apps")
+
+# Field caps, matching the wizard's LIMITS (useOnboardingFlow.js) so what
+# the scan returns is never clipped again on the way in.
+INDUSTRY_MAX = 100
+OFFERING_MAX = 100
+OFFERINGS_MAX = 8
+AUDIENCE_MAX = 600
+VOICE_MAX = 300
+# An evidence quote shorter than this proves nothing ("the", "AI").
+EVIDENCE_MIN = 8
 
 
 @dataclass
@@ -43,6 +61,8 @@ class OnboardingPayload:
     business_name: str = ""
     domain: str = ""
     industry: str = ""
+    # Logo URL from the site itself ("" when none could be found).
+    logo_url: str = ""
 
     # Description: ``description_short`` is the 1-2 sentence polished
     # version intended for display. ``description_raw`` is whatever the
@@ -54,6 +74,10 @@ class OnboardingPayload:
     products: list[str] = field(default_factory=list)
     features: list[str] = field(default_factory=list)
     selling_points: list[str] = field(default_factory=list)
+    # Who the site says it serves, and how its own copy sounds. Empty
+    # unless the page's text supports a value.
+    audience: str = ""
+    voice: str = ""
     # Buyer-intent topics drafted by Claude. Empty when they could not be
     # drafted; ``topics_source`` says why: "ai" (drafted), "unavailable"
     # (no Claude key, see ``missing_keys``) or "failed" (the call failed
@@ -94,6 +118,21 @@ def run_onboarding_scan(url: str, *, user=None) -> OnboardingPayload:
     payload.products = list(scan.get("products") or [])[:8]
     payload.features = list(scan.get("features") or [])[:8]
     payload.selling_points = list(scan.get("selling_points") or [])[:6]
+
+    # Grounded profile: fills only what the heuristic scan left empty.
+    profile = _extract_brand_profile(
+        business_name=payload.business_name,
+        page_text=scan.get("page_text") or "",
+        user=user,
+    )
+    if not payload.industry:
+        payload.industry = profile["industry"]
+    if not payload.products:
+        payload.products = profile["offerings"]
+    payload.audience = profile["audience"]
+    payload.voice = profile["voice"]
+
+    payload.logo_url = _safe_site_logo(payload.domain)
 
     payload.description_short = _polish_description(
         business_name=payload.business_name,
@@ -145,6 +184,156 @@ def _domain_of(url: str) -> str:
         return urlparse(url if url.startswith("http") else f"https://{url}").netloc
     except Exception:
         return ""
+
+
+def _empty_profile() -> dict:
+    return {"industry": "", "offerings": [], "audience": "", "voice": ""}
+
+
+def _norm(text: str) -> str:
+    """Comparison form for grounding checks: sanitized, lowercase, one space."""
+    from core.text_sanitizer import sanitize_untrusted_text
+
+    return re.sub(r"\s+", " ", sanitize_untrusted_text(text or "")).strip().lower()
+
+
+def _clip(text: str, limit: int) -> str:
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= limit:
+        return text
+    cut = text[:limit].rsplit(" ", 1)[0].rstrip(" ,;:-")
+    return cut or text[:limit]
+
+
+def _grounded_value(raw, page: str, limit: int) -> str:
+    """Return ``raw["value"]`` clipped, or "" unless ``raw["evidence"]`` is
+    a verbatim quote from the page."""
+    if not isinstance(raw, dict):
+        return ""
+    value, evidence = raw.get("value"), raw.get("evidence")
+    if not isinstance(value, str) or not isinstance(evidence, str):
+        return ""
+    quote = _norm(evidence).strip("\"'.… ")
+    if len(quote) < EVIDENCE_MIN or quote not in page:
+        return ""
+    return _clip(value, limit)
+
+
+def _names_on_page(name_key: str, page: str) -> bool:
+    """True when ``name_key`` appears in ``page`` as whole words."""
+    return re.search(rf"(?<!\w){re.escape(name_key)}(?!\w)", page) is not None
+
+
+def _grounded_offerings(raw, page: str, business_name: str = "") -> list[str]:
+    """Offerings the page names itself, deduped and capped. The brand's own
+    name is not an offering."""
+    if not isinstance(raw, list):
+        return []
+    seen: set[str] = {_norm(business_name)} if business_name else set()
+    out: list[str] = []
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        name = re.sub(r"\s+", " ", item).strip().strip("\"'.,;:")
+        key = _norm(name)
+        if (len(name) < 3 or len(name) > OFFERING_MAX or key in seen
+                or not _names_on_page(key, page)):
+            continue
+        seen.add(key)
+        out.append(name)
+        if len(out) >= OFFERINGS_MAX:
+            break
+    return out
+
+
+def _extract_brand_profile(*, business_name: str, page_text: str, user=None) -> dict:
+    """Industry, offerings, audience and voice, grounded in ``page_text``.
+
+    One Claude call over the homepage's own visible text. The model must
+    quote the page for each value; a value whose quote is not found in the
+    text, or an offering the text does not name, is dropped. Returns empty
+    values when Claude is not configured, the page gave no text, or the
+    call or its JSON fails: the wizard then shows those fields as missing
+    for the user to fill. Never raises.
+    """
+    profile = _empty_profile()
+    if not (page_text or "").strip():
+        return profile
+    provider = ClaudeUtility(model="claude-haiku-4-5", max_tokens=700)
+    if not provider.is_configured():
+        # No API key is the normal fallback path in dev/tests — stay silent.
+        return profile
+    try:
+        from apps.llm_ranking.services.ranking_service import build_enriched_system_prompt
+
+        system_prompt = build_enriched_system_prompt(
+            "You read a company's homepage text and report only what that "
+            "text itself states. You never guess, infer from general "
+            "knowledge, or fill gaps.",
+            page_text,
+        )
+        prompt = (
+            f"The homepage text in the system prompt belongs to "
+            f"{business_name or 'this business'}. From that text only, report:\n"
+            "- industry: the market or category the business is in, as a "
+            "short phrase (max 6 words).\n"
+            "- offerings: names of the products, plans or services the text "
+            "actually names, copied exactly as written (max 8). Not generic "
+            "features, slogans or navigation links.\n"
+            "- audience: who the text says the business serves, in one or "
+            "two plain sentences.\n"
+            "- voice: how the text's own copy sounds, as a short phrase "
+            "(e.g. 'friendly and plain-spoken').\n\n"
+            "Every value needs evidence: for industry, audience and voice, "
+            "give a short quote copied word for word from the text that "
+            "supports it. If the text does not clearly support a value, "
+            "return an empty string (or an empty list for offerings). An "
+            "empty value is always better than a guess.\n\n"
+            "Return ONLY a JSON object, no prose, no code fences:\n"
+            '{"industry": {"value": "", "evidence": ""}, '
+            '"offerings": [], '
+            '"audience": {"value": "", "evidence": ""}, '
+            '"voice": {"value": "", "evidence": ""}}'
+        )
+        result = provider.query(
+            prompt, system_prompt,
+            module="onboarding", role="brand_profile", user=user,
+        )
+        if not result.succeeded:
+            logger.debug("Brand profile extraction skipped: %s", result.error)
+            return profile
+        match = re.search(r"\{.*\}", result.text or "", re.DOTALL)
+        if not match:
+            return profile
+        data = json.loads(match.group())
+        if not isinstance(data, dict):
+            return profile
+
+        page = _norm(page_text)
+        profile["industry"] = _grounded_value(data.get("industry"), page, INDUSTRY_MAX)
+        profile["offerings"] = _grounded_offerings(
+            data.get("offerings"), page, business_name,
+        )
+        profile["audience"] = _grounded_value(data.get("audience"), page, AUDIENCE_MAX)
+        profile["voice"] = _grounded_value(data.get("voice"), page, VOICE_MAX)
+        return profile
+    except Exception as exc:
+        logger.debug("Brand profile extraction skipped: %s", exc)
+        return _empty_profile()
+
+
+def _safe_site_logo(domain: str) -> str:
+    """The site's logo URL via the cached logo crawler; "" on any failure."""
+    if not domain:
+        return ""
+    try:
+        from apps.prompt_library.services.logo_crawler import fetch_site_logo
+
+        logo = fetch_site_logo(domain)
+    except Exception as exc:
+        logger.debug("Logo lookup skipped for %s: %s", domain, exc)
+        return ""
+    return logo if isinstance(logo, str) else ""
 
 
 def _polish_description(

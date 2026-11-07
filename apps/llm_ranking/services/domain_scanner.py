@@ -40,6 +40,8 @@ def _friendly_fetch_error(detail: str) -> str:
 
 SCAN_TIMEOUT = 12  # seconds
 MAX_BODY_SIZE = 800_000  # 800KB limit
+# Bound on the visible-text excerpt returned as ``page_text``.
+PAGE_TEXT_LIMIT = 6000
 
 # Common stop-words to filter out of content extraction
 STOP_WORDS = frozenset([
@@ -344,6 +346,37 @@ def _build_content_summary(
     return "\n".join(parts)
 
 
+def _build_page_text(parser: DeepExtractor, limit: int = PAGE_TEXT_LIMIT) -> str:
+    """Visible page text, best signal first, bounded to ``limit`` chars.
+
+    Title, meta/og description, headings, then body text in document
+    order. Hidden elements, scripts and styles were already dropped by
+    the parser. Repeated chunks (a heading is also body text) appear once.
+    """
+    lines: list[str] = []
+    seen: set[str] = set()
+
+    def add(text: str, label: str = "") -> None:
+        clean = re.sub(r"\s+", " ", text or "").strip()
+        key = clean.lower()
+        if not clean or key in seen:
+            return
+        seen.add(key)
+        lines.append(f"{label}{clean}")
+
+    add(parser.title, "Title: ")
+    add(parser.og_title, "Title: ")
+    add(parser.meta_description, "Description: ")
+    add(parser.og_description, "Description: ")
+    for heading in parser.h1_texts + parser.h2_texts + parser.h3_texts:
+        add(heading, "Heading: ")
+    for chunk in parser.body_text_chunks:
+        add(chunk)
+        if sum(len(line) + 1 for line in lines) >= limit:
+            break
+    return "\n".join(lines)[:limit]
+
+
 def scan_domain(url: str) -> dict:
     """
     Deep-scan a domain and return comprehensive business information.
@@ -359,6 +392,7 @@ def scan_domain(url: str) -> dict:
             "products": [str],         # extracted product/service names
             "features": [str],         # extracted features
             "selling_points": [str],   # key value propositions
+            "page_text": str,          # visible text excerpt, bounded
             "error": str | None,
         }
     """
@@ -380,6 +414,7 @@ def scan_domain(url: str) -> dict:
         "products": [],
         "features": [],
         "selling_points": [],
+        "page_text": "",
         "error": None,
     }
 
@@ -469,6 +504,7 @@ def scan_domain(url: str) -> dict:
         result["products"] = analysis["products"]
         result["features"] = analysis["features"]
         result["selling_points"] = analysis["selling_points"]
+        result["page_text"] = _build_page_text(parser)
 
     except requests.exceptions.Timeout:
         result["error"] = "Domain took too long to respond."
