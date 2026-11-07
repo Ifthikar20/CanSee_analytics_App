@@ -135,7 +135,14 @@ def dispatch_scheduled_prompt_scans() -> None:
     now = timezone.now()
     due = (
         PromptSchedule.objects
-        .filter(is_enabled=True, next_run_at__lte=now)
+        # Archived prompts never run: the UI promises archiving stops them,
+        # and each run costs LLM calls plus a paid Google check. Their
+        # schedules are left as-is so unarchiving resumes them.
+        .filter(
+            is_enabled=True,
+            next_run_at__lte=now,
+            brand_prompt__is_archived=False,
+        )
         .select_related(
             "brand_prompt", "brand_prompt__website",
             "brand_prompt__prompt", "created_by",

@@ -57,7 +57,10 @@ class CompetitorSerializer(serializers.Serializer):
 
 class WebsiteUpdateSerializer(serializers.Serializer):
     name = serializers.CharField(max_length=200, required=False)
-    industry = serializers.CharField(max_length=100, required=False)
+    # Blank is a normal stored value (the model, the create serializer and
+    # onboarding all allow it), so an update must accept it too; otherwise
+    # a project created without an industry can never be saved.
+    industry = serializers.CharField(max_length=100, required=False, allow_blank=True)
     description = serializers.CharField(required=False, allow_blank=True)
     # No default: an update that leaves a list out must not wipe it.
     topics = serializers.ListField(

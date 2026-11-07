@@ -454,6 +454,12 @@ class WebsitePromptCreateView(TenantScopedAPIView):
                 website=website, prompt=prompt,
             )
             changed = []
+            # Re-adding an archived prompt is an explicit request to track
+            # it again; leaving it archived would hide it from the overview
+            # while the UI reports it as added.
+            if brand_prompt.is_archived:
+                brand_prompt.is_archived = False
+                changed.append("is_archived")
             if tags and brand_prompt.tags != tags:
                 brand_prompt.tags = tags
                 changed.append("tags")
