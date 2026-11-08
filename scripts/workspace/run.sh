@@ -10,8 +10,9 @@
 #     CanSee_analytics_App/       <- Django backend (cloned if missing)
 #     Cansee_analytics_UI_APP/    <- Vue frontend  (cloned if missing)
 #
-# It also works when run from inside the backend repo at
-# scripts/workspace/run.sh; it then uses the repo's parent folder.
+# It also works from inside the backend repo (scripts/workspace/run.sh)
+# or from a sibling folder such as CANSEE/CanSee_console_app/; in both
+# cases it uses the CANSEE folder. Set CANSEE_WORKSPACE to override.
 #
 # Windows: run it from Git Bash (installed with Git for Windows).
 # macOS / Linux: run it from any terminal.
@@ -37,9 +38,15 @@ set -euo pipefail
 
 # ── Locations ────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [ -f "$SCRIPT_DIR/../../manage.py" ]; then
+if [ -n "${CANSEE_WORKSPACE:-}" ]; then
+  # Explicit override.
+  WORKSPACE="$(cd "$CANSEE_WORKSPACE" && pwd)"
+elif [ -f "$SCRIPT_DIR/../../manage.py" ]; then
   # Running from CanSee_analytics_App/scripts/workspace/
   WORKSPACE="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+elif [ ! -d "$SCRIPT_DIR/CanSee_analytics_App" ] && [ -d "$SCRIPT_DIR/../CanSee_analytics_App" ]; then
+  # Running from a sibling folder such as CANSEE/CanSee_console_app/
+  WORKSPACE="$(cd "$SCRIPT_DIR/.." && pwd)"
 else
   WORKSPACE="$SCRIPT_DIR"
 fi
