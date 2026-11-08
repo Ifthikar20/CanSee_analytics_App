@@ -28,13 +28,16 @@ def fit_plackett_luce(
     """
     Fit Plackett-Luce strengths from a list of rankings.
 
-    Each ranking is an ordered list of brand names (best first). Brands
-    that appear in no ranking are excluded from the result.
+    Each ranking is an ordered list of brand names (best first). A ranking
+    with fewer than two brands compares nothing, so it is ignored, and a
+    brand that appears in no comparison is excluded from the result
+    (rather than keeping its untouched starting strength of 1.0).
 
     Returns ``{brand: strength}`` normalised so the maximum strength is 1.0.
-    Returns an empty dict for an empty input.
+    Returns an empty dict when no ranking compares two brands.
     """
-    brands = sorted({b for r in rankings if r for b in r})
+    rankings = [r for r in rankings if r and len(r) >= 2]
+    brands = sorted({b for r in rankings for b in r})
     if not brands:
         return {}
     # Defensive cap — a hostile / malformed extraction could produce an
