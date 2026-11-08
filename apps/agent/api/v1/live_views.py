@@ -68,7 +68,9 @@ def _started_payload(started, *, with_user: bool = True) -> dict:
 
 
 class SendMessageView(_LiveView):
-    """POST a user message; the reply runs in the background (202)."""
+    """POST {text, parent_id?, agent?, template?} a user message; the reply
+    runs in the background (202). ``template`` is a report template key
+    (GET report-templates/) applied to this reply."""
 
     def post(self, request, website_id, chat_id):
         from apps.agent.models import AgentChat
@@ -85,6 +87,7 @@ class SendMessageView(_LiveView):
             parent_id=_uuid_or_none(body.get("parent_id"), "parent_id"),
             agent=body.get("agent"),
             idempotency_key=request.headers.get("Idempotency-Key"),
+            template=body.get("template"),
         )
         return Response(_started_payload(started), status=status.HTTP_202_ACCEPTED)
 
@@ -102,13 +105,17 @@ class RegenerateMessageView(_LiveView):
 
 
 class EditMessageView(_LiveView):
-    """POST {text}: a new version of a user message, and its reply."""
+    """POST {text, template?}: a new version of a user message, and its
+    reply. Without ``template`` the edit keeps the message's report
+    template; null or "" drops it."""
 
     def post(self, request, website_id, message_id):
         website = self.website(write=True)
         body = request.data if isinstance(request.data, dict) else {}
+        extra = {"template": body.get("template")} if "template" in body else {}
         started = run_service.start_edit(
             user=request.user, website=website, message_id=message_id, text=body.get("text"),
+            **extra,
         )
         return Response(_started_payload(started), status=status.HTTP_202_ACCEPTED)
 

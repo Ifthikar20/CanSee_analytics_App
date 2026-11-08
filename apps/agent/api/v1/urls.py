@@ -23,6 +23,8 @@ LIVE = "live/"
 urlpatterns = [
     path("status/", views.AgentStatusView.as_view(), name="agent-status"),
     path("agents/", views.AgentCatalogView.as_view(), name="agent-catalog"),
+    path("report-templates/", views.ReportTemplateCatalogView.as_view(),
+         name="agent-report-templates"),
     # The usage dashboard (signed in; not gated by AGENT_ENABLED)
     path("command-center/", command_views.CommandCenterView.as_view(),
          name="agent-command-center"),

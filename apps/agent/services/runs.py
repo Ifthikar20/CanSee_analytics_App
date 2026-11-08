@@ -11,15 +11,23 @@ continue adds a synthetic "Continue" user message under a truncated
 reply; a research re-run adds a generated user message ("Re-run all 21
 research agents") under the chat's current leaf, and its run makes no
 model request. The chat's current leaf moves to the new reply.
+
+A send or an edit may name a report template (apps.agent.report_templates):
+its outline goes into the user message's system note, and the reply keeps
+the key in ``research["template"]`` so saving it as a report labels it.
+Regenerate, edit and continue keep the template of the reply they replace
+or extend unless an edit names another one.
 """
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 
+from apps.agent import report_templates
 from apps.agent.constants import (
     CHAT_PREVIEW_MAX_LENGTH,
     MAX_SWARM_VERSIONS,
@@ -45,11 +53,24 @@ CONTINUE_TEXT = "Continue"
 _AGENT_RE = re.compile(
     r"(?:started with|selected the) [^()\n]*\((" + "|".join(AgentKey.values) + r")\)"
 )
+# The first line of prompts.context.report_template.
+_TEMPLATE_RE = re.compile(
+    r"^For this message the user chose the [^()\n]* report template \(("
+    + "|".join(report_templates.KEYS) + r")\)\.", re.MULTILINE,
+)
 
 
 class InvalidRequest(CanseeException):
     def __init__(self, message: str):
         super().__init__(message, code="invalid", status_code=400)
+
+
+class TemplateUnavailable(CanseeException):
+    """400 ``template_unavailable``: a known template this chat or this
+    workspace cannot run."""
+
+    def __init__(self, message: str):
+        super().__init__(message, code="template_unavailable", status_code=400)
 
 
 @dataclass
@@ -80,6 +101,59 @@ def clean_agent(agent) -> str | None:
     return agent
 
 
+def clean_template(template) -> str | None:
+    """A report template key, or None for no template (400 when unknown)."""
+    if template in (None, ""):
+        return None
+    if report_templates.get(template) is None:
+        raise InvalidRequest("Unknown report template.")
+    return template
+
+
+def check_template(chat, key: str | None) -> None:
+    """Refuse a template the chat's tools or the workspace cannot serve."""
+    from apps.agent.services.catalog import template_unavailable
+
+    template = report_templates.get(key)
+    if template is None:
+        return
+    reason = template_unavailable(template)
+    if reason is not None:
+        raise TemplateUnavailable(reason["message"])
+    if template.required_tools:
+        try:
+            offered = {t.get("name") for t in json.loads(chat.snapshot.tools_json or "[]")}
+        except (TypeError, ValueError):
+            offered = set()
+        if not set(template.required_tools) <= offered:
+            raise TemplateUnavailable(
+                f"The {template.name} template needs a newer chat. Start a new chat to use it.")
+
+
+def _wire_template(message) -> str | None:
+    """The template named in a user message's system note, if any."""
+    if message is None or not message.wire:
+        return None
+    found = None
+    for m in wire.loads(message.wire):
+        if m.get("role") != "system":
+            continue
+        for block in m.get("content") or []:
+            for match in _TEMPLATE_RE.finditer(block.get("text") or ""):
+                found = match.group(1)
+    return found
+
+
+def reply_template(reply) -> str | None:
+    """The template a reply was written with: its research key, else the
+    one named in its user message's note."""
+    research = reply.research if isinstance(reply.research, dict) else {}
+    key = research.get("template")
+    if report_templates.get(key) is not None:
+        return key
+    return _wire_template(reply.parent) if reply.parent_id else None
+
+
 def clean_idempotency_key(key) -> str | None:
     key = (key or "").strip()
     if not key:
@@ -106,10 +180,12 @@ def _tracked_prompt_count(website) -> int:
     return BrandPrompt.objects.filter(website=website, is_archived=False).count()
 
 
-def user_wire(chat, parent, text: str, *, agent: str | None = None) -> list[dict]:
+def user_wire(chat, parent, text: str, *, agent: str | None = None,
+              template: str | None = None) -> list[dict]:
     """The wire a new user message contributes: the message, then the
     system context it needs (project context first; later a date update
-    when the date changed, and the agent the user picked)."""
+    when the date changed, and the agent the user picked), then the
+    outline of the report template the user picked."""
     today = timezone.now().date()
     messages = [wire.user_message(text)]
     notes = []
@@ -126,6 +202,9 @@ def user_wire(chat, parent, text: str, *, agent: str | None = None) -> list[dict
             notes.append(context_prompt.date_update(today))
         if agent and agent != _last_agent(history, chat.entry_agent):
             notes.append(context_prompt.agent_selected(agent))
+    chosen = report_templates.get(template)
+    if chosen is not None:
+        notes.append(context_prompt.report_template(chosen))
     if notes:
         messages.append(wire.system_message("\n\n".join(notes)))
     return messages
@@ -133,9 +212,13 @@ def user_wire(chat, parent, text: str, *, agent: str | None = None) -> list[dict
 
 def _create_turn(chat, *, user, parent, text: str | None, trigger: str,
                  user_message=None, agent: str | None = None,
-                 idempotency_key: str | None = None) -> StartedRun:
+                 idempotency_key: str | None = None, template: str | None = None,
+                 note_template: bool = True) -> StartedRun:
     """Nodes and run for one turn. ``user_message`` reuses an existing user
-    node (regenerate); otherwise a new one is created from ``text``."""
+    node (regenerate); otherwise a new one is created from ``text``.
+    ``template`` is recorded on the reply; a new user node also carries its
+    outline unless ``note_template`` is False (continue: the note is
+    already in the history)."""
     from apps.agent.models import AgentChat, AgentMessage, AgentRun
 
     now = timezone.now()
@@ -143,7 +226,8 @@ def _create_turn(chat, *, user, parent, text: str | None, trigger: str,
         user_message = AgentMessage.objects.create(
             chat=chat, parent=parent, role=MessageRole.USER,
             depth=(parent.depth + 1) if parent else 0,
-            wire=wire.dumps(user_wire(chat, parent, text, agent=agent)),
+            wire=wire.dumps(user_wire(chat, parent, text, agent=agent,
+                                      template=template if note_template else None)),
             parts=[{"id": "p1", "type": "text", "text": text}],
             status=MessageStatus.COMPLETE, started_at=now, finished_at=now,
         )
@@ -154,6 +238,7 @@ def _create_turn(chat, *, user, parent, text: str | None, trigger: str,
     assistant = AgentMessage.objects.create(
         chat=chat, parent=user_message, role=MessageRole.ASSISTANT,
         depth=user_message.depth + 1, status=MessageStatus.STREAMING, model=model,
+        research={"template": template} if template else {},
     )
     try:
         with transaction.atomic():
@@ -217,11 +302,13 @@ def _load_chat(chat):
     return AgentChat.objects.select_related("website", "snapshot").get(id=chat.id)
 
 
-def start_send(*, user, chat, text, parent_id=None, agent=None, idempotency_key=None) -> StartedRun:
+def start_send(*, user, chat, text, parent_id=None, agent=None, idempotency_key=None,
+               template=None) -> StartedRun:
     from apps.agent.models import AgentChat, AgentMessage
 
     text = clean_text(text)
     agent = clean_agent(agent)
+    template = clean_template(template)
     key = clean_idempotency_key(idempotency_key)
     quota.check_configured()
 
@@ -238,12 +325,13 @@ def start_send(*, user, chat, text, parent_id=None, agent=None, idempotency_key=
             parent = current.current_leaf
         if parent is not None and parent.role != MessageRole.ASSISTANT:
             raise InvalidRequest("A message can only follow a reply.")
+        check_template(current, template)
         _locked_checks(user, current)
         if parent is None and agent and agent != current.entry_agent:
             AgentChat.objects.filter(id=current.id).update(entry_agent=agent)
             current.entry_agent = agent
         return _create_turn(current, user=user, parent=parent, text=text, trigger=RunTrigger.SEND,
-                            agent=agent, idempotency_key=key)
+                            agent=agent, idempotency_key=key, template=template)
 
     return _start(user, build)
 
@@ -261,26 +349,36 @@ def _message_in(user, website, message_id, *, role: str):
 def start_regenerate(*, user, website, message_id) -> StartedRun:
     message = _message_in(user, website, message_id, role=MessageRole.ASSISTANT)
     quota.check_configured()
+    # The user message is reused, so its note (and the outline) stays.
+    template = reply_template(message)
 
     def build() -> StartedRun:
         chat = _load_chat(message.chat)
         _locked_checks(user, chat)
         return _create_turn(chat, user=user, parent=None, text=None,
-                            trigger=RunTrigger.REGENERATE, user_message=message.parent)
+                            trigger=RunTrigger.REGENERATE, user_message=message.parent,
+                            template=template)
 
     return _start(user, build)
 
 
-def start_edit(*, user, website, message_id, text) -> StartedRun:
+_INHERIT = object()
+
+
+def start_edit(*, user, website, message_id, text, template=_INHERIT) -> StartedRun:
+    """``template`` left out keeps the edited message's template; None or
+    "" sends the edit without one."""
     message = _message_in(user, website, message_id, role=MessageRole.USER)
     text = clean_text(text)
+    template = _wire_template(message) if template is _INHERIT else clean_template(template)
     quota.check_configured()
 
     def build() -> StartedRun:
         chat = _load_chat(message.chat)
+        check_template(chat, template)
         _locked_checks(user, chat)
         return _create_turn(chat, user=user, parent=message.parent, text=text,
-                            trigger=RunTrigger.EDIT)
+                            trigger=RunTrigger.EDIT, template=template)
 
     return _start(user, build)
 
@@ -290,12 +388,14 @@ def start_continue(*, user, website, message_id) -> StartedRun:
     if message.status != MessageStatus.TRUNCATED:
         raise InvalidRequest("Only a reply that was cut off can be continued.")
     quota.check_configured()
+    template = reply_template(message)
 
     def build() -> StartedRun:
         chat = _load_chat(message.chat)
         _locked_checks(user, chat)
         return _create_turn(chat, user=user, parent=message, text=CONTINUE_TEXT,
-                            trigger=RunTrigger.CONTINUE)
+                            trigger=RunTrigger.CONTINUE, template=template,
+                            note_template=False)
 
     return _start(user, build)
 

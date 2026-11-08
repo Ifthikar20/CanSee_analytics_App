@@ -319,6 +319,86 @@ def _example_urls(citations, limit: int = 3) -> list[str]:
     return urls
 
 
+PERCEPTION_QUOTE_CHARS = 300
+PERCEPTION_UNAVAILABLE = (
+    "How the engines describe the brand is not available: the Sentiment and Fact check "
+    "analysis is not turned on for this workspace."
+)
+HISTORY_CHANGES = 40
+
+
+def get_brand_perception(ctx: ToolContext, args) -> ToolResult:
+    """measured.perception for the model: themes and contradicted claims of
+    the last 90 days; quotes and claims are engine text, marked untrusted."""
+    from apps.agent.services import measured
+
+    if not measured.insights_enabled():
+        return ToolResult.ok({"available": False, "note": PERCEPTION_UNAVAILABLE},
+                             summary="Not available")
+    found = measured.perception(ctx.website)
+    themes = [
+        {**theme, "quote": untrusted("AI engine answer", theme["quote"], PERCEPTION_QUOTE_CHARS)
+         if theme.get("quote") else ""}
+        for theme in found.get("themes") or []
+    ]
+    claims = [
+        {**claim, "claim": untrusted("AI engine claim", claim.get("claim") or "",
+                                     PERCEPTION_QUOTE_CHARS)}
+        for claim in found.get("contradicted") or []
+    ]
+    result = {
+        "available": True,
+        "period": found.get("period"),
+        "named_answers": found.get("named_answers"),
+        "analyzed_answers": found.get("analyzed_answers"),
+        "themes": themes,
+        "contradicted": claims,
+    }
+    if not found.get("analyzed_answers") and not themes and not claims:
+        result["note"] = ("No engine answer that names the brand has been analyzed in the last "
+                          "90 days, so there is nothing to report yet.")
+    return ToolResult.ok(result, summary=f"{len(themes)} themes, {len(claims)} contradicted claims")
+
+
+def get_visibility_history(ctx: ToolContext, args) -> ToolResult:
+    """Weekly AI visibility over the last 90 days, and what changed since
+    each tracked prompt's previous engine check."""
+    from apps.llm_ranking.services.answer_changes import WINDOW_DAYS, answer_changes
+    from apps.llm_ranking.services.visibility_dashboard import build_dashboard
+
+    board = build_dashboard(ctx.website, period="90d", interval="week")
+    changes = answer_changes(ctx.website, days=WINDOW_DAYS)
+    visibility = board["visibility"]
+    rows = changes["rows"]
+    result = {
+        "window_days": WINDOW_DAYS,
+        "weekly": {
+            "weeks": board["window"]["buckets"],
+            "visibility_pct": visibility["all"]["visibility_pct"],
+            "answers": visibility["all"]["answers"],
+            "by_engine": [{"engine": e["key"], "visibility_pct": e["visibility_pct"]}
+                          for e in visibility["by_engine"]],
+        },
+        "engines": board["engines"],
+        "counts": changes["counts"],
+        "latest_check_at": changes["latest_check_at"],
+        "previous_check_at": changes["previous_check_at"],
+        "changes": rows[:HISTORY_CHANGES],
+        "changes_total": len(rows),
+    }
+    if not rows:
+        result["note"] = ("No engine has answered a tracked prompt in the last 90 days, so "
+                          "nothing can be compared.")
+    ctx.emitter.record_research("history", "visibility", {
+        "window_days": WINDOW_DAYS,
+        "latest_check_at": changes["latest_check_at"],
+        "previous_check_at": changes["previous_check_at"],
+        "counts": changes["counts"],
+    })
+    moved = sum(changes["counts"][k] for k in ("named_now", "rank_up", "dropped", "rank_down"))
+    return ToolResult.ok(result, summary=f"{moved} of {len(rows)} results changed")
+
+
 # Why the knowledge base could not be searched, by the retriever's reason.
 KNOWLEDGE_UNAVAILABLE = {
     "embeddings_not_configured": "Knowledge search isn't available: OPENAI_API_KEY is not set.",

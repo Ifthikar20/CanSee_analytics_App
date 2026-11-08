@@ -2,8 +2,8 @@
 
 The first user message of a chat is followed by the project context; a
 later message gets a date update only when the date changed since the
-last one the chat carries, and a note when the user picked an agent for
-that message. They are stored in the user node's wire, so replay sends
+last one the chat carries, a note when the user picked an agent for that
+message, and the outline of the report template the user picked for it. They are stored in the user node's wire, so replay sends
 the same bytes every time.
 """
 from __future__ import annotations
@@ -68,3 +68,24 @@ def date_update(today: date) -> str:
 
 def agent_selected(agent_key: str) -> str:
     return f"For this message the user selected the {_agent_line(agent_key)} agent."
+
+
+def report_template(template) -> str:
+    """The outline of the report template the user picked for this
+    message (apps.agent.report_templates). Its first line names the key,
+    which services.runs reads back for a regenerate or an edit."""
+    from apps.agent.report_templates import outline_lines
+
+    lines = [
+        f"For this message the user chose the {template.name} report template "
+        f"({template.key}). Its outline replaces the report outline in your instructions for "
+        "this reply.",
+        "Write the report in Markdown: a title line starting with \"# \" that names the project, "
+        "then exactly these sections as \"## \" headings, in this order:",
+        *outline_lines(template),
+        *(f"- {rule}" for rule in template.rules),
+        "- Every number comes from a tool result in this chat. Write a section whose data was "
+        "not measured or is not configured as exactly that; never fill it from your own "
+        "knowledge.",
+    ]
+    return "\n".join(lines)

@@ -155,6 +155,14 @@ class AgentCatalogView(AgentAPIView):
         return Response(catalog.agents())
 
 
+class ReportTemplateCatalogView(AgentAPIView):
+    """The report templates (apps.agent.report_templates), with whether
+    this workspace can run each one."""
+
+    def get(self, request):
+        return Response(catalog.report_templates(request.user))
+
+
 # ── Chats and messages ────────────────────────────────────────────────────
 
 
