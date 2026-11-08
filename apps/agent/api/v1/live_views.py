@@ -68,7 +68,11 @@ def _started_payload(started, *, with_user: bool = True) -> dict:
 
 
 class SendMessageView(_LiveView):
-    """POST a user message; the reply runs in the background (202)."""
+    """POST a user message; the reply runs in the background (202).
+
+    Body: ``{text, parent_id?, agent?, engines?}``. ``engines`` (public
+    engine keys) limits the AI engines this reply's research asks.
+    """
 
     def post(self, request, website_id, chat_id):
         from apps.agent.models import AgentChat
@@ -85,6 +89,7 @@ class SendMessageView(_LiveView):
             parent_id=_uuid_or_none(body.get("parent_id"), "parent_id"),
             agent=body.get("agent"),
             idempotency_key=request.headers.get("Idempotency-Key"),
+            engines=body.get("engines"),
         )
         return Response(_started_payload(started), status=status.HTTP_202_ACCEPTED)
 

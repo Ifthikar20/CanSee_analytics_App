@@ -192,28 +192,54 @@ def writers(user) -> dict:
     return out
 
 
-def status_for(user) -> dict:
-    """Contract: GET status/. Answers even when the agent is switched off."""
+def status_for(user, website=None, runs_needed: int | None = None) -> dict:
+    """Contract: GET status/. Answers even when the agent is switched off.
+
+    ``website`` (optional) reads the prompt runs of that project's owner;
+    ``runs_needed`` (optional) is what the caller is about to ask, so the
+    setup block can say when fewer runs are left."""
+    from apps.agent.services import setup_status
     from apps.citations.services import serp_google
+    from apps.metering.services import prompt_runs
     from apps.metering.services.usage_reader import allowance_status
 
     conf = agent_conf()
     allowance = allowance_status(user)
+    runs = prompt_runs.status(user, website)
+    live = live_available()
+    configured = api_key_configured()
+    engine_rows = setup_status.engines(user)
+    google = setup_status.google(user)
     return {
         "enabled": conf.enabled,
-        "live_available": live_available(),
+        "live_available": live,
         # Whether ANTHROPIC_API_KEY is set; without it no run can start.
-        "configured": api_key_configured(),
+        "configured": configured,
         "model": conf.model,
-        "engines": engines(),
+        # [{key, provider, label, configured, key_setting, reason}];
+        # key_setting is "" unless the viewer is staff or DEBUG is on.
+        "engines": engine_rows,
         "serp_configured": serp_google.is_configured(),
+        "google": google,
         "web_tools_enabled": conf.web_tools_enabled,
         "allowance": {
             "cap_usd": allowance["cap_usd"],
             "spent_usd": allowance["spent_usd"],
             "exceeded": allowance["exceeded"],
             "warning": allowance["warning"],
+            # Free accounts count prompt runs; their dollar cap is hidden.
+            "show_usd": runs["unlimited"],
         },
+        "prompt_runs": runs,
+        "research": setup_status.research(
+            conf=conf, configured=configured, live=live,
+            allowance_exceeded=bool(allowance["exceeded"]), engine_rows=engine_rows,
+            google_block=google, free=not runs["unlimited"],
+        ),
+        "setup": setup_status.setup(
+            user, conf=conf, configured=configured, live=live, engine_rows=engine_rows,
+            google_block=google, runs=runs, allowance=allowance, runs_needed=runs_needed,
+        ),
         "writers": writers(user),
         # A reply starts no new request once it has used this much.
         "limits": {"run_cost_usd": f"{Decimal(str(conf.run_max_cost_usd)):.2f}"},

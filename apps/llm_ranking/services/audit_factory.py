@@ -88,12 +88,18 @@ def create_audit(
     Raises ``NoLLMProviderConfigured`` when no requested engine has a key.
     Every construction path spends the creator's monthly prompt
     allowance here — an audit that would overdraw it raises
-    ``prompt_allowance_exceeded`` (403) before anything is queued.
+    ``prompt_allowance_exceeded`` (403) before anything is queued. The
+    audit asks each prompt of each engine: that many prompt runs must be
+    left on the project owner's account, or it raises
+    ``insufficient_prompt_runs`` / ``prompt_runs_exhausted`` (403).
     """
     from apps.billing.services.org_entitlements import check_prompt_allowance
+    from apps.metering.services import prompt_runs
 
+    prompts = list(prompts)
     providers_queried = require_configured_providers(providers)
-    check_prompt_allowance(user, len(list(prompts)))
+    check_prompt_allowance(user, len(prompts))
+    prompt_runs.require(user, website, len(prompts) * len(providers_queried))
 
     return LLMRankingAudit.objects.create(
         website=website,
@@ -111,7 +117,7 @@ def create_audit(
         location=location or "",
         region=region if region is not None else region_for_country(location),
         keywords=list(keywords if keywords is not None else (website.topics or [])),
-        prompts=list(prompts),
+        prompts=prompts,
         providers_queried=providers_queried,
         context_urls=list(context_urls or []),
         prompt_source=prompt_source,

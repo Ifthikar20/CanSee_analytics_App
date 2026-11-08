@@ -80,6 +80,7 @@ CELL_MESSAGES = {
     "rate_limited": "The engine was busy or rate limited.",
     "timeout": "The engine did not respond in time.",
     "allowance_exceeded": "The monthly AI allowance is used up.",
+    "prompt_runs_exhausted": "This month's free prompt runs are used up.",
     "refused": "The engine declined to answer this prompt.",
     "cut_off": "The engine's answer was cut off before it finished.",
     "engine_error": "The engine returned an error.",
@@ -101,11 +102,13 @@ RUN_IN_PROGRESS = "A country check is running for this project."
 # The order create_run reports blockers in when several apply.
 _ERROR_ORDER = (
     "nothing_to_check", "too_many_google_pages", "too_many_answers",
-    "run_in_progress", "daily_limit", "allowance_exceeded", "insufficient_allowance",
+    "run_in_progress", "daily_limit", "prompt_runs_exhausted", "insufficient_prompt_runs",
+    "allowance_exceeded", "insufficient_allowance",
 )
 _ERROR_STATUS = {
     "nothing_to_check": 400, "too_many_google_pages": 400, "too_many_answers": 400,
     "run_in_progress": 409, "daily_limit": 409,
+    "prompt_runs_exhausted": 403, "insufficient_prompt_runs": 403,
     "allowance_exceeded": 403, "insufficient_allowance": 403,
 }
 
@@ -427,11 +430,19 @@ def estimate(website, user, plan: CheckPlan) -> dict:
             "method_label": regions.engine_method_label(method, None),
         })
 
+    from apps.metering.services import prompt_runs
+
     a = _allowance(user)
     exceeded = answers > 0 and not a["unlimited"] and a["spent"] >= a["cap"]
     enough = a["unlimited"] or answers == 0 or a["spent"] + usd_max <= a["cap"]
+    runs = prompt_runs.estimate_block(user, website, answers)
+    # Free accounts count prompt runs and never see dollars.
+    hide_usd = not runs["unlimited"]
+    short = prompt_runs.shortfall(user, website, answers) if answers else None
 
     blockers = []
+    if short is not None:
+        blockers.append(_blocker(short["code"], short["message"]))
     if plan.include_google and pages > daily_left:
         blockers.append(_blocker(
             "daily_limit",
@@ -441,11 +452,17 @@ def estimate(website, user, plan: CheckPlan) -> dict:
     if not enough and not exceeded:
         blockers.append(_blocker(
             "insufficient_allowance",
-            f"This check needs up to ${usd2(usd_max)} of AI allowance and "
-            f"${usd2(a['left'], ROUND_DOWN)} is left this month.",
+            prompt_runs.ALLOWANCE_SHORT_FREE if hide_usd else (
+                f"This check needs up to ${usd2(usd_max)} of AI allowance and "
+                f"${usd2(a['left'], ROUND_DOWN)} is left this month."
+            ),
         ))
     if exceeded:
-        blockers.append(_blocker("allowance_exceeded", "You have used your monthly AI allowance."))
+        blockers.append(_blocker(
+            "allowance_exceeded",
+            prompt_runs.ALLOWANCE_USED_FREE if hide_usd
+            else "You have used your monthly AI allowance.",
+        ))
     if pages > lim["max_google_pages"]:
         blockers.append(_blocker(
             "too_many_google_pages",
@@ -496,6 +513,8 @@ def estimate(website, user, plan: CheckPlan) -> dict:
             "left_usd": None if a["unlimited"] else usd2(a["left"], ROUND_DOWN),
             "enough": enough,
         },
+        # Each engine answer is one prompt run.
+        "prompt_runs": runs,
         "confirm": {"google_pages": pages, "engine_answers": answers, "ai_usd_max": usd4(usd_max)},
         "warnings": warnings,
         "blockers": blockers,
@@ -521,6 +540,10 @@ def _blocker_error(website, est: dict, blocker: dict) -> CanseeException:
             return _run_in_progress(current)
     elif code == "daily_limit":
         details = {"left": est["google"]["daily_left"], "need": est["google"]["pages_max"]}
+    elif code in ("insufficient_prompt_runs", "prompt_runs_exhausted"):
+        runs = est["prompt_runs"]
+        details = {"needed": runs["needed"], "remaining": runs["remaining"],
+                   "limit": runs["limit"], "resets_at": runs["resets_at"]}
     elif code == "insufficient_allowance":
         details = {
             "need_usd": est["engines"]["usd_max"],
@@ -946,6 +969,10 @@ def engine_error(raw: str) -> tuple[str, str]:
         return FAILED, "cut_off"
     if e.startswith("empty_answer:"):
         return FAILED, "engine_error"
+    if e.startswith("prompt_runs_exhausted"):
+        return SKIPPED, "prompt_runs_exhausted"
+    if e.startswith("prompt_runs_check_failed"):
+        return FAILED, "internal_error"
     if "allowance_check_failed" in e:
         # The allowance lookup broke (fail-closed): nothing is known to be spent.
         return FAILED, "internal_error"
@@ -960,10 +987,25 @@ def engine_error(raw: str) -> tuple[str, str]:
     return FAILED, "engine_error"
 
 
-def query_with_retry(instance, prompt_text: str, **kwargs):
+def query_with_retry(instance, prompt_text: str, *, run_feature: str, run_key: str | None = None,
+                     **kwargs):
     """One provider call, retried once on a transient failure (the rules of
     prompt_crawler._query_with_retry, plus no retry past the allowance).
-    Returns the last ProviderResult, or None when every attempt raised."""
+    Returns the last ProviderResult, or None when every attempt raised.
+
+    Both attempts are one prompt run (``run_feature``, ``run_key``) on the
+    account of ``kwargs["website"]``'s owner; with none left the engine is
+    not asked and the result carries prompt_runs.DENIAL."""
+    from apps.metering.services import prompt_runs
+
+    return prompt_runs.guard(
+        lambda: _ask_twice(instance, prompt_text, **kwargs),
+        user=kwargs.get("user"), website=kwargs.get("website"),
+        engine=getattr(instance, "name", ""), feature=run_feature, key=run_key,
+    )
+
+
+def _ask_twice(instance, prompt_text: str, **kwargs):
     last = None
     for attempt in (1, 2):
         try:
@@ -1031,6 +1073,7 @@ def _engine_cell(job: _Job, cell) -> dict:
         role="country_check", region=regions.region_for_country(job.country),
         module="llm_ranking",
         extra_metadata={"actor": "user", "feature": "country_checks", "country": job.country},
+        run_feature="country_check", run_key=f"country:{run.id}:{cell.id}",
     )
     if result is None:
         return {**fields, **_error_fields(FAILED, "engine_error")}

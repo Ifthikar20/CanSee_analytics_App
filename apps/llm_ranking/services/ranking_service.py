@@ -582,13 +582,22 @@ class LLMRankingService:
         # The cell task runs with acks_late + retries: a worker crash after
         # the provider answered replays the whole cell. The idempotency key
         # makes the replayed usage recording collapse onto the original
-        # ledger row instead of double-billing the cell.
-        result = provider_inst.query(
-            prompt_text, sys_prompt,
-            user=audit.created_by, website=audit.website,
-            audit_id=str(audit.id),
-            region=getattr(audit, "region", "") or "",
-            idempotency_key=f"audit:{audit.id}:cell:{prompt_index}:{provider}:upstream",
+        # ledger row instead of double-billing the cell. The answer is one
+        # prompt run; its key carries the run's start so a replayed cell is
+        # counted once and a re-run of a failed audit is counted again.
+        from apps.metering.services import prompt_runs
+
+        started = audit.started_at.isoformat() if audit.started_at else ""
+        result = prompt_runs.guard(
+            lambda: provider_inst.query(
+                prompt_text, sys_prompt,
+                user=audit.created_by, website=audit.website,
+                audit_id=str(audit.id),
+                region=getattr(audit, "region", "") or "",
+                idempotency_key=f"audit:{audit.id}:cell:{prompt_index}:{provider}:upstream",
+            ),
+            user=audit.created_by, website=audit.website, engine=provider, feature="audit",
+            key=f"audit:{audit.id}:{started}:cell:{prompt_index}:{provider}",
         )
 
         analysis = LLMRankingService._empty_analysis()

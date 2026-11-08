@@ -337,13 +337,17 @@ def track_usd_max(engines: list[str]) -> Decimal:
     return sum((answer_usd_max(e) for e in engines), Decimal("0"))
 
 
-def track_block(user) -> dict:
+def track_block(user, website=None) -> dict:
+    from apps.metering.services import prompt_runs
+
     engines = configured_engines()
     allowance = runs.allowance_payload(user)
     return {
         "engines": [{"key": e, "label": aa.ENGINE_LABELS[e]} for e in engines],
         "usd_max_per_prompt": runs.usd4(track_usd_max(engines)),
         "allowance": {k: allowance[k] for k in ("unlimited", "cap_usd", "left_usd")},
+        # Tracking asks each engine once: one prompt run per engine.
+        "prompt_runs": prompt_runs.estimate_block(user, website, len(engines)),
     }
 
 
@@ -368,7 +372,7 @@ def build(website, *, source=None, status="new", user=None) -> dict:
     return {
         "sources": states,
         "counts": counts,
-        "track": track_block(user),
+        "track": track_block(user, website),
         "ideas": listed,
         **runs.run_state(website, KEY),
     }
@@ -402,6 +406,7 @@ def track(website, user, idea, confirm) -> dict:
     allowance) keeps its own code and leaves nothing created."""
     from apps.billing.services import tracked_prompts
     from apps.llm_ranking.services import audit_factory, scan_dispatch
+    from apps.metering.services import prompt_runs
     from apps.prompt_library.models import BrandPrompt, Prompt, PromptSource
     from apps.prompt_library.services._hash import text_hash
     from apps.prompt_library.services.industry_match import industry_for_website
@@ -410,24 +415,31 @@ def track(website, user, idea, confirm) -> dict:
     engines = configured_engines()
     if not engines:
         raise CanseeException(NO_ENGINE, code="not_configured", status_code=400)
+    # Tracking asks every configured engine now: one prompt run each.
+    prompt_runs.require(user, website, len(engines))
+    hide_usd = prompt_runs.is_limited(user, website)
     usd_max = track_usd_max(engines)
     a = runs.allowance(user)
     if not a["unlimited"]:
         if a["spent"] >= a["cap"]:
-            raise CanseeException("You have used your monthly AI allowance.",
-                                  code="allowance_exceeded", status_code=403)
+            raise CanseeException(
+                prompt_runs.ALLOWANCE_USED_FREE if hide_usd
+                else "You have used your monthly AI allowance.",
+                code="allowance_exceeded", status_code=403)
         if a["spent"] + usd_max > a["cap"]:
             left = runs.usd2(a["left"], runs.ROUND_DOWN)
             raise CanseeException(
-                f"This run needs up to ${runs.usd2(usd_max)} of AI allowance and ${left} is "
-                "left this month.",
+                prompt_runs.ALLOWANCE_SHORT_FREE if hide_usd else (
+                    f"This run needs up to ${runs.usd2(usd_max)} of AI allowance and ${left} is "
+                    "left this month."
+                ),
                 code="insufficient_allowance", status_code=403,
                 details={"need_usd": runs.usd4(usd_max), "left_usd": left,
                          "cap_usd": runs.usd2(a["cap"])},
             )
     if _parse_usd(confirm) < usd_max:
         raise CanseeException(ESTIMATE_CHANGED, code="estimate_changed", status_code=409,
-                              details={"track": track_block(user)})
+                              details={"track": track_block(user, website)})
     if idea.text_key in _tracked_keys(website):
         raise CanseeException(ALREADY_TRACKED, code="already_tracked", status_code=409)
 

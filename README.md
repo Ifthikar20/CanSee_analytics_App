@@ -111,6 +111,27 @@ With `DEBUG=True` the OpenAPI schema is served at `/api/schema/`, with Swagger U
 - LLM calls go through a provider class built on `core/llm/base.py`, which records token
   usage and cost for every call.
 
+## Plans and prompt runs
+
+The Free plan is metered in **prompt runs**: one prompt answered by one AI engine is one
+run. A run counts only when the engine gives a successful, non-empty answer; a failure,
+a refusal, an empty answer or an engine that was never asked counts nothing. The runs
+are shared by every project and engine of the account (the project owner's account, or
+the organization's while organization features are on) and renew with the billing
+period. Every place that asks an engine counts: audits and scans, Check now, scheduled
+prompt checks, country checks, Ask AI, Autopilot, the agent's engine checks and research
+agents, the brand research engine lane, shopping checks and the prompt smoke test.
+Paid plans are unlimited here (their runs are still recorded). The ledger is
+`apps.metering` (`PromptRun`, `UsageCounter`); the service is
+`apps/metering/services/prompt_runs.py`. `GET /api/v1/billing/prompt-runs/` and the
+session's `limits.prompt_runs` report used and remaining runs.
+
+| Setting | Default | What it does |
+| --- | --- | --- |
+| `FREE_MONTHLY_PROMPT_RUNS` | `20` | Prompt runs the Free plan gets each billing period. |
+| `PROMPT_RUN_STALE_MINUTES` | `30` | A run still reserved this long after it was taken (its worker died mid-call) is given back by `apps.metering.tasks.release_stale_prompt_runs`, which Celery beat runs every 15 minutes. |
+| `AI_FREE_MONTHLY_CAP_USD` | `3.0` | Hidden AI spend backstop for the Free plan's Claude-only work (the agent, extraction, reports, onboarding). Free accounts never see it in dollars; its denial says the free AI allowance is used up. |
+
 ## Agent service
 
 The agent workspace (`apps/agent`, mounted at `/api/v1/agent/`) is a chat agent on
@@ -133,7 +154,10 @@ worker that receives a `live/` request answers `503 agent_unavailable`.
 
 **Switches.** `AGENT_ENABLED` (default off) gates every agent endpoint except
 `status/`, which reports what is configured: the switch, the agent process, the model,
-which AI engines and Google results provider have keys, and the user's AI allowance. Without
+which AI engines and Google results provider have keys, the user's AI allowance and prompt
+runs, whether the research agents can run (`research`) and a `setup` block of plain-language
+issues (setting names such as `OPENAI_API_KEY` appear only for staff and while `DEBUG` is
+on). Without
 `ANTHROPIC_API_KEY` no run starts (`503 agent_not_configured`); without `SERPAPI_KEY`
 or `SCRAPERAPI_KEY`
 Google research reports `serp_not_configured`; an engine without a key is reported as

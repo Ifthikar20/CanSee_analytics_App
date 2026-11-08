@@ -378,7 +378,11 @@ class LLMRankingAuditDetailView(TenantScopedAPIView):
         return Response(LLMRankingAuditSerializer(audit).data)
 
     def delete(self, request, website_id, audit_id):
+        from apps.billing.services.org_entitlements import record_deleted_audit
+
         audit = self._get_audit(website_id, audit_id)
+        # Deleting an audit must not hand its prompts back to the allowance.
+        record_deleted_audit(audit)
         audit.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
@@ -407,11 +411,17 @@ class LLMRankingAuditRunView(TenantScopedAPIView):
             )
 
         requested = audit.providers_queried or None
-        if not configured_providers(requested):
+        selected = configured_providers(requested)
+        if not selected:
             return Response(
                 NoLLMProviderConfigured(missing_provider_keys(requested)).response_body(),
                 status=status.HTTP_409_CONFLICT,
             )
+        # A re-run asks every cell again, so it needs that many prompt runs.
+        from apps.metering.services import prompt_runs
+
+        prompt_runs.require(audit.created_by, audit.website,
+                            len(audit.prompts or []) * len(selected))
 
         # Reset to pending and clear old results for re-runs
         if audit.status == LLMRankingAudit.STATUS_FAILED:
@@ -1302,8 +1312,10 @@ class LLMRankingScheduleRunNowView(TenantScopedAPIView):
         # Manual runs spend the runner's monthly prompt allowance like any
         # other audit; raises prompt_allowance_exceeded (403) when spent.
         from apps.billing.services.org_entitlements import check_prompt_allowance
+        from apps.metering.services import prompt_runs
 
         check_prompt_allowance(runner, len(prompts))
+        prompt_runs.require(runner, website, len(prompts) * len(selected))
 
         audit = LLMRankingAudit.objects.create(
             website=website,

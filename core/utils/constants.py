@@ -36,11 +36,17 @@ class Plan(models.TextChoices):
 # across its projects (apps.billing.services.tracked_prompts); -1 is
 # unlimited. ``autopilot`` (the daily run) and ``sms_digest`` (its one text
 # a day) are what plan_limits.plan_allows answers.
+#
+# ``monthly_prompt_runs`` is the free plan's allowance of engine answers per
+# billing period: one prompt answered by one AI engine is one run, shared by
+# every project and engine of the account (apps.metering.services.
+# prompt_runs; settings.FREE_MONTHLY_PROMPT_RUNS overrides the free number).
+# -1 is unlimited.
 PLAN_LIMITS = {
     # Free: what an account WITHOUT an active/trialing subscription gets.
-    # The AI allowance is a small acquisition cost (settings.
-    # AI_FREE_MONTHLY_CAP_USD, default $1/month) — enough to feel the
-    # product, not enough to burn margin.
+    # The allowance is 20 prompt runs a month. A hidden AI spend backstop
+    # (settings.AI_FREE_MONTHLY_CAP_USD, default $3/month) bounds the
+    # Claude-only work around them; free accounts never see it in dollars.
     Plan.FREE: {
         "segment": Segment.INDIVIDUAL,
         "price_monthly": 0,
@@ -54,9 +60,9 @@ PLAN_LIMITS = {
         "competitors": 3,
         "max_prompts_per_audit": 5,
         "max_audits_per_month": 2,
-        # Dedicated prompt allowance per account per calendar month —
-        # every prompt queued into an audit draws it down. -1 = unlimited.
-        "monthly_prompts": 10,
+        # The free plan is metered in prompt runs, not queued prompts.
+        "monthly_prompts": -1,
+        "monthly_prompt_runs": 20,
         "tracked_prompts": 5,
         "autopilot": False,
         "sms_digest": False,
@@ -78,6 +84,7 @@ PLAN_LIMITS = {
         "max_prompts_per_audit": 15,
         "max_audits_per_month": 30,           # daily cadence cap
         "monthly_prompts": 100,
+        "monthly_prompt_runs": -1,
         "tracked_prompts": 100,
         "autopilot": True,
         "sms_digest": True,
@@ -98,6 +105,7 @@ PLAN_LIMITS = {
         # Per-SEAT default for enterprise orgs; each org can carry a
         # negotiated override (Organization.monthly_prompt_allowance).
         "monthly_prompts": 200,
+        "monthly_prompt_runs": -1,
         "tracked_prompts": -1,
         "autopilot": True,
         "sms_digest": True,
@@ -121,6 +129,7 @@ _PROMPT_PLAN = {
     "max_prompts_per_audit": 50,
     "max_audits_per_month": -1,
     "monthly_prompts": -1,
+    "monthly_prompt_runs": -1,
     "autopilot": True,
     "sms_digest": True,
 }

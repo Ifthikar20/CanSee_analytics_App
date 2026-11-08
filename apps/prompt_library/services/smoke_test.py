@@ -90,15 +90,21 @@ def smoke_test_prompt(
         envelope["error"] = f"provider_not_configured: {provider}"
         return envelope
 
+    from apps.metering.services import prompt_runs
+
     t0 = time.monotonic()
     try:
-        result = instance.query(
-            filled,
-            "",
-            user=user,
-            website=website,
-            audit_id="prompt_library_smoke_test",
-            role="smoke_test",
+        # One prompt run; with none left the engine is not asked.
+        result = prompt_runs.guard(
+            lambda: instance.query(
+                filled,
+                "",
+                user=user,
+                website=website,
+                audit_id="prompt_library_smoke_test",
+                role="smoke_test",
+            ),
+            user=user, website=website, engine=provider, feature="smoke_test",
         )
     except Exception as exc:
         envelope["error"] = str(exc)[:300]
