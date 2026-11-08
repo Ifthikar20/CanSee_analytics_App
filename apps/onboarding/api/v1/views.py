@@ -26,8 +26,10 @@ from core.resilience import TokenBucket
 
 def _scan_bucket(user_id) -> TokenBucket:
     """Per-user throttle on /scan/. Burst 6, ~12 / minute steady state.
-    Onboarding involves a Claude pass + a Google call so we don't want
-    a frustrated user re-scanning every two seconds to drive cost up."""
+    A scan makes several Claude passes and up to 3 Google searches (those
+    also have their own daily limit, ONBOARDING_SERP_DAILY_SEARCHES), so we
+    don't want a frustrated user re-scanning every two seconds to drive
+    cost up."""
     return TokenBucket(
         name=f"onboarding-scan:{user_id}",
         capacity=6,

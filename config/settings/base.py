@@ -667,6 +667,13 @@ SCRAPERAPI_COST_PER_SEARCH_USD = env.float("SCRAPERAPI_COST_PER_SEARCH_USD", def
 SCRAPERAPI_GEO_COUNTRIES = env("SCRAPERAPI_GEO_COUNTRIES", default="us")
 # API credits per structured Google request (ScraperAPI docs).
 SCRAPERAPI_CREDITS_PER_SEARCH = env.int("SCRAPERAPI_CREDITS_PER_SEARCH", default=25)
+# Onboarding scan: Google searches for competitors and buyer questions. The
+# scan is synchronous, so each search gets a short timeout (ScraperAPI's own
+# default is 70s) and the scan carries on without Google when it runs out.
+ONBOARDING_SERP_TIMEOUT = env.float("ONBOARDING_SERP_TIMEOUT", default=20.0)
+# Google searches per user per UTC day across onboarding scans (up to 3 a
+# scan), on top of the scan endpoint's own rate limit.
+ONBOARDING_SERP_DAILY_SEARCHES = env.int("ONBOARDING_SERP_DAILY_SEARCHES", default=15)
 
 # Country checks: Google and the AI engines for tracked prompts in several
 # countries, run on demand after the user confirms the estimate.
