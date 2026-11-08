@@ -373,7 +373,7 @@ class TurnRunner:
         with self._usage_lock:
             cost_usd = self.totals.cost_usd
         return budget_stop(started_monotonic=self.started,
-                           cost_usd=cost_usd + Decimal(str(extra_usd or 0)))
+                           cost_usd=cost_usd + Decimal(str(extra_usd or 0)), run=self.run)
 
     def _get_client(self):
         if self._client is None:

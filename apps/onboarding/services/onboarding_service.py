@@ -346,7 +346,9 @@ def _grounded_value(raw, page: str, limit: int) -> str:
     """Return ``raw["value"]`` sanitized and clipped, or "" unless
     ``raw["evidence"]`` is a verbatim quote from the page of at least
     EVIDENCE_MIN_WORDS words that contains every content word of the
-    value."""
+    value. The quote must start and end on word boundaries of the page:
+    a quote cut mid-word ("tutors in Kent" from "tutors in Kentucky")
+    would let a value name a word the page never uses."""
     from core.text_sanitizer import sanitize_untrusted_text
 
     if not isinstance(raw, dict):
@@ -357,7 +359,7 @@ def _grounded_value(raw, page: str, limit: int) -> str:
     quote = _norm(evidence).strip("\"'.… ")
     if len(quote) < EVIDENCE_MIN or len(_words(quote)) < EVIDENCE_MIN_WORDS:
         return ""
-    if quote not in page:
+    if not _names_on_page(quote, page):
         return ""
     value = sanitize_untrusted_text(value)
     if not _words_in_quote(value, quote):
