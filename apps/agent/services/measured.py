@@ -29,6 +29,11 @@ def _enabled() -> bool:
             and django_apps.is_installed("apps.insights"))
 
 
+def insights_enabled() -> bool:
+    """Whether the Sentiment, Fact check and Pages data can be read."""
+    return _enabled()
+
+
 def engine_labels() -> dict[str, str]:
     """Public engine key -> its label ("chatgpt" -> "ChatGPT")."""
     from apps.citations.services.url_analytics import model_key
@@ -237,7 +242,8 @@ def correction_claim(website, claim_key: str) -> dict | None:
 def perception(website) -> dict:
     """How AI engines describe the brand over the last 90 days: the top
     themes with their counts and one quote, and up to five claims the
-    brand's evidence contradicts."""
+    brand's evidence contradicts, each with the ``claim_key`` a correction
+    request (pr_writer) takes."""
     empty = {"period": "last 90 days", "themes": [], "contradicted": []}
     if not _enabled():
         return empty
@@ -265,7 +271,8 @@ def perception(website) -> dict:
         ],
         "contradicted": [
             {"claim": c.get("text"), "answers": c.get("answers"), "engines": c.get("engines") or [],
-             "evidence": c.get("evidence"), "note": c.get("note") or ""}
+             "evidence": c.get("evidence"), "note": c.get("note") or "",
+             "claim_key": c.get("key")}
             for c in (claims.get("claims") or []) if c.get("verdict") == "contradicted"
         ][:CONTRADICTED],
     }

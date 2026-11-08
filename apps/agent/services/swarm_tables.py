@@ -1087,15 +1087,17 @@ def _captured(table: dict) -> str:
     return f"{at.day} {at:%b %Y %H:%M} UTC"
 
 
-def report_appendix(table: dict, swarm_part: dict) -> str:
-    """The "Research agents" section a saved report ends with (contract 6e)."""
+def report_appendix(table: dict, swarm_part: dict, *, sheets=("prompts", "gaps")) -> str:
+    """The "Research agents" section a saved report ends with (contract
+    6e), with the given sheets (the report template's; the Sources and
+    citations template keeps the sources sheet too)."""
     counts = table.get("counts") or {}
     duration = format_duration((swarm_part or {}).get("duration_ms") or 0)
     captured = _captured(table)
     line = (f"Ran {_plural(counts.get('total', 0), 'agent')} in {duration}: {count_list(counts)}. "
             f"Version {table.get('version')} of “{table.get('title')}”"
             + (f", captured {captured}." if captured else "."))
-    body = table_markdown(table, sheets=("prompts", "gaps"))
+    body = table_markdown(table, sheets=sheets)
     return f"## Research agents\n\n{line}\n\n{body}".rstrip()
 
 

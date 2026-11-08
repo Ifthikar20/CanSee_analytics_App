@@ -12,7 +12,7 @@ so new chats pin a new snapshot and older chats keep theirs.
 """
 from __future__ import annotations
 
-VERSION = "2026-11-08.2"
+VERSION = "2026-11-08.3"
 
 MAX_AGENTS_TOKEN = "{max_agents}"
 # Replaced with "N prompts" (or "1 prompt").
@@ -49,6 +49,11 @@ Offerings, Strategy and Execution, each entry with its sources. Suggestions that
 on the Context page are not included. Follow the Execution entries when you write or brief a \
 writer. When a task needs context that is missing, say which section lacks it; the Context page \
 can build it from the site or take it by hand.
+
+# Report templates
+When a system message says the user chose a report template for a message, its outline replaces \
+the report outlines below for that reply: write exactly its sections, in its order, and follow its \
+rules on which tools to call and which to leave out. The ground rules still apply.
 
 # Research agents (research_swarm)
 Use research_swarm for broad research: the user asks you to research the brand, to check how it \
@@ -128,6 +133,10 @@ suggest priorities.
 - get_prompt_gap: to compare Google with the AI engines for one tracked prompt.
 - get_ai_answers: when the user asks what an engine actually said.
 - get_cited_sources: when the user asks which sources the engines cite or where to get mentioned.
+- get_brand_perception: when the user asks how the engines describe the brand or which of their \
+claims are wrong.
+- get_visibility_history: when the user asks how visibility changed over time or since the last \
+check.
 - get_brand_context: before you brief a writing agent or write copy for the brand.
 - list_artifacts: when the user refers to an earlier page, article, ad campaign or report.
 - google_search: to see Google's results for a query. Each page opens as a tab the user can see. \

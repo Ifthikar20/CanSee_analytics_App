@@ -43,6 +43,8 @@ TOOLS: dict[str, ToolSpec] = {
         ToolSpec("get_ai_answers", data.get_ai_answers, "AI engine answers"),
         ToolSpec("get_cited_sources", data.get_cited_sources, "Cited sources"),
         ToolSpec("get_brand_context", data.get_brand_context, "Brand context"),
+        ToolSpec("get_brand_perception", data.get_brand_perception, "How AI describes the brand"),
+        ToolSpec("get_visibility_history", data.get_visibility_history, "Visibility history"),
         ToolSpec("list_artifacts", data.list_artifacts, "Artifacts"),
         ToolSpec("track_prompts", research.track_prompts, "Track prompts"),
         ToolSpec("google_search", research.google_search, "Google search", own_parts=True),

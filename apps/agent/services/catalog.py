@@ -1,6 +1,8 @@
 """What the agent workspace offers, and whether it can run right now.
 
-``agents()`` is the fixed catalog behind GET agents/. ``status_for(user)``
+``agents()`` is the fixed catalog behind GET agents/, and
+``report_templates(user)`` the report templates behind GET
+report-templates/. ``status_for(user)``
 reports the live configuration (switch, process, model, which AI engines
 and Google search have keys, the user's allowance, which writing agents
 it can start and whether the research agents are on); every value comes
@@ -224,3 +226,109 @@ def status_for(user) -> dict:
             "worker_model": conf.worker_model,
         },
     }
+
+
+# ── Report templates ──────────────────────────────────────────────────────
+
+
+def _shows_settings(user) -> bool:
+    """Staff, and local or DEBUG builds, also see the setting to change."""
+    from django.conf import settings
+
+    return bool(getattr(settings, "DEBUG", False) or getattr(user, "is_staff", False))
+
+
+def _note(code: str, message: str, setting: str) -> dict:
+    return {"code": code, "message": message, "setting": setting}
+
+
+def template_unavailable(template) -> dict | None:
+    """Why the workspace cannot run this template ({code, message,
+    setting}), or None. A missing engine or Google search is only a
+    limitation unless the template cannot work without it."""
+    from apps.agent.report_templates import NOT_USED, REQUIRED, SAVED
+    from apps.agent.services import measured
+    from apps.agent.tools.registry import client_tool_definitions
+    from apps.citations.services import serp_google
+
+    if template.needs_insights and not measured.insights_enabled():
+        return _note("insights_off",
+                     f"{template.name} needs the Sentiment and Fact check analysis, which isn't "
+                     "turned on for this workspace.", "INSIGHTS_ENABLED")
+    offered = {t["name"] for t in client_tool_definitions()}
+    if not set(template.required_tools) <= offered:
+        return _note("tools_missing", f"{template.name} isn't available on this workspace.", "")
+    google = serp_google.is_configured()
+    if template.google == REQUIRED and not google:
+        return _note("google_not_configured", "Google search isn't set up on this workspace.",
+                     "SERPAPI_KEY")
+    if template.google not in (NOT_USED, SAVED) and template.engines not in (NOT_USED, SAVED) \
+            and not google and not any(e["configured"] for e in engines()):
+        return _note("nothing_configured",
+                     "Google search and the AI engines aren't set up on this workspace.",
+                     "SERPAPI_KEY")
+    return None
+
+
+def template_limitations(template) -> list[dict]:
+    """What a runnable template will report as not configured."""
+    from apps.agent.report_templates import NOT_USED, SAVED
+    from apps.agent.tools.research import engine_catalog
+    from apps.citations.services import serp_google
+
+    out = []
+    if template.google not in (NOT_USED, SAVED) and not serp_google.is_configured():
+        out.append(_note("google_not_configured",
+                         "Google search isn't set up on this workspace, so Google results show "
+                         "as not configured.", "SERPAPI_KEY"))
+    if template.engines not in (NOT_USED, SAVED):
+        for engine in engine_catalog():
+            if not engine["configured"]:
+                out.append(_note("engine_not_configured",
+                                 f"{engine['label']} isn't set up on this workspace.",
+                                 engine["key_setting"]))
+    if template.research_agents and not agent_conf().swarm_enabled:
+        out.append(_note("research_agents_off",
+                         "The research agents are turned off, so the agent runs single searches "
+                         "and checks instead.", "AGENT_SWARM_ENABLED"))
+    return out
+
+
+def report_templates(user) -> list[dict]:
+    """Contract: GET report-templates/ (apps.agent.report_templates)."""
+    from apps.agent.report_templates import TEMPLATES
+
+    show = _shows_settings(user)
+
+    def public(note: dict | None) -> dict | None:
+        if note is None:
+            return None
+        out = {"code": note["code"], "message": note["message"]}
+        if show and note["setting"]:
+            out["setting"] = note["setting"]
+        return out
+
+    out = []
+    for template in TEMPLATES.values():
+        unavailable = public(template_unavailable(template))
+        out.append({
+            "id": template.key,
+            "name": template.name,
+            "purpose": template.purpose,
+            "header_fields": list(template.header_fields),
+            "sections": [
+                {"title": s.title, "shows": s.shows, "source": s.source, "repeat": s.repeat}
+                for s in template.sections
+            ],
+            "requirements": {
+                "google": template.google,
+                "engines": template.engines,
+                "research_agents": template.research_agents,
+                "runs_checks": template.runs_checks,
+                "note": template.requirement_note,
+            },
+            "available": unavailable is None,
+            "unavailable": unavailable,
+            "limitations": [public(n) for n in template_limitations(template)],
+        })
+    return out
