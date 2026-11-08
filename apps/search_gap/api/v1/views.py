@@ -42,8 +42,10 @@ class SearchGapPromptView(_BrandPromptMixin, TenantScopedAPIView):
 class SearchGapCheckView(_BrandPromptMixin, TenantScopedAPIView):
     """Queue a Google rank check for one prompt.
 
-    The AI side is refreshed through the existing prompt-library crawl
-    endpoint, which already owns the spend-cap and in-flight guards.
+    The AI side is refreshed through the prompt-library crawl endpoint
+    (PromptCrawlTriggerView), which owns the in-flight guard, the monthly
+    prompt allowance and the prompt-run checks; every engine call also
+    passes the AI spend wall.
     """
 
     def post(self, request, website_id, prompt_id):

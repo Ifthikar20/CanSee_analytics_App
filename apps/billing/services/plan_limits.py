@@ -256,12 +256,17 @@ def limits_block(user) -> dict:
     and the session payload (which adds ``seats`` for org members).
 
     ``tracked_prompts`` is ``{"limit", "used"}`` with -1 for unlimited.
+    ``prompt_runs`` is the prompt-runs block of
+    apps.metering.services.prompt_runs.status (the free plan's 20 engine
+    answers a month; ``unlimited`` on paid plans).
     """
     from apps.billing.services import tracked_prompts
+    from apps.metering.services import prompt_runs
 
     return {
         "projects": projects_limit_for(user),
         "tracked_prompts": tracked_prompts.capacity(user),
+        "prompt_runs": prompt_runs.status(user),
         "autopilot": plan_allows(user, "autopilot"),
         "sms_digest": plan_allows(user, "sms_digest"),
     }

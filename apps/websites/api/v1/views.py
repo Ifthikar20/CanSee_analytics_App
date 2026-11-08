@@ -15,6 +15,42 @@ from apps.websites.services.website_service import WebsiteService
 from core.views import TenantScopedAPIView
 
 
+def _projects_limit(user) -> int:
+    from apps.billing.services.plan_limits import projects_limit_for
+
+    return projects_limit_for(user)
+
+
+def project_limit_message(user, max_projects: int) -> str:
+    """The 403 text when the account is at its project cap, naming the plan
+    the cap comes from (PLAN_NAMES) and what adds room."""
+    from apps.billing.services.plan_limits import (
+        _resolve_plan_key,
+        is_trialing_subscription,
+        tier_for_subscription,
+    )
+    from core.utils.constants import PLAN_LIMITS, PLAN_NAMES, Plan
+
+    projects = f"{max_projects} project{'s' if max_projects != 1 else ''}"
+    sub = getattr(user, "subscription", None)
+    if is_trialing_subscription(sub):
+        tier = tier_for_subscription(sub)
+        full = PLAN_LIMITS.get(tier, {}).get("projects", max_projects)
+        unlocks = (
+            f"The {PLAN_NAMES.get(tier, 'paid')} plan's {full} projects unlock "
+            if isinstance(full, int) and full > max_projects
+            else "More projects unlock "
+        )
+        return f"Your free trial includes {projects}. {unlocks}when your subscription starts."
+    plan = _resolve_plan_key(user)
+    name = PLAN_NAMES.get(plan, PLAN_NAMES[Plan.FREE])
+    if plan == Plan.FREE:
+        nxt = "Choose the 100 or 200 prompt plan to add more."
+    else:
+        nxt = "Delete a project to add another, or contact us about the Business plan."
+    return f"Your {name} plan allows up to {projects}. {nxt}"
+
+
 class WebsiteListCreateView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -24,31 +60,12 @@ class WebsiteListCreateView(APIView):
         return Response(serializer.data)
 
     def post(self, request):
-        from apps.billing.services.plan_limits import (
-            current_plan_for,
-            is_trialing_subscription,
-            projects_limit_for,
-        )
-
         # Count the whole tenant, not the individual: an org's project cap
         # is shared, otherwise every teammate gets their own allowance.
         current_count = WebsiteService.accessible_qs(request.user).count()
-        max_projects = projects_limit_for(request.user)
+        max_projects = _projects_limit(request.user)
         if max_projects != -1 and current_count >= max_projects:
-            sub = getattr(request.user, "subscription", None)
-            if is_trialing_subscription(sub):
-                message = (
-                    f"Your free trial includes {max_projects} project"
-                    f"{'s' if max_projects != 1 else ''}. The full Pro "
-                    "allowance unlocks when your subscription starts."
-                )
-            else:
-                plan_name = str(current_plan_for(request.user)).capitalize()
-                message = (
-                    f"Your {plan_name} plan allows up to {max_projects} "
-                    f"project{'s' if max_projects != 1 else ''}. "
-                    "Upgrade to add more."
-                )
+            message = project_limit_message(request.user, max_projects)
             # Error responses bypass the EnvelopeRenderer, so this must
             # carry the envelope shape the frontend reads
             # (error.message drives the toast).

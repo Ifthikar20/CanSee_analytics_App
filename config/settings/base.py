@@ -855,10 +855,19 @@ GEO_SENTIMENT_THEMES_ENABLED = env.bool("GEO_SENTIMENT_THEMES_ENABLED", default=
 # uncapped (core.ai_tracking.effective_ai_cap). A per-account
 # monthly_ai_cost_cap_usd overrides this; set to 0 for truly unlimited.
 AI_ENTERPRISE_MONTHLY_CAP_USD = env.float("AI_ENTERPRISE_MONTHLY_CAP_USD", default=500.0)
-# Monthly AI allowance for accounts WITHOUT an active/trialing
-# subscription (the Free plan). A small customer-acquisition budget —
-# enough to run onboarding and a few scans, not enough to burn margin.
-AI_FREE_MONTHLY_CAP_USD = env.float("AI_FREE_MONTHLY_CAP_USD", default=1.0)
+# Hidden monthly AI spend backstop for accounts WITHOUT an active/trialing
+# subscription (the Free plan). Free accounts are metered in prompt runs
+# (FREE_MONTHLY_PROMPT_RUNS); this bounds the Claude-only work around them
+# (the agent, extraction, reports, onboarding). It is never shown to free
+# accounts in dollars.
+AI_FREE_MONTHLY_CAP_USD = env.float("AI_FREE_MONTHLY_CAP_USD", default=3.0)
+# Prompt runs the Free plan gets each billing period: one prompt answered by
+# one AI engine is one run, shared by every project and engine of the
+# account (apps.metering.services.prompt_runs). Paid plans are unlimited.
+FREE_MONTHLY_PROMPT_RUNS = env.int("FREE_MONTHLY_PROMPT_RUNS", default=20)
+# A prompt run still reserved this many minutes after it was taken (its
+# worker died mid-call) is given back by metering.release_stale_prompt_runs.
+PROMPT_RUN_STALE_MINUTES = env.int("PROMPT_RUN_STALE_MINUTES", default=30)
 
 # ── Google Search Console (apps.search_console) ──
 # OAuth reuses GOOGLE_OAUTH_CLIENT_ID/SECRET via the integrations

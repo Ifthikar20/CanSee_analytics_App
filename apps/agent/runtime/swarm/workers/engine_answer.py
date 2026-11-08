@@ -68,6 +68,8 @@ def failure(raw: str) -> WorkerOutput:
         return failed("refused", message)
     if text.startswith(("max_tokens:", "pause_turn:", "empty_answer:")):
         return failed("upstream_error", message)
+    if text.startswith("prompt_runs_exhausted"):
+        return skipped("prompt_runs_exhausted", message)
     if "allowance" in text:
         return skipped("allowance_exceeded", message)
     if "not configured" in text or "not enabled" in text:

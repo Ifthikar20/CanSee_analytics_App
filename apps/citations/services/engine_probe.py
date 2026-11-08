@@ -32,6 +32,8 @@ logger = logging.getLogger("apps")
 STATUS_OK = "ok"
 STATUS_NOT_CONFIGURED = "not_configured"
 STATUS_FAILED = "failed"
+# The error of an engine left unasked because the account's prompt runs are used up.
+PROMPT_RUNS_USED = "This month's free prompt runs are used up."
 
 # Friendly names for the graph. Keys are the PROVIDERS registry keys.
 ENGINE_LABELS = {
@@ -124,14 +126,23 @@ def probe_engine(name, provider_cls, *, query, target_brand, website, user) -> d
             row["error"] = "no API key configured"
             return row
 
-        result = provider.query(
-            build_prompt(query),
-            user=user,
-            website=website,
-            module="brand_research",
-            role="engine_probe",
-            extra_metadata={"actor": "system"},
+        from apps.metering.services import prompt_runs
+
+        # One prompt run; with none left the engine is not asked.
+        result = prompt_runs.guard(
+            lambda: provider.query(
+                build_prompt(query),
+                user=user,
+                website=website,
+                module="brand_research",
+                role="engine_probe",
+                extra_metadata={"actor": "system"},
+            ),
+            user=user, website=website, engine=name, feature="brand_research",
         )
+        if prompt_runs.is_denial(result.error):
+            row["error"] = PROMPT_RUNS_USED
+            return row
         if not result.succeeded or not (result.text or "").strip():
             row["error"] = (result.error or "empty response")[:300]
             return row

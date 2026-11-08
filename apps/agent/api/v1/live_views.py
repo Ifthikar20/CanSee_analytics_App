@@ -73,9 +73,13 @@ def _started_payload(started, *, with_user: bool = True) -> dict:
 
 
 class SendMessageView(_LiveView):
-    """POST {text, parent_id?, agent?, template?} a user message; the reply
-    runs in the background (202). ``template`` is a report template key
-    (GET report-templates/) applied to this reply."""
+    """POST a user message; the reply runs in the background (202).
+
+    Body: ``{text, parent_id?, agent?, template?, engines?}``. ``template``
+    is a report template key (GET report-templates/) applied to this
+    reply. ``engines`` (public engine keys) limits the AI engines this
+    reply's research asks.
+    """
 
     def post(self, request, website_id, chat_id):
         from apps.agent.models import AgentChat
@@ -93,6 +97,7 @@ class SendMessageView(_LiveView):
             agent=body.get("agent"),
             idempotency_key=request.headers.get("Idempotency-Key"),
             template=body.get("template"),
+            engines=body.get("engines"),
         )
         return Response(_started_payload(started), status=status.HTTP_202_ACCEPTED)
 

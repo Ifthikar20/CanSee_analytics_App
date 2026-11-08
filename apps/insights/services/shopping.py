@@ -71,7 +71,8 @@ NOTHING_TO_RUN = "Choose at least one product and Google Shopping or an engine."
 # Engine failure codes kept as they are (contract 1e item codes, plus a
 # skipped engine's not_configured); timeouts, cut-off and empty answers
 # read engine_error.
-_ENGINE_CODES = ("refused", "rate_limited", "allowance_exceeded", "engine_error", "not_configured")
+_ENGINE_CODES = ("refused", "rate_limited", "allowance_exceeded", "prompt_runs_exhausted",
+                 "engine_error", "not_configured")
 # A numbered list item starts a line: "1. ", "2) ".
 _NUMBERED = re.compile(r"^\s*(\d{1,2})[.)]\s")
 _url = URLValidator(schemes=["http", "https"])
@@ -496,6 +497,8 @@ def estimate(website, user, plan: ShoppingPlan) -> dict:
         "units": {"products": len(plan.products), "google_pages": plan.pages,
                   "answers": plan.answers},
         "ai": {"calls_max": plan.answers, "usd_max": usd * plan.questions},
+        # Each engine answer is one prompt run.
+        "prompt_runs": plan.answers,
         "google": {"pages_max": plan.pages},
         "fetches": {"pages_max": 0},
         "warnings": warnings,
@@ -611,6 +614,7 @@ def _engine_row(ctx, row) -> dict:
         instance, row.query, system_prompt=DEFAULT_SYSTEM, user=ctx.user, website=ctx.website,
         audit_id=ctx.audit_id, role="shopping_answer", module="insights",
         extra_metadata={"actor": "user", "feature": "shopping"},
+        run_feature="shopping", run_key=f"shopping:{row.id}",
     )
     text = (result.text or "").strip() if result is not None and result.succeeded else ""
     if not text:

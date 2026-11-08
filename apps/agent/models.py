@@ -214,6 +214,9 @@ class AgentRun(models.Model):
     # True when a request ended before its final usage arrived (cancel,
     # stream error) and the tokens were estimated.
     usage_estimated = models.BooleanField(default=False)
+    # Limits the person set on this run when sending: {"engines": [public
+    # engine keys]} (the engines chosen at onboarding for the first research).
+    constraints = models.JSONField(default=dict, blank=True)
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
     started_at = models.DateTimeField(null=True, blank=True)
     finished_at = models.DateTimeField(null=True, blank=True)

@@ -53,6 +53,7 @@ DEFERRED_OVERVIEW_NOTE = (
     "names or cites the brand is not measured."
 )
 NOT_SELECTED = "Not in this prompt's model selection"
+NOT_CHOSEN = "Not one of the engines chosen for this research"
 # Punctuation Google ignores in a query: a tracked prompt "What is the best
 # CRM?" is the same search as "what is the best crm".
 _QUERY_NOISE = re.compile(r"[?!,;:\"'“”‘’«»()\[\]{}]|\.(?=\s|$)")
@@ -826,6 +827,10 @@ def public_engine_error(raw: str, default: str = "The engine returned an error."
         return "The engine's answer was cut off before it finished."
     if e.startswith("empty_answer:"):
         return "The engine returned no answer."
+    if e.startswith("prompt_runs_exhausted"):
+        return "This month's free prompt runs are used up."
+    if e.startswith("prompt_runs_check_failed"):
+        return "The prompt runs could not be checked, so the engine was not asked."
     if "allowance_check_failed" in e:
         return "The AI allowance could not be checked, so the engine was not asked."
     if "allowance" in e:
@@ -873,14 +878,16 @@ def _asked_providers(bp) -> set[str] | None:
     return {p[0] for p in parsed if p is not None}
 
 
-def _crawl(website, prompt, user, *, close_db: bool, should_stop=None):
+def _crawl(website, prompt, user, *, close_db: bool, should_stop=None, providers=None):
     """crawl_prompt for one prompt. ``should_stop`` (Stop) is checked before
-    each engine is asked, so a stopped check asks no further engine."""
+    each engine is asked, so a stopped check asks no further engine.
+    ``providers`` limits it to those engines (the run's chosen engines)."""
     from apps.prompt_library.services import prompt_crawler
 
+    limit = {"providers": providers} if providers is not None else {}
     try:
         return prompt_crawler.crawl_prompt(website, prompt, only_missing=False, acting_user=user,
-                                           should_stop=should_stop)
+                                           should_stop=should_stop, **limit)
     finally:
         if close_db:
             connections.close_all()
@@ -902,9 +909,29 @@ def check_ai_engines(ctx: ToolContext, args) -> ToolResult:
     if not found:
         raise ToolError("None of these prompt ids is tracked in this project.",
                         summary="No tracked prompts")
+    from apps.agent.tools.swarm import run_engines
+    from apps.metering.services import prompt_runs
+
     engines = engine_catalog()
     providers = {e["provider"] for e in engines}
     configured = [e for e in engines if e["configured"]]
+    # The engines the person limited this run to (onboarding's choice).
+    chosen = run_engines(ctx.run)
+    crawl_providers = (
+        {e["provider"] for e in configured if e["key"] in chosen} if chosen is not None else None
+    )
+    # Each engine asked is one prompt run: check them all before asking any.
+    needed = 0
+    for bp in found.values():
+        asked = _asked_providers(bp)
+        needed += sum(
+            1 for e in configured
+            if (asked is None or e["provider"] in asked)
+            and (chosen is None or e["key"] in chosen)
+        )
+    short = prompt_runs.shortfall(ctx.user, ctx.website, needed) if needed else None
+    if short is not None:
+        raise ToolError(short["message"], summary="Not enough prompt runs")
     # Only engines the crawl will ask get a part to wait on.
     parts: dict[str, dict[str, str]] = {}
     for pid, bp in found.items():
@@ -929,6 +956,11 @@ def check_ai_engines(ctx: ToolContext, args) -> ToolResult:
                 em.add_part(
                     PartType.ENGINE_CHECK, request=ctx.request, status="unavailable",
                     error=NOT_SELECTED, **fields,
+                )
+            elif chosen is not None and e["key"] not in chosen:
+                em.add_part(
+                    PartType.ENGINE_CHECK, request=ctx.request, status="unavailable",
+                    error=NOT_CHOSEN, **fields,
                 )
             else:
                 parts[pid][e["key"]] = em.add_part(
@@ -1054,7 +1086,7 @@ def check_ai_engines(ctx: ToolContext, args) -> ToolResult:
                 inflight[pid] = captured
             try:
                 return _crawl(ctx.website, found[pid].prompt, ctx.user, close_db=close_db,
-                              should_stop=should_stop), None
+                              should_stop=should_stop, providers=crawl_providers), None
             except Exception:
                 logger.warning("agent: crawl_prompt failed", exc_info=True)
                 return None, "The scan failed."

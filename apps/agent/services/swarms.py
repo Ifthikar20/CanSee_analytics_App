@@ -107,8 +107,10 @@ def start_rerun(user, website, swarm_id, *, scope: str, category: str | None = N
     """Validate a re-run of one of the user's swarms and start it: every
     agent (``all``), one category's agents, or one agent. Raises
     ResourceNotFound (404), runs.InvalidRequest (400 invalid), VersionLimit
-    (400), the usual run-start refusals (409, 429, 403 allowance_exceeded)
-    and InsufficientAllowance (403) when the allowance left is below the
+    (400), the usual run-start refusals (409, 429, 403 allowance_exceeded),
+    insufficient_prompt_runs / prompt_runs_exhausted (403) when the re-run's
+    engine answers need more prompt runs than are left, and
+    InsufficientAllowance (403) when the allowance left is below the
     re-run's upper-bound cost."""
     from apps.agent.runtime.swarm import plan
 
@@ -121,8 +123,14 @@ def start_rerun(user, website, swarm_id, *, scope: str, category: str | None = N
         raise runs.InvalidRequest(f"This research has no such {what}.") from None
     if not task_ids:
         raise runs.InvalidRequest("This research has no agents in that category.")
+    from apps.agent.constants import WorkerType
+    from apps.metering.services import prompt_runs
+
     wanted = set(task_ids)
     specs = [t for t in swarm.tasks or [] if t.get("id") in wanted]
+    # Each engine-answer agent asks one engine one prompt: one prompt run.
+    prompt_runs.require(user, website,
+                        sum(1 for t in specs if t.get("worker") == WorkerType.ENGINE_ANSWER))
     return runs.start_rerun(
         user=user, chat=swarm.chat, swarm=swarm, scope=scope, scope_key=scope_key,
         task_ids=task_ids, text=rerun_text(swarm, scope, scope_key, task_ids),

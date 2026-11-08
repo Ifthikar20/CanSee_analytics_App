@@ -213,7 +213,8 @@ def user_wire(chat, parent, text: str, *, agent: str | None = None,
 def _create_turn(chat, *, user, parent, text: str | None, trigger: str,
                  user_message=None, agent: str | None = None,
                  idempotency_key: str | None = None, template: str | None = None,
-                 note_template: bool = True) -> StartedRun:
+                 note_template: bool = True,
+                 constraints: dict | None = None) -> StartedRun:
     """Nodes and run for one turn. ``user_message`` reuses an existing user
     node (regenerate); otherwise a new one is created from ``text``.
     ``template`` is recorded on the reply; a new user node also carries its
@@ -245,7 +246,7 @@ def _create_turn(chat, *, user, parent, text: str | None, trigger: str,
             run = AgentRun.objects.create(
                 chat=chat, user=user, website=chat.website, user_message=user_message,
                 assistant_message=assistant, trigger=trigger, status=RunStatus.QUEUED,
-                idempotency_key=idempotency_key,
+                idempotency_key=idempotency_key, constraints=constraints or {},
             )
     except IntegrityError:
         raise RunInProgress() from None
@@ -302,13 +303,35 @@ def _load_chat(chat):
     return AgentChat.objects.select_related("website", "snapshot").get(id=chat.id)
 
 
+def clean_engines(engines) -> list[str] | None:
+    """The engines a send limits its run to: a list of public engine keys
+    (chatgpt, claude, gemini, grok, perplexity), duplicates dropped. None or
+    an empty list sets no limit; anything else is 400 invalid."""
+    from apps.agent.tools.schemas import ENGINE_KEYS
+
+    if engines in (None, []):
+        return None
+    if not isinstance(engines, list) or not all(isinstance(e, str) for e in engines):
+        raise InvalidRequest("engines must be a list of engine keys.")
+    unknown = [e for e in engines if e not in ENGINE_KEYS]
+    if unknown:
+        raise InvalidRequest(
+            f"Unknown engine: {unknown[0]}. Use {', '.join(ENGINE_KEYS)}.")
+    return list(dict.fromkeys(engines))
+
+
 def start_send(*, user, chat, text, parent_id=None, agent=None, idempotency_key=None,
-               template=None) -> StartedRun:
+               template=None, engines=None) -> StartedRun:
+    """A user message and its reply. ``template`` is a report template key
+    applied to this reply; ``engines`` limits the AI engines the reply's
+    research asks (AgentRun.constraints["engines"])."""
     from apps.agent.models import AgentChat, AgentMessage
 
     text = clean_text(text)
     agent = clean_agent(agent)
     template = clean_template(template)
+    engines = clean_engines(engines)
+    constraints = {"engines": engines} if engines else None
     key = clean_idempotency_key(idempotency_key)
     quota.check_configured()
 
@@ -331,7 +354,8 @@ def start_send(*, user, chat, text, parent_id=None, agent=None, idempotency_key=
             AgentChat.objects.filter(id=current.id).update(entry_agent=agent)
             current.entry_agent = agent
         return _create_turn(current, user=user, parent=parent, text=text, trigger=RunTrigger.SEND,
-                            agent=agent, idempotency_key=key, template=template)
+                            agent=agent, idempotency_key=key, template=template,
+                            constraints=constraints)
 
     return _start(user, build)
 
@@ -445,6 +469,12 @@ def start_rerun(*, user, chat, swarm, scope: str, scope_key: str, task_ids: list
         _locked_checks(user, current)
         shortfall = allowance_shortfall(user, need_usd) if need_usd is not None else None
         if shortfall is not None:
+            from apps.metering.services import prompt_runs
+
+            if prompt_runs.is_limited(user, chat.website):
+                # Free accounts never see dollars.
+                raise CanseeException(prompt_runs.ALLOWANCE_SHORT_FREE,
+                                      code="insufficient_allowance", status_code=403)
             raise InsufficientAllowance(**shortfall)
         started = _create_turn(current, user=user, parent=parent, text=text,
                                trigger=RunTrigger.RERUN, idempotency_key=key)

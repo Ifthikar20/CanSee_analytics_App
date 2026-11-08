@@ -76,8 +76,9 @@ ANSWER_MESSAGES = {
     **{
         code: country_checks.CELL_MESSAGES[code]
         for code in (
-            "not_configured", "rate_limited", "timeout", "allowance_exceeded", "refused",
-            "cut_off", "engine_error", "cancelled", "internal_error",
+            "not_configured", "rate_limited", "timeout", "allowance_exceeded",
+            "prompt_runs_exhausted", "refused", "cut_off", "engine_error", "cancelled",
+            "internal_error",
         )
     },
     "daily_limit": "This project used its Ask AI answers for today.",
@@ -88,6 +89,8 @@ ANSWER_MESSAGES = {
 BLOCKER_STATUS = {
     "not_configured": 400,
     "run_in_progress": 409,
+    "prompt_runs_exhausted": 403,
+    "insufficient_prompt_runs": 403,
     "allowance_exceeded": 403,
     "insufficient_allowance": 403,
     "daily_limit": 409,
@@ -248,10 +251,15 @@ def _prepare(website, user, ask: Ask) -> tuple[dict, list[dict]]:
     answers = ask.samples * len(keys)
     usd_max = sum((country_checks.answer_usd_max(key) for key in keys), ZERO) * ask.samples
 
+    from apps.metering.services import prompt_runs
+
     a = insights_runs.allowance(user)
     quota = daily_quota()
     qkey = str(website.id)
     daily_limit, daily_left = quota.limit(qkey), quota.remaining(qkey)
+    runs = prompt_runs.estimate_block(user, website, answers)
+    # Free accounts count prompt runs and never see dollars.
+    hide_usd = not runs["unlimited"]
 
     blockers = []
     if not keys:
@@ -259,15 +267,23 @@ def _prepare(website, user, ask: Ask) -> tuple[dict, list[dict]]:
     current = active_run(website)
     if current is not None:
         blockers.append(_blocker("run_in_progress", RUN_IN_PROGRESS, {"run_id": str(current.id)}))
+    short = prompt_runs.shortfall(user, website, answers) if answers else None
+    if short is not None:
+        blockers.append(_blocker(short["code"], short["message"], short["details"]))
     if usd_max > 0 and not a["unlimited"]:
         if a["spent"] >= a["cap"]:
-            blockers.append(_blocker("allowance_exceeded", ALLOWANCE_EXCEEDED))
+            blockers.append(_blocker(
+                "allowance_exceeded",
+                prompt_runs.ALLOWANCE_USED_FREE if hide_usd else ALLOWANCE_EXCEEDED,
+            ))
         elif a["spent"] + usd_max > a["cap"]:
             left = usd2(a["left"], ROUND_DOWN)
             blockers.append(_blocker(
                 "insufficient_allowance",
-                f"This run needs up to ${usd2(usd_max)} of AI allowance and ${left} is left "
-                "this month.",
+                prompt_runs.ALLOWANCE_SHORT_FREE if hide_usd else (
+                    f"This run needs up to ${usd2(usd_max)} of AI allowance and ${left} is left "
+                    "this month."
+                ),
                 {"need_usd": usd4(usd_max), "left_usd": left, "cap_usd": usd2(a["cap"])},
             ))
     if answers > daily_left:
@@ -292,6 +308,8 @@ def _prepare(website, user, ask: Ask) -> tuple[dict, list[dict]]:
             "left_usd": None if a["unlimited"] else usd2(a["left"], ROUND_DOWN),
         },
         "daily": {"limit": daily_limit, "left": daily_left},
+        # Each answer is one prompt run: {needed, remaining, limit, unlimited, enough}.
+        "prompt_runs": runs,
         "tracked": tracked_block(website.id, ask.text),
         "blockers": [{"code": b["code"], "message": b["message"]} for b in blockers],
         "can_run": not blockers,
@@ -553,6 +571,7 @@ def _ask(job: _Job, answer) -> dict:
         user=job.user, website=job.website, audit_id=run.audit_id,
         role="prompt_box", module="llm_ranking",
         extra_metadata={"actor": "user", "feature": "prompt_box"},
+        run_feature="prompt_box", run_key=f"promptbox:{answer.id}",
     )
     if result is None:
         return {**fields, **_error_fields(FAILED, "engine_error")}

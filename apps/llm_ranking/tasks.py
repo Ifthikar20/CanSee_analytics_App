@@ -230,6 +230,19 @@ def dispatch_scheduled_audits() -> None:
                 )
                 _bump_next_run(schedule, now)
                 continue
+            # No prompt run left on the owner's account: skip the same way.
+            # (With some left the audit runs; cells past the last run are
+            # not asked and end failed.)
+            from apps.metering.services import prompt_runs
+
+            runs_ok, _runs_left = prompt_runs.available(cap_user, schedule.website, 1)
+            if not runs_ok:
+                logger.warning(
+                    "Skipping scheduled audit for %s: no prompt runs left.",
+                    schedule.website.name,
+                )
+                _bump_next_run(schedule, now)
+                continue
 
             # ── 3c. At least one AI engine must have a key ────────────
             # Missing keys are deployment state, not a schedule failure:

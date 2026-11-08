@@ -49,10 +49,18 @@ def allowance_denial(user) -> str | None:
     if user is None:
         return None
     try:
-        from core.ai_tracking import effective_ai_cap, month_to_date_cost
+        from core.ai_tracking import ai_allowance_plan, effective_ai_cap, month_to_date_cost
+        from core.utils.constants import Plan
 
         cap = effective_ai_cap(user)
         if cap > 0 and month_to_date_cost(user) >= cap:
+            if ai_allowance_plan(user) == Plan.FREE:
+                # The free plan's dollar cap is a hidden backstop: its
+                # accounts count prompt runs and never see dollars.
+                return (
+                    "monthly_ai_allowance_exceeded: the account has "
+                    "used this month's free AI allowance"
+                )
             return (
                 "monthly_ai_allowance_exceeded: the account has "
                 f"used its ${cap:.2f} monthly AI allowance"

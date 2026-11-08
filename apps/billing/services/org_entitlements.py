@@ -108,15 +108,65 @@ def prompts_used_this_month(user) -> int:
     Autopilot's audits (the ones an AutopilotRunPrompt points to) are left
     out: the number means "prompts you queue yourself", so a daily run never
     uses up the month and refuses the owner's own scans.
+
+    Prompts of audits deleted this month still count (record_deleted_audit
+    keeps them), so deleting an audit never hands its prompts back.
     """
     from apps.llm_ranking.models import LLMRankingAudit
 
-    now = timezone.now()
-    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    month_start = _month_start()
     prompt_lists = LLMRankingAudit.objects.filter(
         created_by=user, created_at__gte=month_start, autopilot_rows__isnull=True,
     ).values_list("prompts", flat=True)
-    return sum(len(p or []) for p in prompt_lists)
+    return sum(len(p or []) for p in prompt_lists) + _deleted_prompts(user, month_start)
+
+
+def _month_start():
+    now = timezone.now()
+    return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+
+def _deleted_counter_filter(user_id, month_start) -> dict:
+    from apps.metering.models import UsageCounter
+
+    return {
+        "meter": UsageCounter.METER_DELETED_AUDIT_PROMPTS,
+        "account_key": f"user:{user_id}",
+        "period_key": month_start.date().isoformat(),
+    }
+
+
+def _deleted_prompts(user, month_start) -> int:
+    from apps.metering.models import UsageCounter
+
+    if user is None or not getattr(user, "pk", None):
+        return 0
+    return (
+        UsageCounter.objects.filter(**_deleted_counter_filter(user.pk, month_start))
+        .values_list("value", flat=True).first()
+        or 0
+    )
+
+
+def record_deleted_audit(audit) -> None:
+    """Keep the prompts of an audit about to be deleted on its creator's
+    month, when they count toward the monthly prompt allowance (created
+    this month, not by Autopilot). Call before ``audit.delete()``."""
+    from django.db.models import F
+
+    from apps.metering.models import UsageCounter
+
+    month_start = _month_start()
+    count = len(audit.prompts or [])
+    if (
+        not count or not audit.created_by_id or audit.created_at is None
+        or audit.created_at < month_start or audit.autopilot_rows.exists()
+    ):
+        return
+    counter, _ = UsageCounter.objects.get_or_create(
+        **_deleted_counter_filter(audit.created_by_id, month_start),
+    )
+    UsageCounter.objects.filter(pk=counter.pk).update(value=F("value") + count)
 
 
 def check_prompt_allowance(user, requested: int) -> None:

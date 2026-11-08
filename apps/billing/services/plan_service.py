@@ -5,7 +5,8 @@ carried its own divergent price table; that drift is gone.)
 
 Feature lines list only what the code enforces or provides: the tracked
 prompts, the engines Autopilot asks, Google page one, the daily text, the
-AI spend allowance, the project cap and the org features. Built per request
+AI spend allowance (the free plan's prompt runs instead: its dollar cap is
+a hidden backstop), the project cap and the org features. Built per request
 from the configured engines, the Google provider and the SMS switch, so a
 card never promises what the server cannot do.
 
@@ -40,10 +41,13 @@ def _join(items: list[str]) -> str:
     return f"{', '.join(items[:-1])} and {items[-1]}"
 
 
-def _limits(limits: dict) -> dict:
+def _limits(limits: dict, *, prompt_runs: int | None = None) -> dict:
     return {
         "projects": limits["projects"],
         "monthly_prompts": limits["monthly_prompts"],
+        "monthly_prompt_runs": (
+            prompt_runs if prompt_runs is not None else limits.get("monthly_prompt_runs", -1)
+        ),
         "tracked_prompts": limits["tracked_prompts"],
         "autopilot": bool(limits["autopilot"]),
         "sms_digest": bool(limits["sms_digest"]),
@@ -77,14 +81,17 @@ def _texts_enabled() -> bool:
 
 
 def _free() -> dict:
+    from apps.metering.services.prompt_runs import free_limit
+
     limits = PLAN_LIMITS[Plan.FREE]
+    runs = free_limit()
+    # The free plan's AI spend cap is a hidden backstop: the card names the
+    # prompt runs (one prompt answered by one AI engine), never dollars.
     features = [
         _count(limits["projects"], "project"),
         _count(limits["tracked_prompts"], "tracked prompt"),
+        f"{_count(runs, 'prompt run')} a month",
     ]
-    free_cap = float(getattr(settings, "AI_FREE_MONTHLY_CAP_USD", 0) or 0)
-    if free_cap > 0:
-        features.append(f"{_usd(free_cap)} of AI usage a month")
     return {
         "id": "free",
         "name": PLAN_NAMES[Plan.FREE],
@@ -95,7 +102,7 @@ def _free() -> dict:
         "interval": "month",
         "trial_days": 0,
         "features": features,
-        "limits": _limits(limits),
+        "limits": _limits(limits, prompt_runs=runs),
     }
 
 

@@ -47,6 +47,7 @@ app.conf.task_routes = {
     "apps.metering.tasks.prune_ai_usage_ledger": {"queue": "integrations"},
     "apps.metering.tasks.prune_polar_outbox": {"queue": "integrations"},
     "apps.metering.tasks.notify_cap_threshold": {"queue": "default"},
+    "apps.metering.tasks.release_stale_prompt_runs": {"queue": "default"},
     # Long-running batch deletes: keep them off the default queue so they
     # cannot delay request-path work.
     "apps.analytics.tasks.prune_analytics_events": {"queue": "integrations"},
@@ -109,6 +110,12 @@ app.conf.beat_schedule = {
     # ── Every 15 minutes ──
     "refresh-expiring-oauth-tokens": {
         "task": "apps.websites.tasks.refresh_expiring_tokens",
+        "schedule": crontab(minute="*/15"),
+    },
+    # Prompt runs a worker reserved and never settled (it died mid-call)
+    # are given back to the free plan's monthly count.
+    "release-stale-prompt-runs": {
+        "task": "apps.metering.tasks.release_stale_prompt_runs",
         "schedule": crontab(minute="*/15"),
     },
     # ── Monthly ──

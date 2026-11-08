@@ -75,6 +75,11 @@ def _public_model_error(raw: str) -> str:
         return "The model's answer was cut off before it finished."
     if e.startswith("empty_answer:"):
         return "The model returned no answer."
+    # Engines left unasked by the free plan's prompt runs (prompt_runs.guard).
+    if e.startswith("prompt_runs_exhausted"):
+        return "This month's free prompt runs are used up."
+    if e.startswith("prompt_runs_check_failed"):
+        return "The prompt runs could not be checked, so this model was not asked."
     if "rate limit" in e or "429" in e or "quota" in e or "overloaded" in e:
         return "The model was busy and will be retried on the next scan."
     if "timeout" in e or "timed out" in e:
@@ -570,11 +575,16 @@ class WebsitePromptCreateView(TenantScopedAPIView):
         # ``scan: false`` skips it: Autopilot asks the prompt from its next run.
         scan_audit_id, scan_error = None, None
         if data.get("scan", True):
+            from apps.search_gap.services.country_geo import provider_key
+
+            engines = data.get("engines") or []
             scan_audit_id, scan_error = self._trigger_scan(
                 website, request.user, [p.text for p in created_prompts], location,
                 crawl_prompt_ids=(
                     [str(p.id) for p in created_prompts] if model_variants else None
                 ),
+                providers=[provider_key(e) for e in engines] or None,
+                variants=len(model_variants),
             )
 
         payload = PromptSerializer(created_prompts[0]).data
@@ -586,7 +596,8 @@ class WebsitePromptCreateView(TenantScopedAPIView):
         return Response(payload, status=status.HTTP_201_CREATED)
 
     @staticmethod
-    def _trigger_scan(website, user, prompts, location, crawl_prompt_ids=None):
+    def _trigger_scan(website, user, prompts, location, crawl_prompt_ids=None,
+                      providers=None, variants=0):
         """Kick off a scan for freshly added prompts.
 
         Returns ``(audit_id, error)``. ``error`` is None when a scan was
@@ -600,24 +611,37 @@ class WebsitePromptCreateView(TenantScopedAPIView):
         is dispatched through the per-prompt crawler instead — the audit
         pipeline always queries provider-default models and would ignore
         the selection.
+
+        ``providers`` (provider keys) limits this scan to those engines (the
+        engines chosen at onboarding); nothing about it is saved on the
+        prompts. Either way the scan needs one prompt run per prompt and
+        engine (``variants`` engines per prompt for the crawler), or its
+        error is ``insufficient_prompt_runs`` / ``prompt_runs_exhausted``.
         """
+        from apps.billing.services.org_entitlements import check_prompt_allowance
         from apps.llm_ranking.services.audit_factory import (
             NoLLMProviderConfigured,
             configured_providers,
             create_audit,
             missing_provider_keys,
         )
+        from apps.metering.services import prompt_runs
         from core.exceptions import CanseeException
 
-        if not configured_providers():
-            return None, NoLLMProviderConfigured(missing_provider_keys()).response_body()
+        if not configured_providers(providers):
+            return None, NoLLMProviderConfigured(missing_provider_keys(providers)).response_body()
         try:
             if crawl_prompt_ids:
                 from apps.prompt_library.tasks import crawl_prompt_for_website
+
+                engines = len(configured_providers(providers)) if providers else variants
+                check_prompt_allowance(website.user, len(crawl_prompt_ids))
+                prompt_runs.require(user, website, len(crawl_prompt_ids) * max(1, engines))
                 for prompt_id in crawl_prompt_ids:
                     crawl_prompt_for_website.delay(
                         str(website.id), str(prompt_id),
                         acting_user_id=str(user.id) if user else None,
+                        providers=list(providers) if providers else None,
                     )
                 return None, None
             from apps.llm_ranking.services.scan_dispatch import dispatch_scan
@@ -626,6 +650,7 @@ class WebsitePromptCreateView(TenantScopedAPIView):
                 website=website,
                 user=user,
                 prompts=list(prompts),
+                providers=list(providers) if providers else None,
                 location=location or "",
             )
             dispatch_scan(str(audit.id))
@@ -633,8 +658,11 @@ class WebsitePromptCreateView(TenantScopedAPIView):
         except NoLLMProviderConfigured as exc:
             return None, exc.response_body()
         except CanseeException as exc:
-            # e.g. the monthly prompt allowance is used up.
-            return None, {"error": exc.code, "message": exc.message}
+            # e.g. the monthly prompt allowance or the prompt runs are used up.
+            body = {"error": exc.code, "message": exc.message}
+            if exc.details:
+                body["details"] = exc.details
+            return None, body
         except Exception:  # pragma: no cover - the create must not fail
             logger.exception("auto-scan dispatch failed")
             return None, {"error": "scan_not_started"}
@@ -1731,10 +1759,14 @@ class BrandPromptDetailAggView(TenantScopedAPIView):
             # errored. A failed cell with the service_unavailable sentinel is
             # surfaced separately from a genuine upstream error, and only a
             # cell that succeeded-but-empty (still in flight) reads "pending".
+            # An engine the free plan's prompt runs left unasked is
+            # "skipped": it was never asked, so it did not fail.
             if has_response:
                 chat_status = "complete"
             elif err.startswith("service_unavailable"):
                 chat_status = "unavailable"
+            elif err.startswith("prompt_runs_exhausted"):
+                chat_status = "skipped"
             elif not r.query_succeeded:
                 chat_status = "failed"
             else:
@@ -1758,7 +1790,7 @@ class BrandPromptDetailAggView(TenantScopedAPIView):
                 # Sanitized: the raw provider error stays in the DB/logs.
                 "error": (
                     _public_model_error(err)
-                    if chat_status in ("failed", "unavailable") else ""
+                    if chat_status in ("failed", "unavailable", "skipped") else ""
                 ),
                 "created_at": r.created_at.isoformat() if r.created_at else None,
             })
@@ -2417,13 +2449,33 @@ class PromptFanoutsView(TenantScopedAPIView):
 
 
 class PromptCrawlTriggerView(TenantScopedAPIView):
-    """Kick off a Celery task to crawl this prompt across providers."""
+    """Kick off a Celery task to crawl this prompt across providers.
+
+    Only a prompt tracked on this project can be crawled. A crawl of the
+    prompt that is still running refuses a second one (409
+    ``crawl_in_progress``). The crawl spends the monthly prompt allowance
+    and needs at least one prompt run left (403 ``prompt_runs_exhausted``);
+    each engine answer is one run, and an engine past the last run is not
+    asked.
+    """
 
     def post(self, request, website_id, prompt_id):
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        from apps.billing.services.org_entitlements import check_prompt_allowance
+        from apps.metering.services import prompt_runs
+        from apps.prompt_library.models import PromptCrawlRun
+        from apps.prompt_library.tasks import _STALE_RUN_MINUTES
+
         website = self.get_website(website_id)
-        try:
-            prompt = Prompt.objects.visible_to_website(website).get(id=prompt_id)
-        except Prompt.DoesNotExist:
+        # Only a prompt tracked on this project (a subset of what the
+        # project can see) may be crawled: a crawl spends prompt runs.
+        prompt = Prompt.objects.filter(
+            id=prompt_id, brand_prompts__website=website,
+        ).first()
+        if prompt is None:
             return Response({"detail": "Prompt not found."},
                             status=status.HTTP_404_NOT_FOUND)
 
@@ -2439,6 +2491,33 @@ class PromptCrawlTriggerView(TenantScopedAPIView):
                 status=status.HTTP_409_CONFLICT,
             )
 
+        # The crawl's audit is created on behalf of the project owner.
+        check_prompt_allowance(website.user, 1)
+        prompt_runs.require(request.user, website, 1)
+
+        # The slot is held from the moment the crawl is queued: a pending
+        # PromptCrawlRun is created here and the worker reuses it, so a
+        # second click before the worker starts is refused too. Locking the
+        # prompt's BrandPrompt row serialises two requests sent together.
+        anchor = timezone.now() - timedelta(minutes=_STALE_RUN_MINUTES)
+        with transaction.atomic():
+            list(BrandPrompt.objects.select_for_update().filter(
+                website=website, prompt=prompt,
+            ))
+            if PromptCrawlRun.objects.filter(
+                website=website, prompt=prompt,
+                status__in=(PromptCrawlRun.STATUS_PENDING, PromptCrawlRun.STATUS_RUNNING),
+                created_at__gte=anchor,
+            ).exists():
+                return Response(
+                    {"error": "crawl_in_progress",
+                     "detail": "The engines are already being asked this prompt."},
+                    status=status.HTTP_409_CONFLICT,
+                )
+            run = PromptCrawlRun.objects.create(
+                website=website, prompt=prompt, status=PromptCrawlRun.STATUS_PENDING,
+            )
+
         # mode=missing: the page's silent gap-fill (query only models that
         # never answered). Default: full re-run of every configured model.
         only_missing = (request.data or {}).get("mode") == "missing"
@@ -2447,17 +2526,26 @@ class PromptCrawlTriggerView(TenantScopedAPIView):
             from apps.prompt_library.tasks import crawl_prompt_for_website
             crawl_prompt_for_website.delay(
                 str(website.id), str(prompt.id), only_missing,
-                acting_user_id=str(request.user.id),
+                acting_user_id=str(request.user.id), crawl_run_id=str(run.id),
             )
             queued = True
         except Exception:
             # Celery worker not running — fall back to sync so the
             # button still does something useful in dev.
             from apps.prompt_library.services.prompt_crawler import crawl_prompt
-            crawl_prompt(
-                website, prompt, only_missing=only_missing,
-                acting_user=request.user,
-            )
+            try:
+                crawl_prompt(
+                    website, prompt, only_missing=only_missing,
+                    acting_user=request.user, crawl_run_id=run.id,
+                )
+            except Exception:
+                # Free the slot rather than leave it held until it goes stale.
+                PromptCrawlRun.objects.filter(
+                    id=run.id,
+                    status__in=(PromptCrawlRun.STATUS_PENDING, PromptCrawlRun.STATUS_RUNNING),
+                ).update(status=PromptCrawlRun.STATUS_FAILED,
+                         error="the crawl could not start", completed_at=timezone.now())
+                raise
             queued = False
         return Response({"queued": queued, "website_id": str(website.id),
                          "prompt_id": str(prompt.id)})

@@ -86,3 +86,92 @@ class PolarCustomer(TimestampMixin):
 
     def __str__(self):
         return f"PolarCustomer({self.user_id}, {self.environment})"
+
+
+class UsageCounter(models.Model):
+    """One monthly count, kept apart from the rows it counts.
+
+    ``meter`` names what is counted:
+      - ``prompt_runs``: engine answers held or counted for an account this
+        billing period (apps.metering.services.prompt_runs). The value moves
+        with a conditional UPDATE, which is what makes the free plan's limit
+        hold under concurrent workers.
+      - ``deleted_audit_prompts``: prompts of audits deleted this calendar
+        month, so deleting an audit never hands its prompts back to the
+        monthly prompt allowance (org_entitlements.prompts_used_this_month).
+    """
+
+    METER_PROMPT_RUNS = "prompt_runs"
+    METER_DELETED_AUDIT_PROMPTS = "deleted_audit_prompts"
+
+    meter = models.CharField(max_length=32)
+    # "user:<uuid>" or "org:<uuid>".
+    account_key = models.CharField(max_length=64)
+    # Period.key: the ISO date the window starts on.
+    period_key = models.CharField(max_length=16)
+    value = models.PositiveIntegerField(default=0)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "metering_usage_counter"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["meter", "account_key", "period_key"],
+                name="metering_usage_counter_unique",
+            ),
+        ]
+
+    def __str__(self):
+        return f"UsageCounter({self.meter} {self.account_key} {self.period_key}={self.value})"
+
+
+class PromptRun(models.Model):
+    """One prompt answered by one AI engine: the free plan's unit.
+
+    A row is ``reserved`` before the engine is asked and settles once the
+    call (retries included) is over: ``counted`` for a successful,
+    non-empty answer, ``released`` for anything else. Only reserved and
+    counted rows hold a unit of the account's UsageCounter.
+    """
+
+    STATUS_RESERVED = "reserved"
+    STATUS_COUNTED = "counted"
+    STATUS_RELEASED = "released"
+    STATUS_CHOICES = [
+        (STATUS_RESERVED, "Reserved"),
+        (STATUS_COUNTED, "Counted"),
+        (STATUS_RELEASED, "Released"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    account_key = models.CharField(max_length=64)
+    period_key = models.CharField(max_length=16)
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="+",
+    )
+    website = models.ForeignKey(
+        "websites.Website", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="+",
+    )
+    # Public engine key: chatgpt, claude, gemini, grok, perplexity.
+    engine = models.CharField(max_length=16)
+    # Where the answer was asked from (prompt_runs.FEATURES).
+    feature = models.CharField(max_length=32)
+    status = models.CharField(
+        max_length=10, choices=STATUS_CHOICES, default=STATUS_RESERVED,
+    )
+    # A retried call (Celery redelivery) reuses its key and is counted once.
+    idempotency_key = models.CharField(max_length=128, unique=True, null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    settled_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "metering_prompt_run"
+        indexes = [
+            models.Index(fields=["account_key", "period_key", "status"]),
+            models.Index(fields=["status", "created_at"]),
+        ]
+
+    def __str__(self):
+        return f"PromptRun({self.status} {self.engine} {self.feature} {self.account_key})"

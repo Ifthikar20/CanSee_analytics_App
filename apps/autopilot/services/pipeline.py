@@ -1034,7 +1034,7 @@ def _ask_prompt(run, row, stop: Stop, *, inline: bool) -> None:
         return
     scan = EngineScan(
         website, bp.prompt, acting_user=website.user, actor="system",
-        usage_tags={"feature": "autopilot", "autopilot_run": str(run.id)},
+        usage_tags={"feature": "autopilot", "autopilot_run": str(run.id)}, feature="autopilot",
     )
     linked = threading.Lock()
 

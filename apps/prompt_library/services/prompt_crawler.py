@@ -183,7 +183,8 @@ def _extract_brands(*, response_text, website, brand_name, keywords, audit_id, u
 
 
 def _query_with_retry(instance, prompt_text, *, user=None, website=None,
-                      audit_id=None, actor: str = "system", extra_metadata=None):
+                      audit_id=None, actor: str = "system", extra_metadata=None,
+                      run_feature: str = "prompt_crawl", run_key: str | None = None):
     """Query a provider, retrying once when it raises or returns a
     non-key transient failure. Returns the ProviderResult (which may
     still be succeeded=False) or None if both attempts raised.
@@ -198,7 +199,23 @@ def _query_with_retry(instance, prompt_text, *, user=None, website=None,
     unattributed query() records nothing and bypasses the spend wall.
     ``extra_metadata`` adds flat tags to the usage row (Autopilot's
     ``feature`` and ``autopilot_run``); ``actor`` always wins.
+
+    Both attempts together are one prompt run (``run_feature``, keyed by
+    ``run_key``), counted only for a successful, non-empty answer. With
+    no run left the engine is not asked and the result carries
+    prompt_runs.DENIAL.
     """
+    from apps.metering.services import prompt_runs
+
+    return prompt_runs.guard(
+        lambda: _ask_twice(instance, prompt_text, user=user, website=website,
+                           audit_id=audit_id, actor=actor, extra_metadata=extra_metadata),
+        user=user, website=website, engine=getattr(instance, "name", ""),
+        feature=run_feature, key=run_key,
+    )
+
+
+def _ask_twice(instance, prompt_text, *, user, website, audit_id, actor, extra_metadata):
     tags = {**(extra_metadata or {}), "actor": actor}
     last = None
     for attempt in (1, 2):
@@ -253,9 +270,26 @@ def _dispatch_alignment(result_id) -> None:
         logger.debug("alignment dispatch failed for %s: %s", result_id, exc)
 
 
+def _start_run(website: Website, prompt: Prompt, crawl_run_id=None) -> PromptCrawlRun:
+    """Mark the reserved pending run as running, or create a running one."""
+    now = timezone.now()
+    if crawl_run_id:
+        claimed = PromptCrawlRun.objects.filter(
+            id=crawl_run_id, website=website, prompt=prompt,
+            status=PromptCrawlRun.STATUS_PENDING,
+        ).update(status=PromptCrawlRun.STATUS_RUNNING, started_at=now)
+        if claimed:
+            return PromptCrawlRun.objects.get(id=crawl_run_id)
+    return PromptCrawlRun.objects.create(
+        website=website, prompt=prompt,
+        status=PromptCrawlRun.STATUS_RUNNING, started_at=now,
+    )
+
+
 def crawl_prompt(
     website: Website, prompt: Prompt, *, only_missing: bool = False,
-    acting_user=None, should_stop=None,
+    acting_user=None, should_stop=None, providers=None, run_feature: str | None = None,
+    crawl_run_id=None,
 ) -> CrawlOutcome:
     """Run a prompt across every configured provider and persist the
     fanout + responses. Returns a small outcome summary used by the
@@ -276,20 +310,28 @@ def crawl_prompt(
     asked: when it returns True the crawl asks no further model and ends
     with what it has (``stopped`` on the outcome). An answer already
     received is still analysed and stored, so it is not paid for twice.
+
+    ``providers`` (provider keys, optional) limits the crawl to those
+    engines, e.g. the engines chosen at onboarding. Each answer is one
+    prompt run of ``run_feature`` ("prompt_crawl" for a person,
+    "scheduled_crawl" for the scheduler by default).
+
+    ``crawl_run_id`` names the pending PromptCrawlRun that Check now
+    reserved when it queued this crawl; it is reused so the slot that
+    refuses a second click stays one row. A missing or no longer pending
+    row (e.g. timed out on read) is replaced by a new one.
     """
     spend_user = acting_user or getattr(website, "user", None)
+    only = {str(p) for p in providers} if providers else None
+    if run_feature is None:
+        run_feature = "prompt_crawl" if acting_user is not None else "scheduled_crawl"
     stopped = False
 
     def stop_requested() -> bool:
         return should_stop is not None and bool(should_stop())
     actor = "user" if acting_user is not None else "system"
 
-    run = PromptCrawlRun.objects.create(
-        website=website,
-        prompt=prompt,
-        status=PromptCrawlRun.STATUS_RUNNING,
-        started_at=timezone.now(),
-    )
+    run = _start_run(website, prompt, crawl_run_id)
 
     fanouts: list[str] = []
     errors: list[str] = []
@@ -366,6 +408,8 @@ def crawl_prompt(
             if not vid or vid in seen_variants or parse_variant(vid) is None:
                 continue
             seen_variants.add(vid)
+            if only is not None and vid.split(":", 1)[0] not in only:
+                continue
             if vid in already_answered:
                 skipped_have_answer += 1
                 continue
@@ -401,6 +445,8 @@ def crawl_prompt(
             if not provider_key or provider_key in seen_providers:
                 continue
             seen_providers.add(provider_key)
+            if only is not None and provider_key not in only:
+                continue
             if provider_key in already_answered:
                 skipped_have_answer += 1
                 continue
@@ -447,6 +493,7 @@ def crawl_prompt(
         result = _query_with_retry(
             instance, prompt.text,
             user=spend_user, website=website, audit_id=str(audit.id), actor=actor,
+            run_feature=run_feature, run_key=f"crawl:{run.id}:{_skip_key}",
         )
         if result is None:
             errors.append(f"{provider_key}: query raised on both attempts")
@@ -616,15 +663,18 @@ class EngineScan:
 
     Spend goes to ``acting_user``, tagged ``actor`` ("user" for the agent,
     "system" for Autopilot's daily run) and ``usage_tags`` on each answer's
-    usage row.
+    usage row. Each answer is one prompt run of ``feature`` on the project
+    owner's account; with none left the engine is not asked.
     """
 
     def __init__(self, website: Website, prompt: Prompt, *, acting_user, actor: str = "user",
-                 usage_tags: dict | None = None):
+                 usage_tags: dict | None = None, feature: str = "agent_research"):
         self.website = website
         self.prompt = prompt
         self.acting_user = acting_user
         self.actor = actor
+        # The prompt-run feature each answer is counted under.
+        self.feature = feature
         self.usage_tags = dict(usage_tags or {})
         self.brand_name = getattr(website, "business_name", None) or website.name or "your brand"
         self.keywords = _website_keywords(website)
@@ -701,10 +751,13 @@ class EngineScan:
         model_used = getattr(instance, "model", "")
         if not isinstance(model_used, str):
             model_used = ""
+        crawl_run = self._crawl_run
         result = _query_with_retry(
             instance, self.prompt.text,
             user=self.acting_user, website=self.website, audit_id=str(audit.id),
             actor=self.actor, extra_metadata=self.usage_tags or None,
+            run_feature=self.feature,
+            run_key=f"scan:{crawl_run.id}:{variant or provider_key}" if crawl_run else None,
         )
         if result is None:
             self._note_error(f"{provider_key}: query raised on both attempts")

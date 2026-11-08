@@ -94,6 +94,18 @@ class PromptCreateSerializer(serializers.Serializer):
     # False tracks the prompts without scanning them now (Ask AI's Track
     # already has its answers; Autopilot asks it from its next run).
     scan = serializers.BooleanField(required=False, default=True)
+    # Public engine keys (chatgpt, claude, gemini, grok, perplexity) the scan
+    # this request starts asks (onboarding's engine choice). Applies to that
+    # one scan only: nothing about it is saved on the prompts.
+    engines = serializers.ListField(
+        child=serializers.ChoiceField(
+            choices=("chatgpt", "claude", "gemini", "grok", "perplexity"),
+        ),
+        required=False, default=list, max_length=5,
+    )
+
+    def validate_engines(self, value):
+        return list(dict.fromkeys(value or []))
 
     def validate_models(self, value):
         from apps.llm_ranking.providers import list_model_variants

@@ -77,9 +77,11 @@ CONFIRM_MESSAGE = "Confirm the estimate before running."
 BLOCKER_CODES = frozenset({
     "run_in_progress", "allowance_exceeded", "insufficient_allowance", "daily_limit",
     "nothing_to_run", "too_many", "not_configured", "cooldown", "daily_runs",
+    "prompt_runs_exhausted", "insufficient_prompt_runs",
 })
 BLOCKER_STATUS = {
     "run_in_progress": 409, "allowance_exceeded": 403, "insufficient_allowance": 403,
+    "prompt_runs_exhausted": 403, "insufficient_prompt_runs": 403,
     "daily_limit": 409, "nothing_to_run": 400, "too_many": 400, "not_configured": 400,
     "cooldown": 409, "daily_runs": 409,
 }
@@ -415,10 +417,18 @@ def _prepare(website, user, kind: Kind, params) -> tuple:
     qkey = str(website.id)
     daily_limit, daily_left = quota.limit(qkey), quota.remaining(qkey)
 
+    from apps.metering.services import prompt_runs
+
     a = allowance(user)
     paid_ai = usd_max > 0
     exceeded = paid_ai and not a["unlimited"] and a["spent"] >= a["cap"]
     enough = a["unlimited"] or not paid_ai or a["spent"] + usd_max <= a["cap"]
+    # Engine answers the kind asks (each is one prompt run); 0 for kinds that
+    # only use Google and Claude.
+    runs_needed = _ints(own.get("prompt_runs"))
+    runs = prompt_runs.estimate_block(user, website, runs_needed)
+    # Free accounts count prompt runs and never see dollars.
+    hide_usd = prompt_runs.is_limited(user, website)
 
     blockers = []
     current = active_run(website, kind.key)
@@ -427,14 +437,24 @@ def _prepare(website, user, kind: Kind, params) -> tuple:
             "run_in_progress", f"{kind.label} is already running for this project.",
             details={"run_id": str(current.id)},
         ))
+    short = prompt_runs.shortfall(user, website, runs_needed) if runs_needed else None
+    if short is not None:
+        blockers.append(_blocker(short["code"], short["message"], short["status"],
+                                 short["details"]))
     if exceeded:
-        blockers.append(_blocker("allowance_exceeded", "You have used your monthly AI allowance."))
+        blockers.append(_blocker(
+            "allowance_exceeded",
+            prompt_runs.ALLOWANCE_USED_FREE if hide_usd
+            else "You have used your monthly AI allowance.",
+        ))
     elif not enough:
         left_usd = usd2(a["left"], ROUND_DOWN)
         blockers.append(_blocker(
             "insufficient_allowance",
-            f"This run needs up to ${usd2(usd_max)} of AI allowance and ${left_usd} is left "
-            "this month.",
+            prompt_runs.ALLOWANCE_SHORT_FREE if hide_usd else (
+                f"This run needs up to ${usd2(usd_max)} of AI allowance and ${left_usd} is left "
+                "this month."
+            ),
             details={"need_usd": usd4(usd_max), "left_usd": left_usd, "cap_usd": usd2(a["cap"])},
         ))
     if pages > daily_left:
@@ -479,6 +499,7 @@ def _prepare(website, user, kind: Kind, params) -> tuple:
             "left_usd": None if a["unlimited"] else usd2(a["left"], ROUND_DOWN),
             "enough": enough,
         },
+        "prompt_runs": runs,
         "confirm": {"ai_calls": calls, "ai_usd_max": usd4(usd_max), "google_pages": pages},
         "warnings": warnings,
         "blockers": [{"code": b["code"], "message": b["message"]} for b in blockers],

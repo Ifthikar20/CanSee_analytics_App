@@ -79,25 +79,47 @@ def _refuse(ctx: ToolContext, code: str, message: str) -> NoReturn:
 # ── Checks ────────────────────────────────────────────────────────────────
 
 
+def _hide_usd(ctx: ToolContext) -> bool:
+    """Free accounts count prompt runs and never see dollars."""
+    from apps.metering.services import prompt_runs
+
+    return prompt_runs.is_limited(ctx.user, ctx.website)
+
+
 def _check_spent(ctx: ToolContext) -> None:
+    from apps.metering.services import prompt_runs
     from core.llm import allowance_denial
 
     if allowance_denial(ctx.user):
-        _refuse(ctx, "allowance_exceeded", ALLOWANCE_EXCEEDED)
+        _refuse(ctx, "allowance_exceeded",
+                prompt_runs.ALLOWANCE_USED_FREE if _hide_usd(ctx) else ALLOWANCE_EXCEEDED)
 
 
 def _check_affordable(ctx: ToolContext, specs: list[dict]) -> None:
     """The plan's upper-bound AI cost, report included, against what is
     left of the monthly allowance (an unlimited cap passes)."""
     from apps.agent.services.swarms import allowance_shortfall
+    from apps.metering.services import prompt_runs
 
     shortfall = allowance_shortfall(ctx.user, plan.estimate_cost(specs, with_report=True))
     if shortfall is not None:
-        _refuse(ctx, "insufficient_allowance", (
+        _refuse(ctx, "insufficient_allowance", prompt_runs.ALLOWANCE_SHORT_FREE if _hide_usd(ctx) else (
             f"Not enough AI allowance: this research needs up to ${shortfall['need_usd']:.2f} "
             f"and ${max(shortfall['left_usd'], 0):.2f} of the ${shortfall['cap_usd']:.2f} "
             "monthly allowance is left. Use fewer prompts or engines."
         ))
+
+
+def _check_prompt_runs(ctx: ToolContext, specs: list[dict]) -> None:
+    """Each engine-answer agent is one prompt run: the plan's must be left
+    on the project owner's account."""
+    from apps.agent.constants import WorkerType
+    from apps.metering.services import prompt_runs
+
+    needed = sum(1 for s in specs if s.get("worker") == WorkerType.ENGINE_ANSWER)
+    short = prompt_runs.shortfall(ctx.user, ctx.website, needed) if needed else None
+    if short is not None:
+        _refuse(ctx, short["code"], short["message"])
 
 
 def _check_measurable(ctx: ToolContext, engines: list[dict], serp_configured: bool) -> None:
@@ -117,7 +139,8 @@ def _check_size(ctx: ToolContext, expansion, args, engines: list[dict],
     configured = [e["key"] for e in engines if e["configured"]]
     if count == 0:
         _refuse(ctx, "nothing_to_measure", NO_AGENTS)
-    wanted = set(args.engines) if args.engines else None
+    chosen = _engines_for(args, ctx.run)
+    wanted = set(chosen) if chosen else None
     asked = len([k for k in configured if wanted is None or k in wanted])
     fits = plan.max_prompts_for(
         engines_per_prompt=asked, google_pages=expansion.plan["google_pages"],
@@ -179,12 +202,36 @@ def _resolve_prompts(ctx: ToolContext, items) -> list[plan.ResolvedPrompt]:
     return out
 
 
-def _options(args, website) -> plan.PlanOptions:
+def run_engines(run) -> tuple[str, ...] | None:
+    """The engines the person limited this run to (AgentRun.constraints,
+    e.g. the engines chosen at onboarding), or None."""
+    from apps.agent.tools.schemas import ENGINE_KEYS
+
+    raw = (getattr(run, "constraints", None) or {}).get("engines") if run is not None else None
+    if not isinstance(raw, list):
+        return None
+    keys = tuple(dict.fromkeys(k for k in raw if k in ENGINE_KEYS))
+    return keys or None
+
+
+def _engines_for(args, run) -> tuple[str, ...] | None:
+    """The engines the model asked for, within the run's limit. When the two
+    share none, the person's choice wins."""
+    asked = tuple(dict.fromkeys(args.engines)) if args.engines else None
+    allowed = run_engines(run)
+    if allowed is None:
+        return asked
+    if asked is None:
+        return allowed
+    return tuple(k for k in asked if k in allowed) or allowed
+
+
+def _options(args, website, run=None) -> plan.PlanOptions:
     title = args.title or f"Research {website.name}"
     return plan.PlanOptions(
         title=clip(" ".join(title.split()), SWARM_TITLE_MAX_LENGTH),
         google_pages=args.google_pages,
-        engines=tuple(dict.fromkeys(args.engines)) if args.engines else None,
+        engines=_engines_for(args, run),
         competitor_pages=args.competitor_pages,
         # The expansion keeps the entries that name a domain and notes the rest.
         competitors=tuple(args.competitors),
@@ -275,6 +322,7 @@ def research_swarm(ctx: ToolContext, args) -> ToolResult:
     if args.rerun_of is not None:
         swarm = _rerun_target(ctx, args.rerun_of)
         specs = [t for t in swarm.tasks or [] if isinstance(t, dict)]
+        _check_prompt_runs(ctx, specs)
         _check_affordable(ctx, specs)
     else:
         engines = research.engine_catalog()
@@ -282,12 +330,13 @@ def research_swarm(ctx: ToolContext, args) -> ToolResult:
         _check_measurable(ctx, engines, serp_configured)
         prompts = _resolve_prompts(ctx, args.prompts)
         expansion = plan.build_expansion(
-            ctx.website, prompts, _options(args, ctx.website), engines=engines,
+            ctx.website, prompts, _options(args, ctx.website, ctx.run), engines=engines,
             serp_configured=serp_configured, now_iso=now_iso(),
             serp_pages=serp_google.max_reliable_pages(),
         )
         _check_size(ctx, expansion, args, engines, serp_configured)
         specs = expansion.tasks
+        _check_prompt_runs(ctx, specs)
         _check_affordable(ctx, specs)
         swarm = _create_swarm(ctx, expansion)
     version = _new_version(ctx, swarm, [t["id"] for t in specs])

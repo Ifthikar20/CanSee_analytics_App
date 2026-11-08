@@ -141,13 +141,31 @@ class AgentAPIView(TenantScopedAPIView):
 
 
 class AgentStatusView(APIView):
-    """Whether the agent can run, and what is configured. Never gated."""
+    """Whether the agent can run, and what is configured. Never gated.
+
+    ``?website_id`` reads the prompt runs of that project's owner (a 404
+    for a project the user cannot see); ``?runs_needed`` is how many prompt
+    runs the caller is about to use (setup issue ``prompt_runs_low``)."""
 
     permission_classes = [IsAuthenticated]
     schema = None
 
     def get(self, request):
-        return Response(catalog.status_for(request.user))
+        from apps.websites.services.website_service import WebsiteService
+
+        website = None
+        website_id = request.query_params.get("website_id")
+        if website_id:
+            website = WebsiteService.get_for_user(
+                user=request.user, website_id=website_id, min_role="viewer",
+            )
+        needed = request.query_params.get("runs_needed")
+        try:
+            runs_needed = max(0, int(needed)) if needed not in (None, "") else None
+        except ValueError:
+            raise CanseeException("runs_needed must be a whole number.", code="invalid",
+                                  status_code=400) from None
+        return Response(catalog.status_for(request.user, website, runs_needed))
 
 
 class AgentCatalogView(AgentAPIView):

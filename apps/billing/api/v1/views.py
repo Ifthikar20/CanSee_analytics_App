@@ -534,12 +534,39 @@ class AITokenUsageView(APIView):
             "by_provider": _shape(usage["by_provider"], "provider"),
             "by_module": _shape(usage["by_module"], "module"),
             "allowance": usage["allowance"],
+            "prompt_runs": usage.get("prompt_runs"),
         }
         # Bare payload: the global EnvelopeRenderer wraps it once as
         # {success, data}. The old explicit {"success", "data"} return was
         # double-wrapped by that renderer, which is why the Billing card
         # read one envelope level too shallow.
         return Response(payload)
+
+
+class PromptRunsView(APIView):
+    """GET: the account's prompt runs this billing period.
+
+    One prompt run is one prompt answered by one AI engine. The free plan
+    gets FREE_MONTHLY_PROMPT_RUNS a period, shared by every project and
+    engine of the account; paid plans are unlimited. ``?website_id`` reads
+    the account of that project's owner (a project shared with you counts
+    on its owner's runs). Body: prompt_runs.status.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from apps.metering.services import prompt_runs
+
+        website = None
+        website_id = request.query_params.get("website_id")
+        if website_id:
+            from apps.websites.services.website_service import WebsiteService
+
+            website = WebsiteService.get_for_user(
+                user=request.user, website_id=website_id, min_role="viewer",
+            )
+        return Response(prompt_runs.status(request.user, website))
 
 
 class PaywallDismissView(APIView):

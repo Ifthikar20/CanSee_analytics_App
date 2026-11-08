@@ -98,13 +98,16 @@ def allowance_status(user, period: Period | None = None, used_tokens: int | None
 
 
 def get_period_usage(user) -> dict:
-    """Usage summary for the user's current billing period. Never raises."""
+    """Usage summary for the user's current billing period. Never raises.
+
+    ``prompt_runs`` (prompt_runs.status) is read fresh on every call; the
+    rest is cached for a minute."""
     period = billing_period_for(user)
     cache_key = f"usage_summary:{user.id}:{period.key}"
     try:
         cached = cache.get(cache_key)
         if cached is not None:
-            return cached
+            return _with_prompt_runs(user, cached)
     except Exception:
         pass
 
@@ -134,7 +137,18 @@ def get_period_usage(user) -> dict:
         cache.set(cache_key, result, _CACHE_SECONDS)
     except Exception:
         pass
-    return result
+    return _with_prompt_runs(user, result)
+
+
+def _with_prompt_runs(user, result: dict) -> dict:
+    from apps.metering.services import prompt_runs
+
+    try:
+        runs = prompt_runs.status(user)
+    except Exception:
+        logger.warning("prompt runs status failed", exc_info=True)
+        runs = None
+    return {**result, "prompt_runs": runs}
 
 
 # ── Local ledger aggregation ──────────────────────────────────────────────
