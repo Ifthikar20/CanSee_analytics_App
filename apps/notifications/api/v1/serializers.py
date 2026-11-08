@@ -55,13 +55,15 @@ class IntegrationConnectionSerializer(serializers.ModelSerializer):
         write_only=True, required=False, allow_blank=True,
     )
     webhook_configured = serializers.SerializerMethodField()
+    # True once a signed /cansee link command proved the workspace.
+    external_team_linked = serializers.SerializerMethodField()
 
     class Meta:
         model = IntegrationConnection
         fields = [
             "id", "platform", "webhook_url", "webhook_configured",
             "channel_name", "is_active",
-            "external_team_id", "external_channel_id",
+            "external_team_id", "external_team_linked", "external_channel_id",
             "schedule_time", "frequency", "message_format",
             "notify_daily_report", "notify_hot_leads",
             "notify_trend_digest", "notify_milestones",
@@ -71,3 +73,23 @@ class IntegrationConnectionSerializer(serializers.ModelSerializer):
 
     def get_webhook_configured(self, obj) -> bool:
         return bool(obj.webhook_url)
+
+    def get_external_team_linked(self, obj) -> bool:
+        return bool(obj.external_team_id and obj.external_team_verified_at)
+
+    def validate_external_team_id(self, value):
+        """The workspace id is only set by a verified link (chat_link). Here
+        it can be cleared (unlink) or sent back unchanged, nothing else."""
+        value = (value or "").strip()
+        current = getattr(self.instance, "external_team_id", "") or ""
+        if value and value != current:
+            raise serializers.ValidationError(
+                "Link a workspace by running /cansee link with a link code "
+                "in that workspace. Workspace ids can't be entered here."
+            )
+        return value
+
+    def update(self, instance, validated_data):
+        if "external_team_id" in validated_data and not validated_data["external_team_id"]:
+            validated_data["external_team_verified_at"] = None
+        return super().update(instance, validated_data)

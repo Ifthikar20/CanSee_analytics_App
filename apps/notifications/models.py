@@ -84,8 +84,12 @@ class IntegrationConnection(TimestampMixin):
 
     # Inbound-command linkage: the Slack team_id ("T...") or Discord guild_id
     # (snowflake) this connection is bound to. Inbound events resolve their
-    # IntegrationConnection through this id.
+    # IntegrationConnection through this id, and only once it is verified.
+    # It is set only from a signed Slack/Discord request that carries a
+    # link code this account created (services.chat_link), never typed in.
     external_team_id = models.CharField(max_length=64, blank=True, default="", db_index=True)
+    # When the workspace proved the link (see above). Null = not linked.
+    external_team_verified_at = models.DateTimeField(null=True, blank=True)
     # Optional default channel id for bot posts (Slack "C...", Discord snowflake).
     external_channel_id = models.CharField(max_length=64, blank=True, default="")
 
@@ -103,6 +107,16 @@ class IntegrationConnection(TimestampMixin):
     class Meta:
         db_table = "notifications_integrationconnection"
         unique_together = [("user", "platform")]
+        constraints = [
+            # One verified owner per Slack workspace / Discord server, so
+            # inbound commands always resolve to exactly one account.
+            models.UniqueConstraint(
+                fields=["platform", "external_team_id"],
+                condition=models.Q(external_team_verified_at__isnull=False)
+                & ~models.Q(external_team_id=""),
+                name="uniq_verified_chat_workspace",
+            ),
+        ]
 
     def __str__(self):
         status = "active" if self.is_active else "inactive"
