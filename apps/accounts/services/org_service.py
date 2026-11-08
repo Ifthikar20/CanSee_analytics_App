@@ -49,6 +49,31 @@ def _pending_invitations(qs=None):
     )
 
 
+def _lock_free_seat(org) -> None:
+    """Lock ``org`` and require a free seat for one more live invitation.
+
+    Call inside ``transaction.atomic()``: the row lock (the same one
+    OrgService.add_member takes) holds until the invitation is written, so
+    concurrent invitations, accepts and auto-joins see each other's seats.
+    """
+    from apps.billing.services.org_entitlements import (
+        seat_available,
+        seat_limit_for,
+        seats_used,
+    )
+
+    Organization.objects.select_for_update().filter(pk=org.pk).first()
+    if not seat_available(org):
+        seat_cap = seat_limit_for(org)
+        raise CanseeException(
+            f"All {seat_cap} seats are taken. Remove a member, revoke a "
+            "pending invitation, or contact us to add seats.",
+            code="plan_limit_exceeded",
+            status_code=403,
+            details={"used": seats_used(org), "limit": seat_cap},
+        )
+
+
 class OrgService:
     # ── Membership ────────────────────────────────────────────────
 
@@ -231,32 +256,19 @@ class OrgService:
         # Seat gate: seats are the billing unit — members plus pending
         # invites occupy them. Custom org packages override the plan's
         # team_members number. An org over its cap after a plan change
-        # keeps its members but cannot invite.
-        from apps.billing.services.org_entitlements import (
-            seat_available,
-            seat_limit_for,
-            seats_used,
-        )
-
-        seat_cap = seat_limit_for(org)
-        if not seat_available(org):
-            raise CanseeException(
-                f"All {seat_cap} seats are taken. Remove a member, revoke a "
-                "pending invitation, or contact us to add seats.",
-                code="plan_limit_exceeded",
-                status_code=403,
-                details={"used": seats_used(org), "limit": seat_cap},
-            )
-
+        # keeps its members but cannot invite. The org row is locked so two
+        # invitations sent at once cannot both take the last seat.
         raw_token = secrets.token_urlsafe(32)
-        invitation = Invitation.objects.create(
-            organization=org,
-            email=email,
-            role=role,
-            token_hash=_hash_token(raw_token),
-            invited_by=acting.user,
-            expires_at=timezone.now() + timedelta(days=INVITATION_TTL_DAYS),
-        )
+        with transaction.atomic():
+            _lock_free_seat(org)
+            invitation = Invitation.objects.create(
+                organization=org,
+                email=email,
+                role=role,
+                token_hash=_hash_token(raw_token),
+                invited_by=acting.user,
+                expires_at=timezone.now() + timedelta(days=INVITATION_TTL_DAYS),
+            )
 
         from apps.accounts.tasks import send_org_invitation_email
         send_org_invitation_email.delay(
@@ -284,32 +296,17 @@ class OrgService:
         except Invitation.DoesNotExist:
             raise ResourceNotFound("Invitation not found.") from None
 
-        # A live invitation already holds its seat. An expired one gave it
-        # up (seats_used counts live invitations only), so reviving it takes
-        # a seat exactly like a new invitation would.
-        if invitation.expires_at <= timezone.now():
-            from apps.billing.services.org_entitlements import (
-                seat_available,
-                seat_limit_for,
-                seats_used,
-            )
-
-            org = acting.organization
-            if not seat_available(org):
-                seat_cap = seat_limit_for(org)
-                raise CanseeException(
-                    f"All {seat_cap} seats are taken. Remove a member, revoke a "
-                    "pending invitation, or contact us to add seats.",
-                    code="plan_limit_exceeded",
-                    status_code=403,
-                    details={"used": seats_used(org), "limit": seat_cap},
-                )
-
         # Rotate the token so an old email's link stops working.
         raw_token = secrets.token_urlsafe(32)
-        invitation.token_hash = _hash_token(raw_token)
-        invitation.expires_at = timezone.now() + timedelta(days=INVITATION_TTL_DAYS)
-        invitation.save(update_fields=["token_hash", "expires_at"])
+        with transaction.atomic():
+            # A live invitation already holds its seat. An expired one gave
+            # it up (seats_used counts live invitations only), so reviving it
+            # takes a seat exactly like a new invitation would.
+            if invitation.expires_at <= timezone.now():
+                _lock_free_seat(acting.organization)
+            invitation.token_hash = _hash_token(raw_token)
+            invitation.expires_at = timezone.now() + timedelta(days=INVITATION_TTL_DAYS)
+            invitation.save(update_fields=["token_hash", "expires_at"])
 
         from apps.accounts.tasks import send_org_invitation_email
         send_org_invitation_email.delay(
