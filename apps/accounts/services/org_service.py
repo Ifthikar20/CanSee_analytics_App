@@ -284,6 +284,27 @@ class OrgService:
         except Invitation.DoesNotExist:
             raise ResourceNotFound("Invitation not found.") from None
 
+        # A live invitation already holds its seat. An expired one gave it
+        # up (seats_used counts live invitations only), so reviving it takes
+        # a seat exactly like a new invitation would.
+        if invitation.expires_at <= timezone.now():
+            from apps.billing.services.org_entitlements import (
+                seat_available,
+                seat_limit_for,
+                seats_used,
+            )
+
+            org = acting.organization
+            if not seat_available(org):
+                seat_cap = seat_limit_for(org)
+                raise CanseeException(
+                    f"All {seat_cap} seats are taken. Remove a member, revoke a "
+                    "pending invitation, or contact us to add seats.",
+                    code="plan_limit_exceeded",
+                    status_code=403,
+                    details={"used": seats_used(org), "limit": seat_cap},
+                )
+
         # Rotate the token so an old email's link stops working.
         raw_token = secrets.token_urlsafe(32)
         invitation.token_hash = _hash_token(raw_token)
