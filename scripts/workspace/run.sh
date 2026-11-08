@@ -573,6 +573,25 @@ show_new_log_lines() {
   fi
 }
 
+check_proxy() {
+  # The browser only talks to Vite; Vite forwards /api to Django. Ask an
+  # API endpoint through Vite: Django answers 401 when nobody is signed
+  # in, while a broken proxy answers 5xx (or nothing). This is the path
+  # every login request takes.
+  local code body="$RUN_DIR/proxy-check.txt"
+  code="$(curl -s -o "$body" -m 15 -w '%{http_code}' "$UI_URL/api/v1/auth/session/" 2>/dev/null || true)"
+  case "$code" in
+    200 | 401 | 403)
+      ok "Frontend reaches the backend (login requests will work)"
+      ;;
+    *)
+      warn "The frontend cannot reach the backend through its /api proxy (HTTP ${code:-none}). Logins will fail."
+      echo "  Response: $(head -c 300 "$body" 2>/dev/null | tr -d '\r')"
+      echo "  Check $LOG_DIR/frontend.log for 'proxy error'."
+      ;;
+  esac
+}
+
 SERVERS_STARTED=0
 
 cleanup() {
@@ -617,6 +636,7 @@ start_servers() {
 
   wait_for_http "$BACKEND_URL/health/" 120 "$LOG_DIR/backend.log" "Backend"
   wait_for_http "$UI_URL/" 120 "$LOG_DIR/frontend.log" "Frontend"
+  check_proxy
 
   open_browser "$UI_URL"
 
