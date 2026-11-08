@@ -130,3 +130,11 @@ def run_source_scan(scan_id: str) -> str:
         from apps.citations.services.source_scan import _finalize_stages
         _finalize_stages(scan, reason=str(exc))
         return "failed"
+
+
+@shared_task(name="apps.citations.tasks.compute_response_attribution")
+def compute_response_attribution(attribution_id: str, user_id: str | None = None) -> None:
+    """Work out where one AI answer got its information (on demand)."""
+    from apps.citations.services.attribution import compute
+
+    compute(attribution_id, user_id)

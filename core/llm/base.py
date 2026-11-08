@@ -101,6 +101,12 @@ class ProviderResult:
     # so web_searches may exceed len(search_queries).
     search_queries: list | None = None
     web_searches: int | None = None
+    # Which part of the answer each cited source grounds, when the engine
+    # reports it (web-search citations): [{"url", "title", "cited_text",
+    # "answer_start", "answer_end"}], offsets into ``text``. cited_text is
+    # the source passage the engine quoted ("" when it does not say).
+    # Validated by apps.llm_ranking.providers.passages.clean_passages.
+    passages: list = field(default_factory=list)
 
     @property
     def total_tokens(self) -> int:

@@ -40,6 +40,16 @@ urlpatterns = [
         name="citations-website-chat-detail",
     ),
     path(
+        "websites/<uuid:website_id>/chats/<uuid:result_id>/attribution/",
+        views.WebsiteChatAttributionView.as_view(),
+        name="citations-website-chat-attribution",
+    ),
+    path(
+        "websites/<uuid:website_id>/pages/snapshot/",
+        views.WebsitePageSnapshotView.as_view(),
+        name="citations-website-page-snapshot",
+    ),
+    path(
         "source-influence/global/",
         views.GlobalSourceInfluenceView.as_view(),
         name="citations-global-influence",

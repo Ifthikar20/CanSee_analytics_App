@@ -280,6 +280,11 @@ class LLMRankingResult(TimestampMixin):
     # 0: the engine reports searches and ran none.
     search_queries = models.JSONField(null=True, blank=True, default=None)
     web_searches = models.PositiveSmallIntegerField(null=True, blank=True)
+    # Which span of the answer each web source grounds, as the engine
+    # reported it: [{"url", "title", "cited_text", "answer_start",
+    # "answer_end"}] (apps.llm_ranking.providers.passages). [] when the
+    # engine reported none or the row predates this field.
+    citation_passages = models.JSONField(default=list, blank=True)
     # The intent type of the prompt (recommendation, comparison, persona, etc.)
     # NOTE: computed at runtime from prompt text — no database column needed.
     PROMPT_TYPE_CHOICES = [

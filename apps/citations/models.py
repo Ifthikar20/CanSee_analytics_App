@@ -302,3 +302,84 @@ class SourceScanEngineAnswer(TimestampMixin):
 
     def __str__(self):
         return f"SourceScanEngineAnswer({self.provider}, {self.status})"
+
+
+class AttributionStatus(models.TextChoices):
+    PENDING = "pending", "Pending"
+    READY = "ready", "Ready"
+    FAILED = "failed", "Failed"
+
+
+class ResponseAttribution(TimestampMixin):
+    """Where one AI answer most likely got its information.
+
+    One row per LLMRankingResult, computed on demand the first time the
+    response is opened (apps.citations.services.attribution) and kept until
+    a refresh. ``findings`` and ``summary`` follow
+    docs/attribution_contract.md section 1.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    result = models.OneToOneField(
+        "llm_ranking.LLMRankingResult",
+        on_delete=models.CASCADE,
+        related_name="attribution",
+    )
+    website = models.ForeignKey(
+        "websites.Website",
+        on_delete=models.CASCADE,
+        related_name="response_attributions",
+    )
+    status = models.CharField(
+        max_length=10, choices=AttributionStatus.choices, default=AttributionStatus.PENDING,
+    )
+    # Public error code when failed (fetch_failed, analysis_failed, ...).
+    error = models.CharField(max_length=40, blank=True)
+    findings = models.JSONField(default=list, blank=True)
+    summary = models.JSONField(default=dict, blank=True)
+    # Every source URL a finding points at, so the snapshot endpoint can
+    # serve only pages this website's attributions reference.
+    source_urls = models.JSONField(default=list, blank=True)
+    version = models.CharField(max_length=20, blank=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "citations_response_attribution"
+        indexes = [models.Index(fields=["website", "status"])]
+
+    def __str__(self):
+        return f"ResponseAttribution({self.result_id}, {self.status})"
+
+
+class PageSnapshot(TimestampMixin):
+    """The reader view of one page as it was read for attribution.
+
+    Keyed by (website, url) so the highlighted passage a finding points at
+    stays where it was found even if the live page changes. ``blocks`` are
+    apps.agent.services.browse reader blocks; page text is untrusted.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    website = models.ForeignKey(
+        "websites.Website",
+        on_delete=models.CASCADE,
+        related_name="page_snapshots",
+    )
+    url = models.URLField(max_length=2000)
+    final_url = models.URLField(max_length=2000, blank=True)
+    title = models.CharField(max_length=300, blank=True)
+    blocks = models.JSONField(default=list, blank=True)
+    status_code = models.PositiveSmallIntegerField(null=True, blank=True)
+    # Fetch error code from browse.fetch_page ("" when the page was read).
+    error = models.CharField(max_length=40, blank=True)
+    captured_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "citations_page_snapshot"
+        constraints = [
+            models.UniqueConstraint(fields=["website", "url"], name="citations_page_snapshot_unique"),
+        ]
+
+    def __str__(self):
+        return f"PageSnapshot({self.url})"

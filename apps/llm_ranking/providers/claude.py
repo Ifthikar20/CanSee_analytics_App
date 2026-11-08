@@ -2,6 +2,7 @@
 from django.conf import settings
 
 from .base import LLMProvider, ProviderResult
+from .passages import claude_passages
 
 DEFAULT_SYSTEM = (
     "When listing tools, platforms, or products, please use a numbered list "
@@ -90,10 +91,7 @@ class ClaudeProvider(LLMProvider):
         # old " ".join injected stray gaps at citation boundaries, because
         # cited answers arrive split into many mid-sentence text blocks
         # ("budget allows ." in the UI).
-        text = "".join(
-            b.text for b in resp.content
-            if getattr(b, "type", "") == "text" and getattr(b, "text", "")
-        ).strip()
+        text, passages = claude_passages(resp.content)
 
         usage = resp.usage
         # Server-side searches are billed per search on top of the tokens.
@@ -157,6 +155,7 @@ class ClaudeProvider(LLMProvider):
             searched=searches > 0,
             search_queries=search_queries,
             web_searches=web_searches,
+            passages=passages,
         )
 
 

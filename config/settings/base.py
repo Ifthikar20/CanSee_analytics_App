@@ -843,8 +843,11 @@ XAI_API_KEY = env("XAI_API_KEY", default="")
 # When True, web-search-capable providers (Claude, GPT, Gemini, Grok) run
 # with their web-search tool enabled and pass the audit region as the search
 # user_location, so non-Perplexity models also answer as a local user.
-# Off by default because web-grounded calls cost more and are slower.
-LLM_WEBSEARCH_ENABLED = env.bool("LLM_WEBSEARCH_ENABLED", default=False)
+# On by default: web-grounded answers are what consumers see, and their
+# citations name the exact passages each answer used (source attribution,
+# apps.citations.services.attribution). Web-grounded calls cost more and are
+# slower; set LLM_WEBSEARCH_ENABLED=false to turn them off.
+LLM_WEBSEARCH_ENABLED = env.bool("LLM_WEBSEARCH_ENABLED", default=True)
 
 # Claude-clustered sentiment themes in apps.llm_ranking.services.geo_deep_dive.
 GEO_SENTIMENT_THEMES_ENABLED = env.bool("GEO_SENTIMENT_THEMES_ENABLED", default=True)

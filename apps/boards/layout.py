@@ -46,12 +46,16 @@ WIDGETS = {
     "products": "half",
 }
 
-# Served while nothing is saved, and what Reset board restores: Ask AI and
-# Prompt ranking (wave 4 contract 6). Saved layouts are not migrated. Callers
-# take copies (default_widgets), never these dicts.
+# Served while nothing is saved, and what Reset board restores: Ask AI,
+# Prompt ranking, Summary, Citations and Who AI recommends. Saved layouts are
+# not migrated. Callers take copies (default_widgets), never these dicts.
+# Mirrored by DEFAULT_LAYOUT in the UI's src/lib/board/widgets.js.
 DEFAULT_LAYOUT = (
     {"key": "prompt-box", "size": "full"},
     {"key": "ranking", "size": "full"},
+    {"key": "summary", "size": "full"},
+    {"key": "citations", "size": "half"},
+    {"key": "who-recommends", "size": "half"},
 )
 
 # An unknown key is quoted back in its error up to this many characters.

@@ -66,6 +66,7 @@ class GrokProvider(LLMProvider):
             extract_responses_citations,
             extract_search_queries,
         )
+        from apps.llm_ranking.providers.passages import responses_passages
 
         try:
             resp = client.responses.create(
@@ -88,6 +89,7 @@ class GrokProvider(LLMProvider):
                 citations=extract_responses_citations(resp),
                 search_queries=queries if searches else None,
                 web_searches=searches if searches else None,
+                passages=responses_passages(resp),
             )
         except Exception:
             return None

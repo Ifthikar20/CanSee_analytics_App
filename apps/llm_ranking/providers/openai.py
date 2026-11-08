@@ -71,6 +71,7 @@ class OpenAIProvider(LLMProvider):
             extract_responses_citations,
             extract_search_queries,
         )
+        from apps.llm_ranking.providers.passages import responses_passages
         from apps.llm_ranking.services.regions import get_region
 
         country = get_region(region).perplexity_country if region else ""
@@ -111,4 +112,5 @@ class OpenAIProvider(LLMProvider):
             ),
             search_queries=queries,
             web_searches=searches,
+            passages=responses_passages(resp),
         )

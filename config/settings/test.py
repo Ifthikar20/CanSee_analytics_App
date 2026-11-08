@@ -78,6 +78,9 @@ TWILIO_FROM_NUMBER = ""
 # from .env on a developer machine, so without this the scan pipeline tests
 # would make real, billable calls to Claude/GPT/Perplexity.
 BRAND_RESEARCH_ENGINES_ENABLED = False
+# Provider doubles answer without web tools; tests that cover web search
+# enable it explicitly.
+LLM_WEBSEARCH_ENABLED = False
 
 # Business flows are ON for the suite (the org/SSO tests exercise them);
 # individual tests assert the OFF behavior via override_settings.

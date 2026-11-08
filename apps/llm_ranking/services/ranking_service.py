@@ -60,6 +60,25 @@ def search_query_fields(result) -> dict:
     }
 
 
+def citation_passage_fields(result, provider: str) -> dict:
+    """``{"citation_passages": [...]}`` for an LLMRankingResult row: which
+    span of the answer each web source grounds, as the engine reported it.
+
+    Empty for a failed answer, for provider doubles without real passages,
+    and for providers whose terms exclude grounded links from storage.
+    """
+    from apps.llm_ranking.providers.passages import clean_passages
+    from core.utils.retention import grounded_links_may_be_stored
+
+    if getattr(result, "succeeded", False) is not True or not grounded_links_may_be_stored(provider):
+        return {"citation_passages": []}
+    passages = getattr(result, "passages", None)
+    text = getattr(result, "text", "")
+    if not isinstance(passages, list) or not isinstance(text, str):
+        return {"citation_passages": []}
+    return {"citation_passages": clean_passages(passages, text)}
+
+
 def _country_counts_for(citations) -> dict:
     """Local helper — silently degrades to {} if citation_geo isn't importable."""
     try:
@@ -671,6 +690,7 @@ class LLMRankingService:
                 "extraction_version": analysis.get("extraction_version", ""),
                 # None for a failed cell, so a retry never keeps stale searches.
                 **search_query_fields(result),
+                **citation_passage_fields(result, provider),
             },
         )
         LLMRankingService._dispatch_citation_extraction(result_obj.id)

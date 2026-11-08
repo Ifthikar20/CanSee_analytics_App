@@ -60,13 +60,21 @@ class PerplexityProvider(LLMProvider):
                 for row in (body.get("search_results") or [])
                 if isinstance(row, dict) and row.get("url")
             ]
+        from .passages import marker_passages
+
+        text = body["choices"][0]["message"]["content"].strip()
+        results = [r for r in (body.get("search_results") or []) if isinstance(r, dict)]
+        if not results:
+            # Legacy shape: the [n] markers index the plain URL list.
+            results = [{"url": u} for u in citations]
         return ProviderResult(
             succeeded=True,
-            text=body["choices"][0]["message"]["content"].strip(),
+            text=text,
             input_tokens=int(usage.get("prompt_tokens", 0)),
             output_tokens=int(usage.get("completion_tokens", 0)),
             raw=body,
             citations=citations,
             # Sonar lists its sources only when it searched the web.
             searched=bool(citations),
+            passages=marker_passages(text, results),
         )

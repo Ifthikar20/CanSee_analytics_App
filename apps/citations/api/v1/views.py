@@ -332,6 +332,48 @@ class WebsiteChatDetailView(TenantScopedAPIView):
         return Response(payload)
 
 
+class WebsiteChatAttributionView(TenantScopedAPIView):
+    """Where one AI answer most likely got its information
+    (docs/attribution_contract.md section 1).
+
+    GET returns what is stored and never starts work; POST starts the
+    analysis, or re-runs it with ``{"refresh": true}``.
+    """
+
+    def get(self, request, website_id, result_id):
+        from apps.citations.services.attribution import get_payload
+
+        website = self.get_website(website_id)
+        data = get_payload(website, result_id)
+        if data is None:
+            return Response({"detail": "Chat not found for this website."}, status=404)
+        return Response(data)
+
+    def post(self, request, website_id, result_id):
+        from apps.citations.services.attribution import start
+
+        website = self.get_website(website_id)
+        refresh = request.data.get("refresh") is True if hasattr(request.data, "get") else False
+        data = start(website, result_id, user=request.user, refresh=refresh)
+        if data is None:
+            return Response({"detail": "Chat not found for this website."}, status=404)
+        return Response(data, status=202 if data["status"] == "pending" else 200)
+
+
+class WebsitePageSnapshotView(TenantScopedAPIView):
+    """The captured reader view of a page one of this website's
+    attributions points at (docs/attribution_contract.md section 2)."""
+
+    def get(self, request, website_id):
+        from apps.citations.services.attribution import snapshot_payload
+
+        website = self.get_website(website_id)
+        data = snapshot_payload(website, request.query_params.get("url", ""))
+        if data is None:
+            return Response({"detail": "No snapshot for this page."}, status=404)
+        return Response(data)
+
+
 class GlobalSourceInfluenceView(APIView):
     """Global (cross-tenant) rollup for benchmarking. No PII; safe to expose."""
 
