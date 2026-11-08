@@ -80,10 +80,10 @@ def _find_subscriptions(from_number: str) -> list:
 def _answer_for(subscription, question: str) -> str:
     """Ask the assistant, scoped to this subscriber's first website."""
     from apps.assistant.services.orchestrator import AssistantUnavailable, answer
-    from apps.websites.models import Website
+    from apps.websites.services.website_service import WebsiteService
 
     website = (
-        Website.objects.filter(user=subscription.user).order_by("created_at").first()
+        WebsiteService.created_by_qs(subscription.user).order_by("created_at").first()
     )
     if website is None:
         return NO_WEBSITE

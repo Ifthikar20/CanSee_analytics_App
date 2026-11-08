@@ -132,9 +132,9 @@ def _build_report_data(user) -> dict:
     """
     from django.utils import timezone
 
-    from apps.websites.models import Website
+    from apps.websites.services.website_service import WebsiteService
 
-    websites = list(Website.objects.filter(user=user).order_by("created_at")[:3])
+    websites = list(WebsiteService.created_by_qs(user).order_by("created_at")[:3])
     data = {
         "visitors_24h": 0,
         "pageviews_24h": 0,
@@ -226,9 +226,10 @@ def _security_overview(user, website=None) -> dict:
         DETECTOR_INDEX,
         ISSUE_FALLBACK,
     )
+    from apps.websites.services.website_service import WebsiteService
 
     open_alerts = SafetyAlert.objects.filter(
-        website__user=user, status=SafetyAlert.STATUS_OPEN,
+        website__in=WebsiteService.created_by_qs(user), status=SafetyAlert.STATUS_OPEN,
     ).only("severity", "detector_code", "issue")
     if website is not None:
         open_alerts = open_alerts.filter(website=website)
@@ -633,6 +634,7 @@ def _security_command_text(user) -> str:
         DETECTOR_INDEX,
         ISSUE_FALLBACK,
     )
+    from apps.websites.services.website_service import WebsiteService
 
     overview = _security_overview(user)
     if not overview["open_total"]:
@@ -645,7 +647,7 @@ def _security_command_text(user) -> str:
     rank = {"high": 0, "medium": 1, "low": 2}
     alerts = sorted(
         SafetyAlert.objects.filter(
-            website__user=user, status=SafetyAlert.STATUS_OPEN,
+            website__in=WebsiteService.created_by_qs(user), status=SafetyAlert.STATUS_OPEN,
         ).select_related("website"),
         key=lambda a: (rank.get(a.severity, 3), -a.last_seen_at.timestamp()),
     )[:5]
@@ -758,10 +760,10 @@ def _growth_command_text(user) -> str:
     """
     from apps.llm_ranking.services.overview_stats import build_overview_for_user
     from apps.llm_ranking.services.visibility_series import build_overview_for_website
-    from apps.websites.models import Website
+    from apps.websites.services.website_service import WebsiteService
 
     site_rows = []
-    for website in Website.objects.filter(user=user).order_by("created_at")[:5]:
+    for website in WebsiteService.created_by_qs(user).order_by("created_at")[:5]:
         try:
             overview = build_overview_for_website(user, website)
         except Exception:
@@ -853,10 +855,10 @@ def _growth_command_text(user) -> str:
 
 
 def _resolve_website(user):
-    from apps.websites.models import Website
+    from apps.websites.services.website_service import WebsiteService
 
     return (
-        Website.objects.filter(user=user, is_active=True)
+        WebsiteService.created_by_qs(user).filter(is_active=True)
         .order_by("created_at")
         .first()
     )
@@ -882,14 +884,14 @@ def _traffic_fact_lines(user, website=None) -> list[str]:
     from django.utils import timezone
 
     from apps.analytics.services.analytics_service import AnalyticsService
-    from apps.websites.models import Website
+    from apps.websites.services.website_service import WebsiteService
 
     now = timezone.now()
     lines = []
     if website is not None:
         targets = [website]
     else:
-        targets = Website.objects.filter(user=user).order_by("created_at")[:3]
+        targets = WebsiteService.created_by_qs(user).order_by("created_at")[:3]
     for website in targets:
         try:
             today = AnalyticsService.get_overview(
@@ -924,13 +926,13 @@ def _traffic_fact_lines(user, website=None) -> list[str]:
 
 def _visibility_fact_lines(user, website=None) -> list[str]:
     from apps.llm_ranking.services.visibility_series import build_overview_for_website
-    from apps.websites.models import Website
+    from apps.websites.services.website_service import WebsiteService
 
     lines = []
     if website is not None:
         targets = [website]
     else:
-        targets = Website.objects.filter(user=user).order_by("created_at")[:3]
+        targets = WebsiteService.created_by_qs(user).order_by("created_at")[:3]
     for website in targets:
         try:
             overview = build_overview_for_website(user, website)

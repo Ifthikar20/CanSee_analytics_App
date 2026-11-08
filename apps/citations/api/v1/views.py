@@ -30,13 +30,12 @@ from apps.llm_ranking.models import LLMRankingAudit
 from core.views import TenantScopedAPIView, TenantScopedListAPIView
 
 
-def _get_audit_for_user(user, audit_id):
-    """Return the audit if its website belongs to ``user``, else 404."""
+def _get_audit_for_user(user, audit_id, *, min_role: str = "member"):
+    """Return the audit if ``user`` can reach its website, else 404/403."""
     from apps.websites.services.website_service import WebsiteService
 
     audit = get_object_or_404(LLMRankingAudit, id=audit_id)
-    # Will raise 404/403 if the user does not own the website.
-    WebsiteService.get_for_user(user=user, website_id=audit.website_id)
+    WebsiteService.get_for_user(user=user, website_id=audit.website_id, min_role=min_role)
     return audit
 
 
@@ -44,7 +43,7 @@ class AuditCitationsView(TenantScopedListAPIView):
     """List citations for one audit. Filterable by provider + source_class."""
 
     def get(self, request, audit_id):
-        audit = _get_audit_for_user(request.user, audit_id)
+        audit = _get_audit_for_user(request.user, audit_id, min_role="viewer")
         qs = Citation.objects.filter(audit=audit).select_related("result")
 
         provider = request.query_params.get("provider")
@@ -65,7 +64,7 @@ class AuditSourceInfluenceView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request, audit_id):
-        audit = _get_audit_for_user(request.user, audit_id)
+        audit = _get_audit_for_user(request.user, audit_id, min_role="viewer")
         return Response(compute_audit_breakdown(audit))
 
 

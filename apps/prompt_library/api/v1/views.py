@@ -176,10 +176,10 @@ class PreviewSampleView(APIView):
         )
 
 
-def _resolve_audit(user, audit_id) -> LLMRankingAudit:
-    """Fetch an audit and verify the user owns the underlying website."""
+def _resolve_audit(user, audit_id, *, min_role: str = "member") -> LLMRankingAudit:
+    """Fetch an audit and verify the user can reach the underlying website."""
     audit = get_object_or_404(LLMRankingAudit, id=audit_id)
-    WebsiteService.get_for_user(user=user, website_id=audit.website_id)
+    WebsiteService.get_for_user(user=user, website_id=audit.website_id, min_role=min_role)
     return audit
 
 
@@ -221,7 +221,7 @@ class GetAuditSampleView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request, audit_id):
-        audit = _resolve_audit(request.user, audit_id)
+        audit = _resolve_audit(request.user, audit_id, min_role="viewer")
         sample_run = getattr(audit, "prompt_sample_run", None)
         if sample_run is None:
             return Response({"sample_run": None})
@@ -615,7 +615,9 @@ class PromptPreviewView(APIView):
         website_id = request.query_params.get("website")
         website = None
         if website_id:
-            website = WebsiteService.get_for_user(user=request.user, website_id=website_id)
+            website = WebsiteService.get_for_user(
+                user=request.user, website_id=website_id, min_role="viewer",
+            )
         filled, missing = resolve_for_website(website, prompt)
         return Response({
             "prompt_id": str(prompt.id),

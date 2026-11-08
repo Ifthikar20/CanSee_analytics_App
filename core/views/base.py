@@ -23,6 +23,7 @@ from rest_framework.views import APIView
 
 from core.exceptions import ResourceNotFound
 from core.interceptors.pagination import StandardPagination
+from core.permissions.rbac import min_role_for_method
 
 
 class TenantScopedAPIView(APIView):
@@ -44,10 +45,13 @@ class TenantScopedAPIView(APIView):
     #: Override in subclasses to use a different URL kwarg name (e.g. ``site_id``).
     website_url_kwarg: str = "website_id"
 
-    def get_website(self, website_id=None):
+    def get_website(self, website_id=None, *, min_role: str | None = None):
         """Return the ``Website`` for the current request, raising 404/403 if denied.
 
         Pass an explicit id when the URL kwarg name differs from the convention.
+        Without ``min_role`` the request method decides: reads (GET, HEAD,
+        OPTIONS) are open to org viewers, everything else needs member.
+        Pass ``min_role="admin"`` for destructive project-level actions.
         Lazily imports :class:`WebsiteService` to avoid circular imports during
         Django app loading.
         """
@@ -55,7 +59,11 @@ class TenantScopedAPIView(APIView):
 
         if website_id is None:
             website_id = self.kwargs.get(self.website_url_kwarg)
-        return WebsiteService.get_for_user(user=self.request.user, website_id=website_id)
+        if min_role is None:
+            min_role = min_role_for_method(self.request.method)
+        return WebsiteService.get_for_user(
+            user=self.request.user, website_id=website_id, min_role=min_role,
+        )
 
     def get_tenant_object(self, queryset, **lookup):
         """Return a single object from ``queryset`` matching ``lookup``.

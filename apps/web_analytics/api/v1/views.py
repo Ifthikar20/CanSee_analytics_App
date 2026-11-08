@@ -188,7 +188,7 @@ class Ga4SelectPropertyView(GatedTenantView):
 
 class Ga4DisconnectView(GatedTenantView):
     def delete(self, request, website_id):
-        website = self.get_website(website_id)
+        website = self.get_website(website_id, min_role="admin")
         integration = _get_integration(website, "ga")
         if integration is not None:
             ga4_oauth.disconnect(integration)
@@ -420,7 +420,7 @@ class CloudflareSelectZoneView(GatedTenantView):
 
 class CloudflareDisconnectView(GatedTenantView):
     def delete(self, request, website_id):
-        website = self.get_website(website_id)
+        website = self.get_website(website_id, min_role="admin")
         integration = _get_integration(website, "cloudflare")
         if integration is not None:
             # Nothing to revoke remotely; the tenant owns the token.
