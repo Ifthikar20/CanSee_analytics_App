@@ -270,9 +270,26 @@ def _dispatch_alignment(result_id) -> None:
         logger.debug("alignment dispatch failed for %s: %s", result_id, exc)
 
 
+def _start_run(website: Website, prompt: Prompt, crawl_run_id=None) -> PromptCrawlRun:
+    """Mark the reserved pending run as running, or create a running one."""
+    now = timezone.now()
+    if crawl_run_id:
+        claimed = PromptCrawlRun.objects.filter(
+            id=crawl_run_id, website=website, prompt=prompt,
+            status=PromptCrawlRun.STATUS_PENDING,
+        ).update(status=PromptCrawlRun.STATUS_RUNNING, started_at=now)
+        if claimed:
+            return PromptCrawlRun.objects.get(id=crawl_run_id)
+    return PromptCrawlRun.objects.create(
+        website=website, prompt=prompt,
+        status=PromptCrawlRun.STATUS_RUNNING, started_at=now,
+    )
+
+
 def crawl_prompt(
     website: Website, prompt: Prompt, *, only_missing: bool = False,
     acting_user=None, should_stop=None, providers=None, run_feature: str | None = None,
+    crawl_run_id=None,
 ) -> CrawlOutcome:
     """Run a prompt across every configured provider and persist the
     fanout + responses. Returns a small outcome summary used by the
@@ -298,6 +315,11 @@ def crawl_prompt(
     engines, e.g. the engines chosen at onboarding. Each answer is one
     prompt run of ``run_feature`` ("prompt_crawl" for a person,
     "scheduled_crawl" for the scheduler by default).
+
+    ``crawl_run_id`` names the pending PromptCrawlRun that Check now
+    reserved when it queued this crawl; it is reused so the slot that
+    refuses a second click stays one row. A missing or no longer pending
+    row (e.g. timed out on read) is replaced by a new one.
     """
     spend_user = acting_user or getattr(website, "user", None)
     only = {str(p) for p in providers} if providers else None
@@ -309,12 +331,7 @@ def crawl_prompt(
         return should_stop is not None and bool(should_stop())
     actor = "user" if acting_user is not None else "system"
 
-    run = PromptCrawlRun.objects.create(
-        website=website,
-        prompt=prompt,
-        status=PromptCrawlRun.STATUS_RUNNING,
-        started_at=timezone.now(),
-    )
+    run = _start_run(website, prompt, crawl_run_id)
 
     fanouts: list[str] = []
     errors: list[str] = []

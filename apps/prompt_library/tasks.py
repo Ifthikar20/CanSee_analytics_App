@@ -5,6 +5,7 @@ import logging
 from datetime import timedelta
 
 from celery import shared_task
+from django.utils import timezone
 
 logger = logging.getLogger("apps")
 
@@ -56,6 +57,7 @@ def refresh_effectiveness_scores() -> int:
 def crawl_prompt_for_website(
     self, website_id: str, prompt_id: str, only_missing: bool = False,
     acting_user_id: str | None = None, providers: list | None = None,
+    crawl_run_id: str | None = None,
 ) -> dict:
     """Fan out + query providers for a single saved prompt.
 
@@ -70,9 +72,10 @@ def crawl_prompt_for_website(
     ``acting_user_id`` is set when a person clicked the button — AI
     spend is attributed to them. The scheduler leaves it None and spend
     goes to the website owner as actor="system". ``providers`` limits the
-    crawl to those engines (provider keys).
+    crawl to those engines (provider keys). ``crawl_run_id`` is the
+    pending PromptCrawlRun Check now reserved when it queued the crawl.
     """
-    from apps.prompt_library.models import Prompt
+    from apps.prompt_library.models import Prompt, PromptCrawlRun
     from apps.prompt_library.services.prompt_crawler import crawl_prompt
     from apps.websites.models import Website
 
@@ -81,6 +84,11 @@ def crawl_prompt_for_website(
         prompt = Prompt.objects.get(id=prompt_id)
     except (Website.DoesNotExist, Prompt.DoesNotExist) as exc:
         logger.warning("crawl_prompt_for_website: %s", exc)
+        if crawl_run_id:
+            PromptCrawlRun.objects.filter(
+                id=crawl_run_id, status=PromptCrawlRun.STATUS_PENDING,
+            ).update(status=PromptCrawlRun.STATUS_FAILED, error=str(exc)[:1000],
+                     completed_at=timezone.now())
         return {"ok": False, "error": str(exc)}
 
     acting_user = None
@@ -91,7 +99,7 @@ def crawl_prompt_for_website(
 
     outcome = crawl_prompt(
         website, prompt, only_missing=only_missing, acting_user=acting_user,
-        providers=providers or None,
+        providers=providers or None, crawl_run_id=crawl_run_id,
     )
     return {
         "ok": True,
