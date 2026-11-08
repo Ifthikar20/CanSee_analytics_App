@@ -229,7 +229,9 @@ class RejectedBrandPrompt(TimestampMixin):
     class Meta:
         db_table = "prompt_library_rejectedbrandprompt"
         unique_together = [("website", "prompt")]
-        indexes = [models.Index(fields=["website", "-created_at"])]
+        indexes = [
+            models.Index(fields=["website", "-created_at"], name="prompt_libr_website_3a8e91_idx"),
+        ]
         ordering = ["-created_at"]
 
 
@@ -268,7 +270,9 @@ class PromptFanout(TimestampMixin):
     class Meta:
         db_table = "prompt_library_promptfanout"
         indexes = [
-            models.Index(fields=["website", "prompt", "-created_at"]),
+            models.Index(
+                fields=["website", "prompt", "-created_at"], name="prompt_libr_website_a4f2b1_idx",
+            ),
         ]
         ordering = ["-created_at"]
 
@@ -313,7 +317,9 @@ class PromptCrawlRun(TimestampMixin):
     class Meta:
         db_table = "prompt_library_promptcrawlrun"
         indexes = [
-            models.Index(fields=["website", "prompt", "-created_at"]),
+            models.Index(
+                fields=["website", "prompt", "-created_at"], name="prompt_libr_website_b9c4d2_idx",
+            ),
         ]
         ordering = ["-created_at"]
 
@@ -456,7 +462,7 @@ class TestEnvironment(TimestampMixin):
     class Meta:
         db_table = "prompt_library_testenvironment"
         unique_together = [("website", "name")]
-        indexes = [models.Index(fields=["website", "-created_at"])]
+        indexes = [models.Index(fields=["website", "-created_at"], name="pl_testenv_w_ca_idx")]
         ordering = ["-created_at"]
 
     def __str__(self):

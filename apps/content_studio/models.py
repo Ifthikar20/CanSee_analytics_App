@@ -88,8 +88,8 @@ class ContentBrief(TimestampMixin):
         db_table = "content_studio_contentbrief"
         ordering = ["-impact_score", "-created_at"]
         indexes = [
-            models.Index(fields=["website", "status", "-impact_score"]),
-            models.Index(fields=["website", "gap_type"]),
+            models.Index(fields=["website", "status", "-impact_score"], name="cs_brief_w_s_imp_idx"),
+            models.Index(fields=["website", "gap_type"], name="cs_brief_w_gap_idx"),
         ]
 
     def __str__(self):
@@ -128,8 +128,8 @@ class ContentDraft(TimestampMixin):
         db_table = "content_studio_contentdraft"
         ordering = ["-created_at"]
         indexes = [
-            models.Index(fields=["website", "status"]),
-            models.Index(fields=["brief"]),
+            models.Index(fields=["website", "status"], name="cs_draft_w_s_idx"),
+            models.Index(fields=["brief"], name="cs_draft_brief_idx"),
         ]
 
     def __str__(self):
