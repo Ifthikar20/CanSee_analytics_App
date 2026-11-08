@@ -70,6 +70,19 @@ CANSEE_COMMAND = {
         },
         {
             "type": SUB_COMMAND,
+            "name": "link",
+            "description": "Link this server to your Cansee account with a link code",
+            "options": [
+                {
+                    "type": OPTION_STRING,
+                    "name": "code",
+                    "description": "The link code from Cansee Integrations settings",
+                    "required": True,
+                },
+            ],
+        },
+        {
+            "type": SUB_COMMAND,
             "name": "help",
             "description": "List available Cansee commands",
         },

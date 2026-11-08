@@ -4,6 +4,7 @@ import string
 from datetime import timedelta
 
 from django.contrib.auth import authenticate
+from django.core.cache import cache
 from django.utils import timezone
 from rest_framework_simplejwt.tokens import RefreshToken
 
@@ -13,7 +14,7 @@ from apps.accounts.models import (
     PasswordResetToken,
     User,
 )
-from core.exceptions import LoginRefused
+from core.exceptions import CanseeException, LoginRefused
 from core.logging.audit_logger import audit_log
 
 security_logger = logging.getLogger("security")
@@ -23,6 +24,35 @@ _SESSION_REFUSALS = {
     "Please verify your email before logging in.": "email_not_verified",
     "This account has been deactivated.": "account_deactivated",
 }
+
+
+#: How long an email verification code stays valid.
+OTP_TTL_MINUTES = 15
+#: Wrong codes allowed per account in OTP_FAILURE_WINDOW_SECONDS. At the
+#: limit the live code is retired and verification is refused until the
+#: window ends. Sending a new code does not reset the count, so resending
+#: cannot buy more guesses.
+OTP_MAX_FAILURES = 10
+OTP_FAILURE_WINDOW_SECONDS = 60 * 60
+#: A new code can be emailed to an account at most once per this period.
+OTP_RESEND_COOLDOWN_SECONDS = 60
+
+
+def _otp_failures_key(user) -> str:
+    return f"email_otp_failures:{user.pk}"
+
+
+def otp_resend_allowed(user) -> bool:
+    """True at most once per OTP_RESEND_COOLDOWN_SECONDS for ``user``."""
+    return cache.add(f"email_otp_resend:{user.pk}", 1, timeout=OTP_RESEND_COOLDOWN_SECONDS)
+
+
+def _otp_locked() -> CanseeException:
+    return CanseeException(
+        "Too many incorrect codes. Wait up to an hour, then request a new code.",
+        code="otp_attempts_exceeded",
+        status_code=429,
+    )
 
 
 class AuthService:
@@ -181,9 +211,14 @@ class AuthService:
 
     @staticmethod
     def generate_email_otp(*, user: User) -> str:
-        """Generate a 6-digit OTP for email verification."""
+        """Generate a 6-digit OTP for email verification.
+
+        Only the newest code is valid: every earlier unused code is retired
+        first, so resending cannot stack up many live codes to guess at.
+        """
         otp = "".join(secrets.choice(string.digits) for _ in range(6))
-        expires_at = timezone.now() + timedelta(minutes=15)
+        expires_at = timezone.now() + timedelta(minutes=OTP_TTL_MINUTES)
+        EmailVerificationOTP.objects.filter(user=user, used=False).update(used=True)
         EmailVerificationOTP.objects.create(
             user=user, otp=otp, expires_at=expires_at
         )
@@ -197,6 +232,10 @@ class AuthService:
         except User.DoesNotExist:
             raise ValueError("Invalid OTP.") from None
 
+        failures_key = _otp_failures_key(user)
+        if (cache.get(failures_key) or 0) >= OTP_MAX_FAILURES:
+            raise _otp_locked()
+
         verification = (
             EmailVerificationOTP.objects.filter(
                 user=user,
@@ -209,8 +248,21 @@ class AuthService:
         )
 
         if not verification:
+            # Count wrong guesses per account, whatever IP they come from.
+            # At the limit the live code is retired and the account is
+            # locked until the window ends; then only a new code works.
+            cache.add(failures_key, 0, timeout=OTP_FAILURE_WINDOW_SECONDS)
+            try:
+                failures = cache.incr(failures_key)
+            except ValueError:  # expired between add and incr
+                cache.set(failures_key, 1, timeout=OTP_FAILURE_WINDOW_SECONDS)
+                failures = 1
+            if failures >= OTP_MAX_FAILURES:
+                EmailVerificationOTP.objects.filter(user=user, used=False).update(used=True)
+                raise _otp_locked()
             raise ValueError("Invalid or expired OTP.")
 
+        cache.delete(failures_key)
         verification.used = True
         verification.save(update_fields=["used"])
 

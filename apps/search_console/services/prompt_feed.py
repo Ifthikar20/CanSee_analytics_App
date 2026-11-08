@@ -6,9 +6,10 @@ scoring_service.SOURCE_WEIGHTS already gives gsc_aggregate the highest
 weight (1.2), so anything created here is preferentially sampled into
 audits once compute-demand-scores runs.
 
-Prompt rows are global per industry, not per website, so branded
-queries are excluded to keep tenant-identifying terms out of the
-shared pool.
+Rows created here are private to the website (owner_website, not in the
+shared catalog): even unbranded queries can name competitors or places
+the tenant cares about. Branded queries are still skipped. A query that
+matches an existing row only raises that row's score.
 """
 
 from __future__ import annotations
@@ -133,6 +134,9 @@ def feed_prompts_for_website(website, *, days: int = 28, top_n: int | None = Non
                 "source_url": "",
                 "excerpt": "",
                 "demand_score": demand,
+                # A tenant's own Search Console queries: private to the
+                # website, offered back to it as suggestions only.
+                "owner_website": website,
             },
         )
         if was_created:

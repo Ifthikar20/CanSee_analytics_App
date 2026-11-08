@@ -758,6 +758,7 @@ def track_prompts(ctx: ToolContext, args) -> ToolResult:
                 style="question",
                 source=PromptSource.MANUAL,
                 text_hash=digest,
+                owner_website=ctx.website,  # private to this tenant
             )
         brand_prompt, was_created = BrandPrompt.objects.get_or_create(
             website=ctx.website, prompt=prompt,

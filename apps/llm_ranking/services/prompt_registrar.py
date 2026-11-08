@@ -86,6 +86,8 @@ def register_within_plan(items: list[dict], website) -> tuple[int, int]:
                     excerpt=(item.get("rationale") or "")[:500] if isinstance(item, dict) else "",
                     text_hash=digest,
                     is_active=True,
+                    # Generated from this website's content: private to it.
+                    owner_website=website,
                 )
                 created += 1
             # Link to the website so it joins the saved prompt list.

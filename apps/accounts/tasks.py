@@ -26,7 +26,7 @@ def send_verification_email(user_id: str):
 
     # SECURITY: never log the OTP itself — it is a live authentication
     # secret. It travels only in the email body. A retry generates a fresh
-    # OTP; earlier unexpired codes stay valid, which is harmless.
+    # OTP and retires the earlier ones (AuthService.generate_email_otp).
     otp = AuthService.generate_email_otp(user=user)
     subject, html = emails.verification_email(otp=otp)
     if not EmailService.send_email(to=user.email, subject=subject, html_content=html):

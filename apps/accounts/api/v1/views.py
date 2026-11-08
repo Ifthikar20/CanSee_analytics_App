@@ -183,6 +183,9 @@ class TokenRefreshView(APIView):
 
 class VerifyEmailView(APIView):
     permission_classes = [AllowAny]
+    # Per-IP limit on guesses; AuthService.verify_email_otp also limits
+    # wrong codes per account.
+    throttle_classes = [AuthRateThrottle]
 
     def post(self, request):
         serializer = VerifyEmailSerializer(data=request.data)
@@ -200,8 +203,13 @@ class ResendVerificationView(APIView):
         from apps.accounts.models import User
         try:
             user = User.objects.get(email__iexact=email, is_email_verified=False)
+            from apps.accounts.services.auth_service import otp_resend_allowed
             from apps.accounts.tasks import send_verification_email
-            send_verification_email.delay(str(user.id))
+
+            # One email per account per minute, whatever IP asks; the
+            # answer stays the same so it reveals nothing.
+            if otp_resend_allowed(user):
+                send_verification_email.delay(str(user.id))
         except User.DoesNotExist:
             pass  # Don't reveal whether email exists
         return Response({"message": "If an unverified account exists, a new code has been sent."})

@@ -1,8 +1,9 @@
 """A project's team: the people who can write its agent work and review it.
 
-The website's owner plus the members of its organization with role
-member or above, the rule WebsiteService.get_for_user applies to writes.
-Inactive accounts are left out.
+The owner of a personal website, or the members of the website's
+organization with role member or above, the rule WebsiteService.get_for_user
+applies to writes. On an org website the creator is listed only while their
+own membership still allows writes. Inactive accounts are left out.
 """
 from __future__ import annotations
 
@@ -28,7 +29,11 @@ def team_for(website) -> list[dict]:
     roles = {m.user_id: m.role for m in members}
     team = []
     owner = website.user
-    if owner is not None and owner.is_active:
+    owner_counts = (
+        not website.organization_id
+        or role_at_least(roles.get(getattr(owner, "id", None)) or "", "member")
+    )
+    if owner is not None and owner.is_active and owner_counts:
         team.append({"id": owner.id, "name": _name(owner), "email": owner.email,
                      "role": roles.get(owner.id) or "owner", "user": owner})
     others = sorted(

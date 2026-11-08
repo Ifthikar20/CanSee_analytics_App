@@ -89,7 +89,8 @@ class WebsiteDetailView(TenantScopedAPIView):
     patch = put
 
     def delete(self, request, pk):
-        website = self._get_website(request, pk)
+        # Deleting a shared project affects the whole organization.
+        website = self.get_website(pk, min_role="admin")
         WebsiteService.delete(website=website, user=request.user)
         return Response(status=status.HTTP_204_NO_CONTENT)
 
@@ -116,7 +117,8 @@ class PixelRegenerateView(TenantScopedAPIView):
     website_url_kwarg = "pk"
 
     def post(self, request, pk):
-        website = self.get_website(pk)
+        # A new key breaks the snippet already installed on the live site.
+        website = self.get_website(pk, min_role="admin")
         website = WebsiteService.regenerate_pixel_key(website=website, user=request.user)
         return Response({"pixel_key": str(website.pixel_key)})
 

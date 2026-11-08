@@ -49,17 +49,14 @@ class PromptSerializer(serializers.ModelSerializer):
             "style_label",
             "demand_score",
             "source_score",
-            "effectiveness_score",
-            "effectiveness_components",
-            "runs_count",
             "last_used_at",
             "is_active",
             "created_at",
         )
+        # No effectiveness fields: the Prompt row is shared by tenants, so
+        # its stored score would mix their results. Per-website scores come
+        # from PromptEffectivenessView (?website=) and the saved-prompt rows.
         read_only_fields = (
-            "effectiveness_score",
-            "effectiveness_components",
-            "runs_count",
             "last_used_at",
             "created_at",
             "industry_slug",
@@ -191,7 +188,8 @@ class SmokeTestRequestSerializer(serializers.Serializer):
 
 class SynthesizeRequestSerializer(serializers.Serializer):
     industry_id = serializers.UUIDField()
-    count = serializers.IntegerField(min_value=1, max_value=50, default=10)
+    # Each item costs one auto_template call on top of the synthesis call.
+    count = serializers.IntegerField(min_value=1, max_value=20, default=10)
     style = serializers.ChoiceField(
         choices=["question", "story", "comparison", "local", "how_to", "listicle"],
         default="question",

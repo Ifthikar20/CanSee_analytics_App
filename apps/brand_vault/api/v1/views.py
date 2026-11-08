@@ -78,14 +78,14 @@ class WebsiteFactsView(TenantScopedListAPIView):
         return self.paginated_response(qs, BrandFactSerializer)
 
 
-def _get_fact_for_user(user, fact_id) -> BrandFact:
+def _get_fact_for_user(user, fact_id, *, min_role: str = "member") -> BrandFact:
     from apps.websites.services.website_service import WebsiteService
 
     try:
         fact = BrandFact.objects.select_related("website").get(id=fact_id)
     except BrandFact.DoesNotExist as exc:
         raise ResourceNotFound("BrandFact not found.") from exc
-    WebsiteService.get_for_user(user=user, website_id=fact.website_id)
+    WebsiteService.get_for_user(user=user, website_id=fact.website_id, min_role=min_role)
     return fact
 
 
@@ -93,7 +93,7 @@ class FactDetailView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request, fact_id):
-        fact = _get_fact_for_user(request.user, fact_id)
+        fact = _get_fact_for_user(request.user, fact_id, min_role="viewer")
         return Response(BrandFactDetailSerializer(fact).data)
 
 
@@ -381,7 +381,7 @@ class FactUsageView(APIView):
     def get(self, request, fact_id):
         from apps.llm_ranking.models import LLMRankingAudit
 
-        fact = _get_fact_for_user(request.user, fact_id)
+        fact = _get_fact_for_user(request.user, fact_id, min_role="viewer")
         audit_count = LLMRankingAudit.objects.filter(
             website_id=fact.website_id,
             status=LLMRankingAudit.STATUS_COMPLETED,

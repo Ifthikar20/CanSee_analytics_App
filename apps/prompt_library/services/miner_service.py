@@ -308,6 +308,8 @@ def mine_for_industry(
                 "source": miner.source,
                 "source_url": row.get("source_url", "") or "",
                 "excerpt": row.get("excerpt", "") or "",
+                # Mined by ops from public sources: the shared catalog.
+                "is_catalog": True,
             }
             obj, was_created = Prompt.objects.get_or_create(
                 industry=industry,

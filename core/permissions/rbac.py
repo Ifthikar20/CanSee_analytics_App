@@ -19,3 +19,20 @@ def role_at_least(role: str, required: str) -> bool:
     ``required`` from OrgRole/UserRole values.
     """
     return ROLE_HIERARCHY.get(role, 0) >= ROLE_HIERARCHY.get(required, 0)
+
+
+#: Methods that only read. Viewers may make these; anything else changes
+#: data and needs member or above (see TenantScopedAPIView.get_website).
+READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
+def min_role_for_method(method: str) -> str:
+    """The least org role a request with this HTTP method needs."""
+    return "viewer" if (method or "").upper() in READ_METHODS else "member"
+
+
+def denied_message(required: str) -> str:
+    """What a current org member below ``required`` is told (403)."""
+    if ROLE_HIERARCHY.get(required, 0) > ROLE_HIERARCHY["member"]:
+        return "Only organization admins can do this."
+    return "Your organization role can view this project but not change it."
