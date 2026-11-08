@@ -20,7 +20,7 @@
 # Usage:
 #   ./run.sh              Set up everything and start the app (default)
 #   ./run.sh setup        Clone/update repos, install, migrate. No servers.
-#   ./run.sh user         Create a login (email, name, password)
+#   ./run.sh user         Create a login (uses users.sh when present)
 #   ./run.sh stop         Stop the servers and the Docker database/Redis
 #   ./run.sh status       Show what is running
 #   ./run.sh reset-db     Delete the local database and start it fresh
@@ -71,6 +71,8 @@ UI_URL="http://localhost:$UI_PORT"
 
 export DJANGO_SETTINGS_MODULE="config.settings.dev"
 export PYTHONUNBUFFERED=1
+# Write logs as UTF-8 on Windows instead of the console code page.
+export PYTHONUTF8=1
 
 # Django runs natively here, not inside the compose network, so it must
 # reach Postgres/Redis through the ports Docker publishes on 127.0.0.1.
@@ -311,9 +313,14 @@ setup_backend() {
     }
   ok "database up to date"
 
-  manage seed_prompts >"$LOG_DIR/seed.log" 2>&1 ||
-    warn "Prompt library seeding failed (see $LOG_DIR/seed.log). The app still runs."
-  ok "prompt library seeded"
+  # seed_prompts only exists on some branches.
+  if [ -f "$BACKEND_DIR/apps/prompt_library/management/commands/seed_prompts.py" ]; then
+    if manage seed_prompts >"$LOG_DIR/seed.log" 2>&1; then
+      ok "prompt library seeded"
+    else
+      warn "Prompt library seeding failed (see $LOG_DIR/seed.log). The app still runs."
+    fi
+  fi
 
   if manage check_llm_keys --provider claude >"$LOG_DIR/llm-check.log" 2>&1; then
     ok "Anthropic key works"
@@ -436,51 +443,101 @@ maybe_create_first_user() {
 }
 
 # ── Process management ───────────────────────────────────────────────
-port_in_use() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+# Servers are tracked by the port they listen on and by whether they
+# answer HTTP, not by process id: in Git Bash on Windows the shell's
+# process ids do not reliably follow the native python/node processes,
+# so a pid can look dead while the server is still running.
 
-kill_tree() {
-  # kill_tree <msys/unix pid> [windows pid]
-  local pid="$1" winpid="${2:-}"
+http_up() {
+  local code
+  code="$(curl -s -o /dev/null -m 3 -w '%{http_code}' "$1" 2>/dev/null || true)"
+  [ -n "$code" ] && [ "$code" != "000" ]
+}
+
+port_pids() {
+  # Print the ids of processes listening on TCP port $1, one per line.
+  local port="$1"
+  if [ "$IS_WINDOWS" = "1" ]; then
+    netstat -ano 2>/dev/null | tr -d '\r' |
+      awk -v p=":$port" '$1 == "TCP" && $4 == "LISTENING" &&
+        substr($2, length($2) - length(p) + 1) == p { print $5 }' | sort -u
+  elif command -v lsof >/dev/null 2>&1; then
+    lsof -nP -t -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | sort -u
+  fi
+}
+
+port_in_use() {
+  local port="$1"
+  [ -n "$(port_pids "$port")" ] && return 0
+  (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && return 0
+  http_up "http://localhost:$port/"  # also catches IPv6-only listeners
+}
+
+kill_pid_tree() {
+  # kill_pid_tree <pid>: on Windows a native pid, elsewhere a unix pid.
+  local pid="$1"
   [ -n "$pid" ] || return 0
   if [ "$IS_WINDOWS" = "1" ]; then
-    if [ -z "$winpid" ] && [ -r "/proc/$pid/winpid" ]; then winpid="$(cat "/proc/$pid/winpid")"; fi
-    if [ -n "$winpid" ]; then
-      taskkill //F //T //PID "$winpid" >/dev/null 2>&1 || true
-    fi
-    kill "$pid" 2>/dev/null || true
+    taskkill //F //T //PID "$pid" >/dev/null 2>&1 || true
   else
-    # Each server runs in its own process group (set -m), so kill the group.
     kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
   fi
 }
 
 save_pid() {
-  local name="$1" pid="$2" winpid=""
-  if [ "$IS_WINDOWS" = "1" ] && [ -r "/proc/$pid/winpid" ]; then winpid="$(cat "/proc/$pid/winpid")"; fi
-  echo "$pid $winpid" >"$RUN_DIR/$name.pid"
+  # Remember the launcher process (native pid on Windows) for clean stops.
+  local name="$1" pid="$2"
+  if [ "$IS_WINDOWS" = "1" ] && [ -r "/proc/$pid/winpid" ]; then pid="$(cat "/proc/$pid/winpid")"; fi
+  echo "$pid" >"$RUN_DIR/$name.pid"
 }
 
-stop_one() {
-  local name="$1" file="$RUN_DIR/$1.pid" pid winpid
-  [ -f "$file" ] || return 0
-  read -r pid winpid <"$file" || true
-  kill_tree "$pid" "$winpid"
-  rm -f "$file"
-  ok "$name stopped"
+stop_server() {
+  # stop_server <name> <port>
+  local name="$1" port="$2" file="$RUN_DIR/$1.pid" pid i
+  if [ -f "$file" ]; then
+    read -r pid _ <"$file" || true
+    kill_pid_tree "$pid"
+    rm -f "$file"
+  fi
+  for pid in $(port_pids "$port"); do kill_pid_tree "$pid"; done
+  for i in $(seq 1 10); do
+    port_in_use "$port" || { ok "$name stopped"; return 0; }
+    sleep 1
+  done
+  warn "$name: port $port is still in use. Close the program using it (process id: $(port_pids "$port" | tr '\n' ' '))."
+}
+
+free_port_or_die() {
+  # free_port_or_die <name> <port>
+  local name="$1" port="$2" answer
+  port_in_use "$port" || return 0
+  if [ -f "$RUN_DIR/$name.pid" ]; then
+    echo "  A previous Cansee $name is still running on port $port; stopping it."
+  else
+    read -r -p "  Port $port is in use by another program. Stop it? [Y/n] " answer
+    [[ "$answer" =~ ^[Nn]$ ]] && die "Port $port is in use. Free it and run again."
+  fi
+  stop_server "$name" "$port"
+  port_in_use "$port" && die "Port $port is still in use."
+  return 0
+}
+
+startup_failed() {
+  # Known fatal startup messages, so a broken start fails fast.
+  grep -qE "error when starting dev server|Error: That port is already in use|is already in use" "$1" 2>/dev/null
 }
 
 wait_for_http() {
-  # wait_for_http <url> <seconds> <pid> <logfile> <label>
-  local url="$1" timeout="$2" pid="$3" log="$4" label="$5" i code
+  # wait_for_http <url> <seconds> <logfile> <label>
+  local url="$1" timeout="$2" log="$3" label="$4" i
   for i in $(seq 1 "$timeout"); do
-    code="$(curl -s -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || true)"
-    if [ -n "$code" ] && [ "$code" != "000" ]; then
+    if http_up "$url"; then
       ok "$label is up ($url)"
       return 0
     fi
-    if ! kill -0 "$pid" 2>/dev/null; then
+    if startup_failed "$log"; then
       echo; tail -n 40 "$log"
-      die "$label stopped while starting. Full log: $log"
+      die "$label failed to start. Full log: $log"
     fi
     sleep 1
   done
@@ -499,45 +556,67 @@ open_browser() {
   fi
 }
 
-BACKEND_PID=""
-FRONTEND_PID=""
-TAIL_PID=""
+# Byte offsets already printed from each log (read via ${!var}).
+# shellcheck disable=SC2034
+LOG_OFF_backend=0 LOG_OFF_frontend=0
+
+show_new_log_lines() {
+  # Print whatever was appended to <name>.log since the last call.
+  local name="$1" file="$LOG_DIR/$1.log" var="LOG_OFF_$1" off size
+  [ -f "$file" ] || return 0
+  off="${!var}"
+  size="$(wc -c <"$file" | tr -d '[:space:]')"
+  [ "$size" -lt "$off" ] && off=0
+  if [ "$size" -gt "$off" ]; then
+    tail -c +"$((off + 1))" "$file" | head -c "$((size - off))" | sed "s/^/[$name] /"
+    printf -v "$var" '%s' "$size"
+  fi
+}
+
+SERVERS_STARTED=0
 
 cleanup() {
   trap - INT TERM EXIT
+  [ "$SERVERS_STARTED" = "1" ] || return 0
   echo
   step "Shutting down servers"
-  [ -n "$TAIL_PID" ] && kill "$TAIL_PID" 2>/dev/null || true
-  stop_one frontend
-  stop_one backend
+  stop_server frontend "$UI_PORT"
+  stop_server backend "$BACKEND_PORT"
   echo "  Postgres and Redis are still running in Docker (fast restart)."
   echo "  Run './run.sh stop' to stop them too."
 }
 
+on_signal() {
+  cleanup
+  exit 130
+}
+
 start_servers() {
   step "Starting the app"
-  port_in_use "$BACKEND_PORT" && die "Port $BACKEND_PORT is already in use. Run './run.sh stop' or close the program using it."
-  port_in_use "$UI_PORT" && die "Port $UI_PORT is already in use. Run './run.sh stop' or close the program using it."
+  free_port_or_die backend "$BACKEND_PORT"
+  free_port_or_die frontend "$UI_PORT"
 
-  set -m  # give each server its own process group so it can be stopped cleanly
+  SERVERS_STARTED=1
+  trap on_signal INT TERM
+  trap cleanup EXIT
+
+  # Outside Windows, give each server its own process group so the whole
+  # tree (autoreloader, npm, vite) can be stopped together.
+  [ "$IS_WINDOWS" = "1" ] || set -m
   (cd "$BACKEND_DIR" && exec "$(venv_python)" manage.py runserver "$BACKEND_HOST:$BACKEND_PORT") \
-    >"$LOG_DIR/backend.log" 2>&1 &
-  BACKEND_PID=$!
-  save_pid backend "$BACKEND_PID"
+    >"$LOG_DIR/backend.log" 2>&1 </dev/null &
+  save_pid backend "$!"
 
   # Point the Vite dev proxy at 127.0.0.1 explicitly: on Windows,
   # "localhost" can resolve to IPv6 (::1) while Django listens on IPv4.
   (cd "$UI_DIR" && VITE_API_URL="$BACKEND_URL" VITE_WS_URL="ws://$BACKEND_HOST:$BACKEND_PORT" \
     exec npm run dev -- --port "$UI_PORT" --strictPort) \
-    >"$LOG_DIR/frontend.log" 2>&1 &
-  FRONTEND_PID=$!
-  save_pid frontend "$FRONTEND_PID"
-  set +m
+    >"$LOG_DIR/frontend.log" 2>&1 </dev/null &
+  save_pid frontend "$!"
+  [ "$IS_WINDOWS" = "1" ] || set +m
 
-  trap cleanup INT TERM EXIT
-
-  wait_for_http "$BACKEND_URL/health/" 90 "$BACKEND_PID" "$LOG_DIR/backend.log" "Backend"
-  wait_for_http "$UI_URL/" 90 "$FRONTEND_PID" "$LOG_DIR/frontend.log" "Frontend"
+  wait_for_http "$BACKEND_URL/health/" 120 "$LOG_DIR/backend.log" "Backend"
+  wait_for_http "$UI_URL/" 120 "$LOG_DIR/frontend.log" "Frontend"
 
   open_browser "$UI_URL"
 
@@ -548,20 +627,30 @@ ${G}${B}Cansee is running.${N}
   App:        $UI_URL
   API:        $BACKEND_URL
   Logs:       $LOG_DIR
-  New login:  ./run.sh user   (in another terminal)
+  New login:  ./users.sh     (in another Git Bash window)
 
 Live logs follow below. Press Ctrl+C to stop the servers.
 
 EOF
 
-  tail -n 0 -f "$LOG_DIR/backend.log" "$LOG_DIR/frontend.log" &
-  TAIL_PID=$!
-
-  # Exit (and clean up) as soon as either server stops.
-  while kill -0 "$BACKEND_PID" 2>/dev/null && kill -0 "$FRONTEND_PID" 2>/dev/null; do
-    sleep 2
+  # Follow both logs and watch both servers. A server counts as stopped
+  # after ~15 seconds without an HTTP answer (Django's auto-reload after a
+  # code change takes a few seconds, so single misses are ignored).
+  local backend_miss=0 frontend_miss=0 tick=0
+  while true; do
+    show_new_log_lines backend
+    show_new_log_lines frontend
+    tick=$((tick + 1))
+    if [ $((tick % 3)) = 0 ]; then
+      if http_up "$BACKEND_URL/health/"; then backend_miss=0; else backend_miss=$((backend_miss + 1)); fi
+      if http_up "$UI_URL/"; then frontend_miss=0; else frontend_miss=$((frontend_miss + 1)); fi
+      if [ "$backend_miss" -ge 5 ]; then warn "The backend stopped responding. See $LOG_DIR/backend.log"; break; fi
+      if [ "$frontend_miss" -ge 5 ]; then warn "The frontend stopped responding. See $LOG_DIR/frontend.log"; break; fi
+    fi
+    sleep 1
   done
-  warn "A server stopped unexpectedly. See the logs above or in $LOG_DIR."
+  show_new_log_lines backend
+  show_new_log_lines frontend
 }
 
 # ── Commands ─────────────────────────────────────────────────────────
@@ -588,6 +677,10 @@ cmd_setup() {
 }
 
 cmd_user() {
+  # Prefer the dedicated user script when it sits next to this one.
+  if [ -f "$SCRIPT_DIR/users.sh" ]; then
+    exec bash "$SCRIPT_DIR/users.sh" add
+  fi
   mkdir -p "$LOG_DIR"
   [ -d "$BACKEND_DIR" ] || die "Backend not found at $BACKEND_DIR. Run ./run.sh setup first."
   [ -f "$(venv_python)" ] || die "Backend is not installed yet. Run ./run.sh setup first."
@@ -605,16 +698,16 @@ cmd_reset_db() {
   local answer
   read -r -p "  Type 'reset' to continue: " answer
   [ "$answer" = "reset" ] || { echo "  Cancelled."; return 0; }
-  stop_one frontend
-  stop_one backend
+  stop_server frontend "$UI_PORT"
+  stop_server backend "$BACKEND_PORT"
   compose down -v >/dev/null 2>&1 || die "Could not remove the database container and volume."
   ok "Local database deleted. Run ./run.sh to recreate it and create a login."
 }
 
 cmd_stop() {
   step "Stopping Cansee"
-  stop_one frontend
-  stop_one backend
+  stop_server frontend "$UI_PORT"
+  stop_server backend "$BACKEND_PORT"
   if [ -d "$BACKEND_DIR" ] && command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     compose stop db redis >/dev/null 2>&1 || true
     ok "Postgres and Redis stopped (data is kept)"
@@ -623,16 +716,8 @@ cmd_stop() {
 
 cmd_status() {
   step "Status"
-  local name file pid winpid
-  for name in backend frontend; do
-    file="$RUN_DIR/$name.pid"
-    if [ -f "$file" ]; then
-      read -r pid winpid <"$file" || true
-      if kill -0 "$pid" 2>/dev/null; then ok "$name running (pid $pid)"; else warn "$name not running (stale pid file)"; fi
-    else
-      echo "  $name not running"
-    fi
-  done
+  if http_up "$BACKEND_URL/health/"; then ok "backend running ($BACKEND_URL)"; else echo "  backend not running"; fi
+  if http_up "$UI_URL/"; then ok "frontend running ($UI_URL)"; else echo "  frontend not running"; fi
   if [ -d "$BACKEND_DIR" ] && command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     compose ps db redis
   fi
