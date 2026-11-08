@@ -9,6 +9,10 @@ os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings.prod")
 app = Celery("cansee")
 app.config_from_object("django.conf:settings", namespace="CELERY")
 app.autodiscover_tasks()
+# core is not an installed app, so autodiscovery skips it; its scheduled
+# tasks (hard_delete_soft_deleted, check_encryption_key_rotation) were
+# rejected by the worker as unregistered.
+app.autodiscover_tasks(["core"])
 
 # ── Queue topology ──
 # Slow third-party API calls must not block pixel/analytics aggregation.

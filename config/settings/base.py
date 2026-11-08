@@ -15,7 +15,12 @@ env = environ.Env(
 environ.Env.read_env(BASE_DIR / ".env")
 
 # ── CORE ──
-SECRET_KEY = env("DJANGO_SECRET_KEY", default="unsafe-secret-key-change-in-production")
+# The default is public (it is in this file): it exists only so local tools
+# start without configuration. prod.py refuses to start with it, and
+# core.checks.check_secret_keys flags it anywhere DEBUG is off, because the
+# JWT signing key falls back to it and a known key lets anyone mint tokens.
+INSECURE_DEFAULT_SECRET_KEY = "unsafe-secret-key-change-in-production"
+SECRET_KEY = env("DJANGO_SECRET_KEY", default=INSECURE_DEFAULT_SECRET_KEY)
 DEBUG = env("DEBUG")
 ALLOWED_HOSTS = env("ALLOWED_HOSTS")
 
@@ -177,6 +182,8 @@ SIMPLE_JWT = {
 
 # ── MIDDLEWARE (ORDER MATTERS) ──
 MIDDLEWARE = [
+    # First: answers load-balancer probes before ALLOWED_HOSTS is checked.
+    "core.middleware.liveness.LivenessMiddleware",
     "core.middleware.request_id.RequestIDMiddleware",
     "core.middleware.security_headers.SecurityHeadersMiddleware",
     "apps.billing.middleware.rate_limiter.WebhookRateLimitMiddleware",
@@ -316,6 +323,12 @@ SESSION_EXPIRE_AT_BROWSER_CLOSE = False
 SESSION_COOKIE_AGE = 60 * 60 * 24 * 30  # 30 days
 SESSION_SAVE_EVERY_REQUEST = True
 
+# ── TERMS OF SERVICE ──
+# The version of the Terms users must accept (the date it took effect).
+# Change it, and the Terms page date, when the Terms change: every user is
+# asked to accept again (apps.accounts.services.terms).
+TERMS_VERSION = env("TERMS_VERSION", default="2026-11-08")
+
 # ── AXES ──
 AXES_FAILURE_LIMIT = 5
 AXES_COOLOFF_TIME = timedelta(minutes=30)
@@ -328,8 +341,12 @@ AXES_LOCKOUT_PARAMETERS = [["ip_address", "username"]]
 # trust the last hop (our nginx) and read the entry just before it, so the
 # lockout key cannot be moved around with a spoofed left-most X-Forwarded-For.
 AXES_IPWARE_META_PRECEDENCE_ORDER = ("HTTP_X_FORWARDED_FOR", "REMOTE_ADDR")
-AXES_IPWARE_PROXY_COUNT = 1
+# Proxies in front of Django that append to X-Forwarded-For (nginx = 1; an
+# AWS load balancer in front adds one more). Keep equal to TRUSTED_PROXY_COUNT.
+AXES_IPWARE_PROXY_COUNT = env.int("TRUSTED_PROXY_COUNT", default=1)
 AXES_RESET_ON_SUCCESS = True
+# Lock on the email in lowercase, so changing letter case is not a fresh key.
+AXES_USERNAME_CALLABLE = "core.utils.axes.lockout_username"
 
 # ── CORS ──
 CORS_ALLOWED_ORIGINS = env.list("CORS_ALLOWED_ORIGINS", default=[])

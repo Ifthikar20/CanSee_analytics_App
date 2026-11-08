@@ -38,6 +38,13 @@ class User(AbstractBaseUser, PermissionsMixin, TimestampMixin):
         help_text="When the user chose the Free plan from the paywall. "
                   "Null = never dismissed; clear to re-show the paywall.",
     )
+    # Terms of Service acceptance (clickwrap): the version the user agreed
+    # to (settings.TERMS_VERSION at the time), when, and from where.
+    # apps.accounts.services.terms decides whether a new version must be
+    # accepted.
+    terms_accepted_version = models.CharField(max_length=32, blank=True, default="")
+    terms_accepted_at = models.DateTimeField(null=True, blank=True)
+    terms_accepted_ip = models.GenericIPAddressField(null=True, blank=True)
 
     # Calendar-month spend cap across every AI module. 0 = no cap.
     monthly_ai_cost_cap_usd = models.DecimalField(

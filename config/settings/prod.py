@@ -3,6 +3,14 @@ import os
 
 DEBUG = False
 
+# Never serve production with the public default secret: session data,
+# password-reset tokens and (through SIMPLE_JWT's fallback) every access
+# token would be signed with a key anyone can read.
+if not SECRET_KEY or SECRET_KEY == INSECURE_DEFAULT_SECRET_KEY:  # noqa: F405
+    raise ImproperlyConfigured("DJANGO_SECRET_KEY must be set to a private value in production.")  # noqa: F405
+if SIMPLE_JWT.get("SIGNING_KEY") in ("", INSECURE_DEFAULT_SECRET_KEY):  # noqa: F405
+    raise ImproperlyConfigured("JWT_SIGNING_KEY (or DJANGO_SECRET_KEY) must be set in production.")  # noqa: F405
+
 # Trust nginx's X-Forwarded-Proto only when this deployment actually
 # terminates TLS. On a plaintext deployment the header is meaningless, and
 # honouring it would make request.is_secure() return True over http:// --
@@ -75,14 +83,32 @@ _db_sslrootcert = env("DB_SSLROOTCERT", default="")  # noqa: F405
 if _db_sslrootcert:
     DATABASES["default"]["OPTIONS"]["sslrootcert"] = _db_sslrootcert  # noqa: F405
 
-# AWS S3 Storage
-DEFAULT_FILE_STORAGE = "storages.backends.s3boto3.S3Boto3Storage"
-STATICFILES_STORAGE = "storages.backends.s3boto3.S3StaticStorage"
+# File storage. Django 5.1 reads only STORAGES (DEFAULT_FILE_STORAGE and
+# STATICFILES_STORAGE were removed in 5.1, so the S3 lines that used to be
+# here had no effect). Default: the local filesystem, which is what nginx
+# serves today from the shared static volume. USE_S3_STORAGE=true sends
+# static files and uploads to AWS_STORAGE_BUCKET_NAME instead (an IAM role
+# supplies credentials; leave the AWS_*_KEY variables empty).
+USE_S3_STORAGE = env.bool("USE_S3_STORAGE", default=False)  # noqa: F405
+if USE_S3_STORAGE:
+    STORAGES = {
+        "default": {"BACKEND": "storages.backends.s3boto3.S3Boto3Storage"},
+        "staticfiles": {"BACKEND": "storages.backends.s3boto3.S3StaticStorage"},
+    }
+else:
+    STORAGES = {
+        "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
+        "staticfiles": {"BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage"},
+    }
 AWS_ACCESS_KEY_ID = env("AWS_ACCESS_KEY_ID", default="")  # noqa: F405
 AWS_SECRET_ACCESS_KEY = env("AWS_SECRET_ACCESS_KEY", default="")  # noqa: F405
 AWS_STORAGE_BUCKET_NAME = env("AWS_STORAGE_BUCKET_NAME", default="")  # noqa: F405
 AWS_S3_REGION_NAME = env("AWS_S3_REGION_NAME", default="us-east-1")  # noqa: F405
-AWS_S3_CUSTOM_DOMAIN = f"{AWS_STORAGE_BUCKET_NAME}.s3.amazonaws.com"
+# A CloudFront domain in front of the bucket (e.g. static.cansee.ai), else
+# the bucket's own S3 domain.
+AWS_S3_CUSTOM_DOMAIN = env(  # noqa: F405
+    "AWS_S3_CUSTOM_DOMAIN", default=f"{AWS_STORAGE_BUCKET_NAME}.s3.amazonaws.com",
+)
 AWS_DEFAULT_ACL = "private"
 AWS_S3_FILE_OVERWRITE = False
 

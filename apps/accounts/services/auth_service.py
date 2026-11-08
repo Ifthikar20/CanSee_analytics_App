@@ -3,6 +3,7 @@ import secrets
 import string
 from datetime import timedelta
 
+from django.conf import settings
 from django.contrib.auth import authenticate
 from django.core.cache import cache
 from django.utils import timezone
@@ -104,9 +105,25 @@ class AuthService:
         # SSO enforcement runs BEFORE the password is checked: an enforced
         # account must get the same answer whether or not the password is
         # right, and a correct password must never mint a session.
+        email = (email or "").strip().lower()
         AuthService._require_sso_gate(email=email)
 
         user = authenticate(request=request, email=email, password=password)
+
+        if user is None and getattr(request, "axes_locked_out", False):
+            # django-axes refused the attempt before the password was
+            # checked. Say so: "Incorrect email or password" would send the
+            # user round in circles for the whole cool-off.
+            security_logger.warning(
+                "Login attempt on locked-out email",
+                extra={"email": email, "ip": ip_address},
+            )
+            minutes = int(settings.AXES_COOLOFF_TIME.total_seconds() // 60) if settings.AXES_COOLOFF_TIME else 30
+            raise LoginRefused(
+                f"Too many failed sign-in attempts. Try again in {minutes} minutes or reset your password.",
+                code="account_locked",
+                status_code=429,
+            )
 
         if user is None:
             LoginAttempt.objects.create(

@@ -309,3 +309,28 @@ def check_public_scheme(app_configs, **kwargs):
         )
 
     return errors
+
+
+@register(Tags.security)
+def check_secret_keys(app_configs, **kwargs):
+    """Error when DEBUG is off and the Django or JWT signing key is the
+    public default from settings/base.py (anyone could sign tokens)."""
+    if getattr(settings, "DEBUG", False):
+        return []
+    default = getattr(settings, "INSECURE_DEFAULT_SECRET_KEY", None)
+    errors = []
+    if not settings.SECRET_KEY or settings.SECRET_KEY == default:
+        errors.append(Error(
+            "SECRET_KEY is empty or the public default.",
+            hint="Set DJANGO_SECRET_KEY to a long random value.",
+            id="core.E008",
+        ))
+    signing = (getattr(settings, "SIMPLE_JWT", {}) or {}).get("SIGNING_KEY")
+    if not signing or signing == default:
+        errors.append(Error(
+            "The JWT signing key is empty or the public default.",
+            hint="Set JWT_SIGNING_KEY (or DJANGO_SECRET_KEY) to a long random value.",
+            id="core.E009",
+        ))
+    return errors
+

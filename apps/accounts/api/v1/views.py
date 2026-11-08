@@ -135,9 +135,12 @@ class LoginView(APIView):
         serializer = LoginSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
+        from core.utils.ua_parser import get_client_ip
+
         result = AuthService.login(
             **serializer.validated_data,
-            ip_address=request.META.get("REMOTE_ADDR", ""),
+            # The client, not the proxy in front of Django.
+            ip_address=get_client_ip(request),
             user_agent=request.META.get("HTTP_USER_AGENT", ""),
             request=request,
         )
@@ -581,6 +584,7 @@ class SessionView(APIView):
         from django.conf import settings
 
         from apps.accounts.services.org_service import OrgService
+        from apps.accounts.services.terms import terms_state
         from apps.billing.services import polar_billing
         from apps.billing.services.plan_limits import limits_block, subscription_state
         from apps.websites.services.website_service import WebsiteService
@@ -687,8 +691,32 @@ class SessionView(APIView):
             # never re-derives plan limits from the plan name. -1 = unlimited.
             "limits": limits,
             "paywall_dismissed": user.paywall_dismissed_at is not None,
+            "terms": terms_state(user),
             "next_route": next_route,
         })
+
+
+class TermsAcceptView(APIView):
+    """POST {"version"} -- record that the user accepted the current Terms
+    of Service. 400 terms_version_mismatch when ``version`` is not the
+    current one (the page changed since the user read it)."""
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        from apps.accounts.services.terms import TermsVersionMismatch, accept_terms
+        from core.utils.ua_parser import get_client_ip
+
+        version = request.data.get("version") if hasattr(request.data, "get") else None
+        try:
+            state = accept_terms(request.user, version=version, ip_address=get_client_ip(request))
+        except TermsVersionMismatch:
+            return Response(
+                {"error": {"code": "terms_version_mismatch",
+                           "message": "The Terms of Service changed. Review the current version."}},
+                status=400,
+            )
+        return Response({"terms": state})
 
 
 class AIUsageView(APIView):

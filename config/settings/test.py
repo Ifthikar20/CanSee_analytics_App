@@ -1,6 +1,10 @@
 from .base import *  # noqa
 
 DEBUG = False
+# A private key for the suite (core.checks.check_secret_keys refuses the
+# public default whenever DEBUG is off).
+SECRET_KEY = "test-only-secret-key-not-used-anywhere-else-0123456789"
+SIMPLE_JWT = {**SIMPLE_JWT, "SIGNING_KEY": SECRET_KEY}  # noqa: F405
 SECURE_SSL_REDIRECT = False
 
 # The suite asserts the secure posture, so it must not inherit a developer's
