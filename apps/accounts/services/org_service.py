@@ -49,20 +49,23 @@ def _pending_invitations(qs=None):
     )
 
 
+def _lock_org(org) -> None:
+    """Lock the org row until the surrounding transaction ends (the same
+    lock OrgService.add_member takes), so concurrent invitations, accepts
+    and auto-joins see each other's seats."""
+    Organization.objects.select_for_update().filter(pk=org.pk).first()
+
+
 def _lock_free_seat(org) -> None:
     """Lock ``org`` and require a free seat for one more live invitation.
-
-    Call inside ``transaction.atomic()``: the row lock (the same one
-    OrgService.add_member takes) holds until the invitation is written, so
-    concurrent invitations, accepts and auto-joins see each other's seats.
-    """
+    Call inside ``transaction.atomic()``."""
     from apps.billing.services.org_entitlements import (
         seat_available,
         seat_limit_for,
         seats_used,
     )
 
-    Organization.objects.select_for_update().filter(pk=org.pk).first()
+    _lock_org(org)
     if not seat_available(org):
         seat_cap = seat_limit_for(org)
         raise CanseeException(
@@ -237,29 +240,33 @@ class OrgService:
         existing_user = User.objects.filter(email__iexact=email).first()
         if existing_user and existing_user.org_memberships.exists():
             raise AlreadyInOrganization()
-        if _pending_invitations(org.invitations).filter(email=email).exists():
-            raise CanseeException(
-                "That address already has a pending invitation — resend it instead.",
-                code="already_invited",
-                status_code=400,
-            )
-        # The uniq_pending_invite constraint can't see expiry (a partial
-        # unique index has no notion of "now"), so an EXPIRED invite for
-        # this email still occupies the slot — retire it before creating.
-        org.invitations.filter(
-            email=email,
-            accepted_at__isnull=True,
-            revoked_at__isnull=True,
-            expires_at__lte=timezone.now(),
-        ).update(revoked_at=timezone.now())
 
-        # Seat gate: seats are the billing unit — members plus pending
-        # invites occupy them. Custom org packages override the plan's
-        # team_members number. An org over its cap after a plan change
-        # keeps its members but cannot invite. The org row is locked so two
-        # invitations sent at once cannot both take the last seat.
         raw_token = secrets.token_urlsafe(32)
+        # The org row is locked from the duplicate check to the write, so
+        # two invitations sent at once (a double click, or two admins at
+        # the last seat) are decided one after the other.
         with transaction.atomic():
+            _lock_org(org)
+            if _pending_invitations(org.invitations).filter(email=email).exists():
+                raise CanseeException(
+                    "That address already has a pending invitation — resend it instead.",
+                    code="already_invited",
+                    status_code=400,
+                )
+            # The uniq_pending_invite constraint can't see expiry (a partial
+            # unique index has no notion of "now"), so an EXPIRED invite for
+            # this email still occupies the slot — retire it before creating.
+            org.invitations.filter(
+                email=email,
+                accepted_at__isnull=True,
+                revoked_at__isnull=True,
+                expires_at__lte=timezone.now(),
+            ).update(revoked_at=timezone.now())
+
+            # Seat gate: seats are the billing unit — members plus pending
+            # invites occupy them. Custom org packages override the plan's
+            # team_members number. An org over its cap after a plan change
+            # keeps its members but cannot invite.
             _lock_free_seat(org)
             invitation = Invitation.objects.create(
                 organization=org,
