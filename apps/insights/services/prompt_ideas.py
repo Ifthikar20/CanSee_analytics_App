@@ -449,6 +449,7 @@ def track(website, user, idea, confirm) -> dict:
                 "intent_bucket": "category",
                 "style": "question",
                 "source": PromptSource.MANUAL,
+                "owner_website": website,  # private to this tenant
             },
         )
         brand_prompt, _created = BrandPrompt.objects.get_or_create(website=website, prompt=prompt)

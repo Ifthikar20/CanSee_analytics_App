@@ -39,10 +39,11 @@ def compute_demand_scores() -> int:
 
 @shared_task(name="apps.prompt_library.tasks.refresh_effectiveness_scores")
 def refresh_effectiveness_scores() -> int:
-    """Refresh effectiveness_score for every active prompt.
+    """Refresh each website's effectiveness score for its tracked prompts.
 
-    Pulls from ``LLMRankingResult`` rows linked via the ``source_prompt``
-    foreign key. See :mod:`apps.prompt_library.services.effectiveness`.
+    Pulls from that website's ``LLMRankingResult`` rows linked via the
+    ``source_prompt`` foreign key and stores the result on BrandPrompt.
+    See :mod:`apps.prompt_library.services.effectiveness`.
     """
     from apps.prompt_library.services.effectiveness import (
         refresh_all_effectiveness_scores,

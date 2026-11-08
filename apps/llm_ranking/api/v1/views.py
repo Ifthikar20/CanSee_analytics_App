@@ -1399,9 +1399,8 @@ def _prompt_coverage(website, since):
         )
         .values("prompt_id").distinct().count()
     )
-    eff_agg = brand_prompts.select_related("prompt").aggregate(
-        avg=Avg("prompt__effectiveness_score"),
-    )
+    # This website's own scores (BrandPrompt), not the shared Prompt row.
+    eff_agg = brand_prompts.aggregate(avg=Avg("effectiveness_score"))
     return {
         "total_prompts": total_prompts,
         "measured_last_7d": measured_recent,
@@ -1451,18 +1450,20 @@ def _model_visibility(website, since):
 def _top_prompts(website, limit, descending):
     from apps.prompt_library.models import BrandPrompt
 
-    ordering = "-prompt__effectiveness_score" if descending else "prompt__effectiveness_score"
+    # Ranked by this website's own score; the shared Prompt row would mix
+    # in other tenants' results.
+    ordering = "-effectiveness_score" if descending else "effectiveness_score"
     brand_prompts = (
         BrandPrompt.objects.filter(website=website)
         .select_related("prompt")
-        .filter(prompt__effectiveness_score__gt=0)
+        .filter(effectiveness_score__gt=0)
         .order_by(ordering)[:limit]
     )
     return [
         {
             "id": str(bp.prompt.id),
             "text": (bp.prompt.text or "")[:140],
-            "effectiveness_score": round(bp.prompt.effectiveness_score or 0, 2),
+            "effectiveness_score": round(bp.effectiveness_score or 0, 2),
         }
         for bp in brand_prompts
     ]

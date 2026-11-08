@@ -131,7 +131,13 @@ class PromptListView(ListAPIView):
     pagination_class = StandardPagination
 
     def get_queryset(self):
-        qs = Prompt.objects.filter(is_active=True).select_related("industry")
+        # The shared catalog plus the caller's own private prompts; never
+        # another tenant's.
+        qs = (
+            Prompt.objects.visible_to_user(self.request.user)
+            .filter(is_active=True)
+            .select_related("industry")
+        )
         industry_slug = self.request.query_params.get("industry")
         if industry_slug:
             qs = qs.filter(industry__slug=industry_slug)
@@ -160,7 +166,7 @@ class PreviewSampleView(APIView):
         rng = random.Random(seed)
 
         pool = list(
-            Prompt.objects.filter(industry=industry, is_active=True).order_by(
+            Prompt.objects.catalog().filter(industry=industry, is_active=True).order_by(
                 "-demand_score", "-created_at"
             )[: max(n * 4, 50)]
         )
@@ -257,7 +263,8 @@ class WebsiteBrandPromptsView(TenantScopedAPIView):
         serializer = BrandPromptSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         prompt = get_object_or_404(
-            Prompt, id=serializer.validated_data["prompt_id"], is_active=True
+            Prompt.objects.visible_to_website(website),
+            id=serializer.validated_data["prompt_id"], is_active=True,
         )
         tracked_prompts.check_capacity(
             website, tracked_prompts.adding_count(website, prompt_ids=[prompt.id]),
@@ -464,9 +471,11 @@ class WebsitePromptCreateView(TenantScopedAPIView):
             # prompt (and any citations it later produces) file under it.
             from django.utils.text import slugify
             slug = slugify(topic_name)[:64] or "topic"
+            # A topic the tenant typed is private filing, not a catalog
+            # industry: created inactive so IndustryListView never lists it.
             industry, _ = Industry.objects.get_or_create(
                 slug=slug,
-                defaults={"name": topic_name, "is_active": True},
+                defaults={"name": topic_name, "is_active": False},
             )
         elif data.get("industry_id"):
             industry = get_object_or_404(Industry, id=data["industry_id"], is_active=True)
@@ -496,6 +505,8 @@ class WebsitePromptCreateView(TenantScopedAPIView):
                     intent_bucket=data.get("intent_bucket") or "category",
                     style=data.get("style") or "question",
                     source=PromptSource.MANUAL,
+                    # Private to this tenant: never listed in the catalog.
+                    owner_website=website,
                 ),
             )
             brand_prompt, _ = BrandPrompt.objects.get_or_create(
@@ -611,13 +622,17 @@ class PromptPreviewView(APIView):
     def get(self, request, prompt_id):
         from apps.prompt_library.services.variable_resolver import resolve_for_website
 
-        prompt = get_object_or_404(Prompt, id=prompt_id)
         website_id = request.query_params.get("website")
         website = None
         if website_id:
             website = WebsiteService.get_for_user(
                 user=request.user, website_id=website_id, min_role="viewer",
             )
+        visible = (
+            Prompt.objects.visible_to_website(website) if website is not None
+            else Prompt.objects.visible_to_user(request.user)
+        )
+        prompt = get_object_or_404(visible, id=prompt_id)
         filled, missing = resolve_for_website(website, prompt)
         return Response({
             "prompt_id": str(prompt.id),
@@ -628,21 +643,37 @@ class PromptPreviewView(APIView):
 
 
 class PromptEffectivenessView(APIView):
-    """Return the cached effectiveness envelope for a prompt."""
+    """Return one website's effectiveness envelope for a prompt.
+
+    ``?website=<id>`` is required: the score is computed from that
+    website's own audit results only, never from other tenants' runs of
+    the same shared prompt.
+    """
 
     permission_classes = [IsAuthenticated]
 
     def get(self, request, prompt_id):
-        prompt = get_object_or_404(Prompt, id=prompt_id)
-        components = dict(prompt.effectiveness_components or {})
-        stable = bool(components.pop("stable", prompt.runs_count >= 3))
-        runs = int(components.pop("runs", prompt.runs_count or 0))
+        from apps.prompt_library.services.effectiveness import compute_effectiveness
+
+        website_id = request.query_params.get("website")
+        if not website_id:
+            return Response(
+                {"error": "website_required",
+                 "detail": "Pass ?website=<id> to score this prompt for a project."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        website = WebsiteService.get_for_user(
+            user=request.user, website_id=website_id, min_role="viewer",
+        )
+        prompt = get_object_or_404(Prompt.objects.visible_to_website(website), id=prompt_id)
+        envelope = compute_effectiveness(prompt, website=website)
         return Response({
             "prompt_id": str(prompt.id),
-            "overall": prompt.effectiveness_score,
-            "components": components,
-            "stable": stable,
-            "runs": runs,
+            "website_id": str(website.id),
+            "overall": envelope["overall"],
+            "components": envelope["components"],
+            "stable": envelope["stable"],
+            "runs": envelope["runs"],
         })
 
 
@@ -731,7 +762,6 @@ class PromptSmokeTestView(APIView):
                 status=status.HTTP_429_TOO_MANY_REQUESTS,
             )
 
-        prompt = get_object_or_404(Prompt, id=prompt_id)
         serializer = SmokeTestRequestSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
@@ -739,6 +769,7 @@ class PromptSmokeTestView(APIView):
         website = WebsiteService.get_for_user(
             user=request.user, website_id=data["website_id"],
         )
+        prompt = get_object_or_404(Prompt.objects.visible_to_website(website), id=prompt_id)
         envelope = smoke_test_prompt(
             prompt, website, provider=data["provider"], user=request.user,
         )
@@ -746,14 +777,34 @@ class PromptSmokeTestView(APIView):
 
 
 class PromptSynthesizeView(APIView):
-    """Bulk-generate prompt templates via the synthesis provider."""
+    """Bulk-generate catalog prompt templates via the synthesis provider.
 
-    permission_classes = [IsAuthenticated]
+    Staff only: the results are written into the shared catalog every
+    tenant browses (the same rule as the catalog enable/disable view).
+    One request makes one synthesis call plus one auto_template call per
+    item, so a per-user token bucket also limits how often it can run.
+    """
+
+    permission_classes = [IsAdminUser]
+    _BUCKET_CAPACITY = 3
+    _BUCKET_REFILL = 3 / 60.0  # 3 requests per minute, refilled smoothly.
 
     def post(self, request):
         from apps.llm_ranking.providers import get_synthesis_provider
         from apps.prompt_library.services._hash import text_hash
         from apps.prompt_library.services.auto_template import auto_template
+        from core.resilience import TokenBucket
+
+        bucket = TokenBucket(
+            name=f"prompt_synthesize:{request.user.id}",
+            capacity=self._BUCKET_CAPACITY,
+            refill_per_second=self._BUCKET_REFILL,
+        )
+        if not bucket.try_acquire():
+            return Response(
+                {"error": "rate_limited", "detail": "Too many syntheses. Wait a moment."},
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+            )
 
         serializer = SynthesizeRequestSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -832,6 +883,8 @@ class PromptSynthesizeView(APIView):
                 intent_bucket="category",
                 source=PromptSource.LLM_SYNTH,
                 text_hash=h,
+                # Staff-generated for the shared library.
+                is_catalog=True,
             )
             created.append(prompt)
         return Response({
@@ -932,6 +985,8 @@ class PromptGenerateFromContextView(APIView):
                     intent_bucket=item["intent_bucket"],
                     source=PromptSource.LLM_SYNTH,
                     text_hash=h,
+                    # Generated from this tenant's own material: private.
+                    owner_website=website,
                 )
                 persisted.append(prompt)
 
@@ -1158,7 +1213,10 @@ class BrandPromptDetailAggView(TenantScopedAPIView):
         website = self.get_website(website_id)
 
         try:
-            prompt = Prompt.objects.select_related("industry").get(id=prompt_id)
+            prompt = (
+                Prompt.objects.visible_to_website(website)
+                .select_related("industry").get(id=prompt_id)
+            )
         except Prompt.DoesNotExist:
             return Response({"detail": "Prompt not found."},
                             status=status.HTTP_404_NOT_FOUND)
@@ -1716,8 +1774,9 @@ class BrandPromptDetailAggView(TenantScopedAPIView):
                 # ranking score (source type, recency, paraphrase count).
                 "demand_score": None,
                 "source_score": prompt.demand_score,
-                "runs_count": prompt.runs_count,
-                "effectiveness_score": prompt.effectiveness_score,
+                # This website's own numbers; None when it does not track it.
+                "runs_count": bp.runs_count if bp else None,
+                "effectiveness_score": bp.effectiveness_score if bp else None,
                 "created_at": prompt.created_at.isoformat() if prompt.created_at else None,
             },
             "is_brand_prompt": bp_exists,
@@ -1760,7 +1819,7 @@ class PromptReextractView(TenantScopedAPIView):
     def post(self, request, website_id, prompt_id):
         website = self.get_website(website_id)
         try:
-            prompt = Prompt.objects.get(id=prompt_id)
+            prompt = Prompt.objects.visible_to_website(website).get(id=prompt_id)
         except Prompt.DoesNotExist:
             return Response({"detail": "Prompt not found."},
                             status=status.HTTP_404_NOT_FOUND)
@@ -1904,7 +1963,7 @@ class WebsiteSavedPromptsAggView(TenantScopedAPIView):
                 "location": bp.location or "",
                 "demand_score": None,
                 "source_score": p.demand_score,
-                "runs_count": p.runs_count,
+                "runs_count": bp.runs_count,
                 "is_active": p.is_active,
                 # Per-website archive state (drives the Active/Archived
                 # split); distinct from the global catalog p.is_active.
@@ -1917,9 +1976,8 @@ class WebsiteSavedPromptsAggView(TenantScopedAPIView):
                 "models_mentioned": [],
                 "total_mentions": 0,
                 "responses_seen": 0,
-                # Cached 0-1 effectiveness, already on the select_related
-                # Prompt -- free to expose.
-                "effectiveness_score": p.effectiveness_score,
+                # This website's cached 0-1 effectiveness (BrandPrompt).
+                "effectiveness_score": bp.effectiveness_score,
                 # Who else the models name on this prompt, most-cited first.
                 "top_competitors": [],
                 "competitors_count": 0,
@@ -2154,7 +2212,8 @@ class WebsiteSuggestedPromptsView(TenantScopedAPIView):
         rejected_ids = RejectedBrandPrompt.objects.filter(website=website).values_list("prompt_id", flat=True)
 
         qs = (
-            Prompt.objects.filter(is_active=True, industry=industry)
+            Prompt.objects.visible_to_website(website)
+            .filter(is_active=True, industry=industry)
             .exclude(id__in=list(saved_ids))
             .exclude(id__in=list(rejected_ids))
         )
@@ -2206,7 +2265,7 @@ class WebsiteSuggestionActionView(TenantScopedAPIView):
     def post(self, request, website_id, prompt_id, action):
         website = self.get_website(website_id)
         try:
-            prompt = Prompt.objects.get(id=prompt_id, is_active=True)
+            prompt = Prompt.objects.visible_to_website(website).get(id=prompt_id, is_active=True)
         except Prompt.DoesNotExist:
             return Response({"detail": "Prompt not found."},
                             status=status.HTTP_404_NOT_FOUND)
@@ -2239,7 +2298,9 @@ class WebsiteSuggestionBulkView(TenantScopedAPIView):
             return Response({"detail": "action must be 'accept' or 'reject'."},
                             status=status.HTTP_400_BAD_REQUEST)
 
-        prompts = list(Prompt.objects.filter(is_active=True, id__in=ids))
+        prompts = list(
+            Prompt.objects.visible_to_website(website).filter(is_active=True, id__in=ids)
+        )
         if action == "accept":
             # All or nothing under the plan's tracked-prompt cap.
             tracked_prompts.check_capacity(
@@ -2267,7 +2328,7 @@ class PromptFanoutsView(TenantScopedAPIView):
 
         website = self.get_website(website_id)
         try:
-            prompt = Prompt.objects.get(id=prompt_id)
+            prompt = Prompt.objects.visible_to_website(website).get(id=prompt_id)
         except Prompt.DoesNotExist:
             return Response({"detail": "Prompt not found."},
                             status=status.HTTP_404_NOT_FOUND)
@@ -2312,7 +2373,7 @@ class PromptCrawlTriggerView(TenantScopedAPIView):
     def post(self, request, website_id, prompt_id):
         website = self.get_website(website_id)
         try:
-            prompt = Prompt.objects.get(id=prompt_id)
+            prompt = Prompt.objects.visible_to_website(website).get(id=prompt_id)
         except Prompt.DoesNotExist:
             return Response({"detail": "Prompt not found."},
                             status=status.HTTP_404_NOT_FOUND)
@@ -2372,7 +2433,7 @@ class PromptSourceScanView(TenantScopedAPIView):
 
         website = self.get_website(website_id)
         try:
-            prompt = Prompt.objects.get(id=prompt_id)
+            prompt = Prompt.objects.visible_to_website(website).get(id=prompt_id)
         except Prompt.DoesNotExist:
             return Response({"detail": "Prompt not found."},
                             status=status.HTTP_404_NOT_FOUND)
@@ -2450,7 +2511,7 @@ class PromptScheduleView(TenantScopedAPIView):
         """Return the website's BrandPrompt for this prompt, or None."""
         website = self.get_website(website_id)
         try:
-            prompt = Prompt.objects.get(id=prompt_id)
+            prompt = Prompt.objects.visible_to_website(website).get(id=prompt_id)
         except Prompt.DoesNotExist:
             return None
         return BrandPrompt.objects.filter(website=website, prompt=prompt).first()

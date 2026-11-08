@@ -72,7 +72,8 @@ def sample_prompts_for_audit(
     rng = random.Random(seed)
 
     pool = list(
-        Prompt.objects.filter(industry=industry, is_active=True).only(
+        Prompt.objects.visible_to_website(audit_run.website)
+        .filter(industry=industry, is_active=True).only(
             "id", "text", "intent_bucket", "source", "demand_score", "created_at"
         )
     )
