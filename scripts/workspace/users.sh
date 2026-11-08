@@ -13,12 +13,19 @@
 #   ./users.sh                          Create a user (asks for everything)
 #   ./users.sh add [email] [full name]  Create a user (asks for what is missing)
 #   ./users.sh list                     List all users
-#   ./users.sh passwd [email]           Reset a user's password
+#   ./users.sh passwd [email]           Reset a password (also clears a lockout)
+#   ./users.sh check [email]            Diagnose a login that is not working
+#   ./users.sh unlock [email]           Clear a lockout after failed logins
 #   ./users.sh help                     Show this help
 #
 # Passwords are always typed at a hidden prompt, never passed on the
 # command line. The app requires at least 12 characters and rejects
 # common or all-numeric passwords.
+#
+# Logging in: emails are saved in lowercase and the login form is
+# case-sensitive, so type the email in lowercase. Five wrong passwords
+# lock that email for 30 minutes (the app still says "Incorrect email or
+# password"); ./users.sh unlock or ./users.sh passwd clears it.
 
 set -euo pipefail
 
@@ -116,6 +123,92 @@ if mode == "exists":
     print("yes" if existing else "no")
     sys.exit(0)
 
+
+def clear_lockout(addr):
+    """Remove django-axes failed-login records for this email."""
+    try:
+        from axes.models import AccessAttempt
+    except Exception:
+        return 0
+    deleted, _ = AccessAttempt.objects.filter(username__iexact=addr).delete()
+    return deleted
+
+
+if mode == "unlock":
+    print(f"cleared {clear_lockout(email)}")
+    sys.exit(0)
+
+if mode == "check":
+    from django.conf import settings
+    from django.utils import timezone
+
+    if not existing:
+        print("  user:            NOT FOUND in the local database")
+        sys.exit(5)
+    password_ok = existing.check_password(os.environ["CANSEE_PASSWORD"])
+    print(f"  user:            {existing.email}")
+    active_text = "yes" if existing.is_active else "NO"
+    print(f"  active:          {active_text}")
+    verified = "yes" if existing.is_email_verified else "NO"
+    print(f"  email verified:  {verified}")
+    pw_text = "matches" if password_ok else "DOES NOT MATCH"
+    print(f"  password:        {pw_text}")
+
+    locked, failures = False, 0
+    try:
+        from axes.models import AccessAttempt
+        limit = getattr(settings, "AXES_FAILURE_LIMIT", 5)
+        cooloff = getattr(settings, "AXES_COOLOFF_TIME", None)
+        rows = list(AccessAttempt.objects.filter(username__iexact=email))
+        failures = max((r.failures_since_start for r in rows), default=0)
+        recent = [r for r in rows if cooloff is None or r.attempt_time >= timezone.now() - cooloff]
+        locked = failures >= limit and bool(recent)
+    except Exception:
+        pass
+    lock_text = f"LOCKED after {failures} failed logins" if locked else f"not locked ({failures} failed logins counted)"
+    print(f"  lockout:         {lock_text}")
+
+    typed_variants = set()
+    try:
+        from apps.accounts.models import LoginAttempt
+        attempts = list(LoginAttempt.objects.filter(email__iexact=email).order_by("-timestamp")[:5])
+    except Exception:
+        attempts = None
+    if attempts is None:
+        print("  login attempts:  (not available on this branch)")
+    elif not attempts:
+        print("  login attempts:  none recorded for this email")
+    else:
+        print("  last login attempts (newest first):")
+        for a in attempts:
+            result = "success" if a.success else "failed"
+            typed_variants.add(a.email)
+            print(f"    {a.timestamp:%Y-%m-%d %H:%M:%S}  {result:<8} typed as {a.email}")
+
+    print()
+    problems = 0
+    if not password_ok:
+        problems += 1
+        print(f"  -> The password you just typed is not the saved one. Reset it with: ./users.sh passwd {existing.email}")
+    if locked:
+        problems += 1
+        print(f"  -> The account is locked by too many failed logins; even the right password is refused")
+        print(f"     (shown as \"Incorrect email or password\"). Clear it with: ./users.sh unlock {existing.email}")
+    if typed_variants - {existing.email}:
+        problems += 1
+        print(f"  -> The browser sent a different spelling/case of the email. Login is case-sensitive:")
+        print(f"     type it exactly as {existing.email}")
+    if attempts == [] :
+        problems += 1
+        print("  -> No login attempt from the browser reached this database. Make sure the browser is on")
+        print("     the app started by ./run.sh (http://localhost:5173) and that ./run.sh is still running.")
+    if not existing.is_active or not existing.is_email_verified:
+        problems += 1
+        print(f"  -> The account is inactive or unverified. Fix it with: ./users.sh passwd {existing.email}")
+    if not problems:
+        print("  -> Everything checks out in the database. Try logging in again with exactly this email and password.")
+    sys.exit(0)
+
 password = os.environ["CANSEE_PASSWORD"]
 try:
     validate_password(password, user=existing)
@@ -137,7 +230,9 @@ elif mode == "passwd":
         sys.exit(5)
     existing.set_password(password)
     existing.is_active = True
-    existing.save(update_fields=["password", "is_active"])
+    existing.is_email_verified = True
+    existing.save(update_fields=["password", "is_active", "is_email_verified"])
+    clear_lockout(email)
     print("updated")
 '
 
@@ -163,8 +258,8 @@ user_exists() {
 save_with_password() {
   local mode="$1" email="$2" name="$3" password confirm result status
   while true; do
-    read -r -s -p "  Password (hidden): " password; echo >&2
-    read -r -s -p "  Repeat password: " confirm; echo >&2
+    IFS= read -r -s -p "  Password (hidden): " password; echo >&2
+    IFS= read -r -s -p "  Repeat password: " confirm; echo >&2
     if [ -z "$password" ]; then echo "  Password cannot be empty." >&2; continue; fi
     if [ "$password" != "$confirm" ]; then echo "  Passwords do not match." >&2; continue; fi
     status=0
@@ -193,7 +288,7 @@ cmd_add() {
   name="${2:-}"
   [ -n "$name" ] || read -r -p "  Full name: " name
   save_with_password add "$email" "$name" >/dev/null
-  ok "Created $email. Log in at http://localhost:5173"
+  ok "Created $(printf '%s' "$email" | tr '[:upper:]' '[:lower:]'). Log in at http://localhost:5173 with the email in lowercase."
 }
 
 cmd_passwd() {
@@ -204,6 +299,28 @@ cmd_passwd() {
   [ "$(user_exists "$email")" = "yes" ] || die "No user with email $email. Create one with: ./users.sh add $email"
   save_with_password passwd "$email" "" >/dev/null
   ok "Password updated for $email"
+}
+
+cmd_check() {
+  ensure_backend
+  step "Check a login"
+  local email password
+  email="$(ask_email "${1:-}")"
+  IFS= read -r -s -p "  Password to test (hidden): " password; echo
+  echo
+  local status=0
+  CANSEE_MODE=check CANSEE_EMAIL="$email" CANSEE_PASSWORD="$password" run_py || status=$?
+  [ "$status" = "5" ] && die "No user with email $email. Create one with: ./users.sh add $email"
+  [ "$status" = "0" ] || die "The check failed (exit $status)."
+}
+
+cmd_unlock() {
+  ensure_backend
+  step "Unlock a login"
+  local email result
+  email="$(ask_email "${1:-}")"
+  result="$(CANSEE_MODE=unlock CANSEE_EMAIL="$email" CANSEE_PASSWORD="" run_py | tail -n 1)"
+  ok "Lockout cleared for $email (${result#cleared } record(s) removed). You can log in again now."
 }
 
 cmd_list() {
@@ -219,6 +336,8 @@ main() {
     add | new | create) cmd_add "$@" ;;
     list | ls) cmd_list ;;
     passwd | password | reset-password) cmd_passwd "$@" ;;
+    check | test) cmd_check "$@" ;;
+    unlock) cmd_unlock "$@" ;;
     -h | --help | help) usage ;;
     *) usage; die "Unknown command: $cmd" ;;
   esac
