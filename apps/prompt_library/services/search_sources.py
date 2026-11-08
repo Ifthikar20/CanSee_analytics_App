@@ -10,12 +10,15 @@ work; the frontend renders an explanatory empty state in that case.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
+from collections.abc import Callable
 from typing import Any
 from urllib.parse import urlparse
 
 from django.conf import settings
+from django.core.cache import cache
 
 logger = logging.getLogger("apps")
 
@@ -193,11 +196,38 @@ def _build_groups(rows: list[dict]) -> list[dict]:
     return out
 
 
-def search_sources(query: str, *, limit: int = 8) -> dict[str, Any]:
+# A SerpAPI search is paid per call, so a successful answer is reused for a
+# day: the same prompt asked again (or by a teammate) costs nothing.
+_RESULT_CACHE_TTL = 60 * 60 * 24
+# Wall-clock budget for verifying candidate pages inside the request.
+_VERIFY_SECONDS = 15
+
+
+class SearchRateLimited(Exception):
+    """The caller's search allowance is used up; try again later."""
+
+
+def _result_cache_key(query: str, limit: int) -> str:
+    normalised = " ".join(query.lower().split())
+    digest = hashlib.sha256(f"{limit}\n{normalised}".encode()).hexdigest()
+    return f"psrc:v1:{digest}"
+
+
+def search_sources(
+    query: str,
+    *,
+    limit: int = 8,
+    allow_paid_call: Callable[[], bool] | None = None,
+) -> dict[str, Any]:
     """Return ``{provider, query, results, groups}``. ``groups`` clusters
     results by source_class with extracted asker info. Empty when SerpAPI
     isn't configured or the call fails — caller should treat that as a
-    graceful 'no data yet' state, NOT an error."""
+    graceful 'no data yet' state, NOT an error.
+
+    A successful answer is cached for a day by normalised query. On a cache
+    miss ``allow_paid_call`` (when given) is asked before SerpAPI is
+    called; ``SearchRateLimited`` is raised when it says no.
+    """
     query = (query or "").strip()
     if not query:
         return {"provider": "fallback", "results": [], "groups": [], "query": query}
@@ -206,6 +236,20 @@ def search_sources(query: str, *, limit: int = 8) -> dict[str, Any]:
     if not api_key:
         return {"provider": "unconfigured", "results": [], "groups": [], "query": query}
 
+    key = _result_cache_key(query, limit)
+    cached = cache.get(key)
+    if cached is not None:
+        return {**cached, "query": query, "cached": True}
+    if allow_paid_call is not None and not allow_paid_call():
+        raise SearchRateLimited()
+
+    result = _search_serpapi(query, limit=limit, api_key=api_key)
+    if not result.get("error"):
+        cache.set(key, result, timeout=_RESULT_CACHE_TTL)
+    return result
+
+
+def _search_serpapi(query: str, *, limit: int, api_key: str) -> dict[str, Any]:
     try:
         import requests
     except ImportError:  # pragma: no cover
@@ -265,7 +309,9 @@ def search_sources(query: str, *, limit: int = 8) -> dict[str, Any]:
             candidates.append(row)
 
     from apps.prompt_library.services.source_verifier import filter_verified
-    verified = filter_verified(query, candidates)[:limit]
+    verified = filter_verified(
+        query, candidates, max_seconds=_VERIFY_SECONDS,
+    )[:limit]
 
     return {
         "provider": "serpapi",

@@ -23,6 +23,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+import time
 from typing import Any
 from urllib.parse import urlparse
 
@@ -179,17 +180,26 @@ def verify_source(prompt: str, url: str) -> dict[str, Any]:
     return verdict
 
 
-def filter_verified(prompt: str, rows: list[dict]) -> list[dict]:
+def filter_verified(
+    prompt: str, rows: list[dict], *, max_seconds: float | None = None,
+) -> list[dict]:
     """Return only the rows whose URL strictly verifies against ``prompt``.
 
     Annotates each kept row with `_verification` so the UI can show
     how many keywords matched (useful for a 'verified · 6/6 terms' badge).
+
+    ``max_seconds`` bounds the whole pass: once it is spent, the remaining
+    rows are left out as unverified instead of fetching more pages, so a
+    request never waits on one slow page after another.
     """
+    deadline = None if max_seconds is None else time.monotonic() + max_seconds
     out: list[dict] = []
     for row in rows:
         url = row.get("url") or ""
         if not url:
             continue
+        if deadline is not None and time.monotonic() >= deadline:
+            break
         v = verify_source(prompt, url)
         if v["verified"]:
             row = dict(row)

@@ -711,12 +711,22 @@ class PromptSearchSourcesView(APIView):
     Body: ``{"query": "the prompt text"}``
     Returns: ``{"provider": "serpapi" | "unconfigured", "query": str,
                 "results": [{title, url, domain, snippet, source_class, position}]}``
+
+    Each uncached lookup is a paid SerpAPI search plus page fetches, so a
+    per-user bucket limits them; answers are cached for a day by query and
+    a cached answer does not use the bucket.
     """
 
     permission_classes = [IsAuthenticated]
+    _BUCKET_CAPACITY = 5
+    _BUCKET_REFILL = 20 / 3600.0  # 20 uncached searches an hour after a burst of 5.
 
     def post(self, request):
-        from apps.prompt_library.services.search_sources import search_sources
+        from apps.prompt_library.services.search_sources import (
+            SearchRateLimited,
+            search_sources,
+        )
+        from core.resilience import TokenBucket
 
         query = (request.data or {}).get("query") or ""
         query = str(query).strip()
@@ -725,7 +735,20 @@ class PromptSearchSourcesView(APIView):
                 {"detail": "Query too short."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        return Response(search_sources(query, limit=8))
+        bucket = TokenBucket(
+            name=f"prompt_search_sources:{request.user.id}",
+            capacity=self._BUCKET_CAPACITY,
+            refill_per_second=self._BUCKET_REFILL,
+        )
+        try:
+            payload = search_sources(query, limit=8, allow_paid_call=bucket.try_acquire)
+        except SearchRateLimited:
+            return Response(
+                {"error": "rate_limited",
+                 "detail": "Too many new searches. Try again in a few minutes."},
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+            )
+        return Response(payload)
 
 
 class PromptSmokeTestView(APIView):
