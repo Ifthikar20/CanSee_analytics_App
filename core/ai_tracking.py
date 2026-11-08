@@ -8,12 +8,55 @@ The AITokenUsage model lives in apps.accounts.models but is accessed through
 this module for convenience.
 """
 import logging
+import threading
 import uuid
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from datetime import timedelta
+from decimal import Decimal
 
 from django.utils import timezone
 
 logger = logging.getLogger(__name__)
+
+
+# ── Capturing what a block of code spends ──
+# A caller that runs someone else's AI calls (the agent asking the AI
+# engines through the prompt crawler) learns their cost by wrapping them in
+# capture_usage(): every ledger row this thread records inside the block is
+# added to the capture. Rows a duplicate idempotency key suppressed are not.
+_captures = threading.local()
+
+
+@dataclass
+class UsageCapture:
+    rows: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cost_usd: Decimal = field(default_factory=lambda: Decimal("0"))
+
+
+@contextmanager
+def capture_usage():
+    """Collect the usage this thread records inside the block. Captures
+    nest: an inner block's rows count in the outer one too."""
+    stack = getattr(_captures, "stack", None)
+    if stack is None:
+        stack = _captures.stack = []
+    capture = UsageCapture()
+    stack.append(capture)
+    try:
+        yield capture
+    finally:
+        stack.remove(capture)
+
+
+def _note_captured(input_tokens: int, output_tokens: int, cost) -> None:
+    for capture in getattr(_captures, "stack", None) or ():
+        capture.rows += 1
+        capture.input_tokens += int(input_tokens or 0)
+        capture.output_tokens += int(output_tokens or 0)
+        capture.cost_usd += Decimal(str(cost or 0))
 
 
 # ── Pricing (per 1M tokens) ──
@@ -304,6 +347,7 @@ def record_usage(
         if not created:
             logger.info("Duplicate AI usage suppressed (idempotency_key=%s)", key)
             return
+        _note_captured(input_tokens, output_tokens, cost)
 
         from apps.metering.services.events import ingest_mode, schedule_flush
 

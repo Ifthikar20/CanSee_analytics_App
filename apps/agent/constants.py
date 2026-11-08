@@ -197,6 +197,8 @@ class PartType:
 class EventType:
     """Run event types shared by SSE and long-poll (contract section 2)."""
 
+    # A run waiting for a free run thread: {position, ahead, slots}.
+    RUN_QUEUED = "run.queued"
     RUN_STARTED = "run.started"
     RUN_RETRYING = "run.retrying"
     RUN_USAGE = "run.usage"

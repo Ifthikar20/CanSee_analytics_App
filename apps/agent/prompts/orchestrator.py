@@ -4,11 +4,21 @@ Byte-identical for every tenant and every chat: project details arrive
 in a ``role: "system"`` message after the chat's first user message
 (prompts.context), so all chats share one cache prefix. Change VERSION
 with any edit; chats keep the snapshot they started on.
+
+The research agents' limits come from the settings
+(AGENT_SWARM_MAX_TASKS): ``system_prompt()`` fills them in, and
+``SYSTEM_PROMPT`` reads as that text. A changed limit changes the text,
+so new chats pin a new snapshot and older chats keep theirs.
 """
+from __future__ import annotations
 
-VERSION = "2026-11-05.1"
+VERSION = "2026-11-08.2"
 
-SYSTEM_PROMPT = """\
+MAX_AGENTS_TOKEN = "{max_agents}"
+# Replaced with "N prompts" (or "1 prompt").
+MAX_PROMPTS_TOKEN = "{max_prompts}"
+
+_TEMPLATE = """\
 You are the CanSee agent. You help a business see and improve how it shows up in two places:
 - SEO: Google's organic results and Google's AI Overview.
 - GEO: the answers AI engines give (ChatGPT, Claude, Gemini, Grok and Perplexity).
@@ -53,10 +63,10 @@ tracked when the research starts). If there are none, propose 3 to 5 buyer-inten
 the user to confirm, and run the research after they say yes.
 2. Plan. Use the defaults (google_pages 1, competitor_pages 1, every configured engine, \
 content_gaps and citations on) unless the user asked for more depth. Put competitors the user \
-named in competitors. A research has at most 30 agents: each prompt adds its Google pages, the \
-engines asked, its competitor pages, and 3 more with content_gaps and citations on, so with all \
-five engines configured use at most 3 prompts. If the result says the plan is too large or the \
-allowance is short, make the plan smaller and call it once more.
+named in competitors. A research has at most {max_agents} agents: each prompt adds its Google \
+pages, the engines asked, its competitor pages, and 3 more with content_gaps and citations on, so \
+with all five engines configured use at most {max_prompts}. If the result says the plan is \
+too large or the allowance is short, make the plan smaller and call it once more.
 3. Report. The app shows the agents and the results table above your reply, and a saved report \
 includes that table, so do not repeat the full table. Write the report from the tool result: a \
 title line starting with "# ", a summary of three sentences, one section per prompt (what Google \
@@ -150,3 +160,37 @@ Lead with the answer. Be direct and specific: name the exact query, page and com
 paragraphs, tables for comparisons and plain language. Ask one clear question when you need a \
 decision from the user.
 """
+
+
+def research_limits(max_tasks: int) -> tuple[int, int]:
+    """(agents, prompts) for a research of at most ``max_tasks`` agents:
+    the prompts that fit with the default plan (one Google page, one
+    competitor page, content gaps and citations on) and all five engines
+    configured, capped by the tool's prompt limit and at least 1."""
+    from apps.agent.runtime.swarm.plan import max_prompts_for
+    from apps.agent.tools.schemas import MAX_SWARM_PROMPTS
+
+    fits = max_prompts_for(engines_per_prompt=5, google_pages=1, competitor_pages=1,
+                           content_gaps=True, citations=True, serp_configured=True,
+                           max_tasks=max_tasks)
+    return max_tasks, max(1, min(fits, MAX_SWARM_PROMPTS))
+
+
+def system_prompt(max_tasks: int | None = None) -> str:
+    """The orchestrator's system prompt with the research limits of
+    ``max_tasks`` agents (default: AGENT_SWARM_MAX_TASKS)."""
+    if max_tasks is None:
+        from apps.agent.conf import agent_conf
+
+        max_tasks = agent_conf().swarm_max_tasks
+    agents, prompts = research_limits(max_tasks)
+    phrase = "1 prompt" if prompts == 1 else f"{prompts} prompts"
+    return _TEMPLATE.replace(MAX_AGENTS_TOKEN, str(agents)).replace(MAX_PROMPTS_TOKEN, phrase)
+
+
+def __getattr__(name: str):
+    # SYSTEM_PROMPT is the text a new chat sends, read at the point of use
+    # so a settings override takes effect.
+    if name == "SYSTEM_PROMPT":
+        return system_prompt()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

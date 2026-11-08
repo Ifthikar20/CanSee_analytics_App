@@ -12,11 +12,15 @@ Thread mode: the calling thread (the run's) is the monitor. It starts a
 task on its own daemon thread once the task's dependencies have finished
 and a slot is free: one of AGENT_SWARM_WORKERS for this swarm, one of
 the process's ``task`` slots and the task's primary resource (limits).
-It times tasks out, stops them on Stop and at the research's time limit,
-hands the analysis usage to the run and checkpoints the parts every few
-seconds. A task that times out is finished without its thread: whatever
-the thread still reports is dropped by its closed reporter, and the
-resource it holds is released when its call returns.
+It times tasks out, stops them on Stop, at the research's time limit and
+when the run reaches its cost ceiling (the engines' answers and the
+analyses count), hands that usage to the run and checkpoints the parts
+every few seconds. A task that times out is finished without its thread:
+whatever the thread still reports is dropped by its closed reporter, the
+resource and the process ``task`` slot it holds are released when its
+thread returns (so the process never runs more task threads than
+AGENT_SWARM_PROCESS_WORKERS), and usage it reports after the execution
+ended still reaches the run.
 
 Inline mode (tests): the tasks run one after another in task order in
 the calling thread (an order that satisfies every dependency), without
@@ -64,6 +68,8 @@ STOPPED_RUNNING = {"code": "stopped", "message": "Stopped"}
 DEADLINE_PENDING = {"code": "deadline",
                     "message": "Not started: the research reached its time limit."}
 DEADLINE_RUNNING = {"code": "deadline", "message": "Stopped at the research's time limit."}
+COST_PENDING = {"code": "cost_limit", "message": "Not started: this reply reached its cost limit."}
+COST_RUNNING = {"code": "cost_limit", "message": "Stopped: this reply reached its cost limit."}
 INTERNAL_ERROR = {"code": "internal_error", "message": "This agent failed with an internal error."}
 NOTHING_TO_RUN = {"code": "internal_error", "message": "This research has no agents to run."}
 
@@ -189,14 +195,14 @@ class _Execution:
             if task_id in self.final:
                 return False
             self.final.add(task_id)
-            job = self.running.pop(task_id, None)
+            self.running.pop(task_id, None)
             self.pending = [s for s in self.pending if s["id"] != task_id]
             task_reporter = self.reporters[task_id]
             task_reporter.finished(status, result=result, tone=tone, detail=detail, error=error,
                                    pane=pane, target=target)
             self.run.set_result(task_id, task_reporter.task)
-        if job is not None and not self.run.inline:
-            limits.release("task")
+        # The process ``task`` slot stays taken until the task's thread
+        # returns (_work), also when the task finished without it.
         self.wake.set()
         return True
 
@@ -223,11 +229,21 @@ class _Execution:
         self._end_open(running=("failed", DEADLINE_RUNNING),
                        pending=("skipped", DEADLINE_PENDING))
 
+    def _over_budget(self) -> bool:
+        """The run reached its cost ceiling: running tasks fail, the rest
+        are skipped, and the run's next request ends it (run_cost_limit)."""
+        if self.run.over_budget() is None:
+            return False
+        self._end_open(running=("failed", COST_RUNNING), pending=("skipped", COST_PENDING))
+        return True
+
     def _stopped_reason(self) -> tuple[str, dict]:
         if self.run.cancelled():
             return "stopped", STOPPED_RUNNING
         if time.monotonic() >= self.run.deadline:
             return "failed", DEADLINE_RUNNING
+        if self.run.budget_stop is not None:
+            return "failed", COST_RUNNING
         return "stopped", STOPPED_RUNNING
 
     # ── Running tasks ────────────────────────────────────────────────
@@ -285,6 +301,8 @@ class _Execution:
             if time.monotonic() >= self.run.deadline:
                 self._expire_all()
                 return
+            if self._over_budget():
+                return
             job = self._begin(spec, None, math.inf)
             output = self._call(job)
             if output is not None:
@@ -316,8 +334,10 @@ class _Execution:
                     limit = _timeout(job.spec)
                     self.finalize(job.task_id, "failed", error={
                         "code": "timeout", "message": f"Timed out after {limit:g} seconds."})
-            self._dispatch(conf)
             self.run.drain_usage()
+            if self._over_budget():
+                return
+            self._dispatch(conf)
             self.run.ctx.emitter.checkpoint()
             with self.lock:
                 if not self.pending and not self.running:
@@ -338,6 +358,10 @@ class _Execution:
                     return
                 if not self._deps_settled(spec):
                     continue
+            # Each start sees the spend of the tasks that finished so far.
+            self.run.drain_usage()
+            if self.run.over_budget() is not None:
+                return
             resource = limits.primary_resource(spec)
             if resource and not limits.try_acquire(resource):
                 continue
@@ -356,6 +380,7 @@ class _Execution:
         except RuntimeError:
             logger.exception("agent swarm task %s could not start a thread", spec["id"])
             job.release_primary()
+            limits.release("task")
             self.finalize(spec["id"], "failed", error=dict(INTERNAL_ERROR))
 
     def _work(self, job: TaskJob) -> None:
@@ -370,6 +395,8 @@ class _Execution:
                 self.finalize(job.task_id, status, error=dict(error))
         finally:
             job.release_primary()
+            # Only now: a timed-out task's thread holds its slot until here.
+            limits.release("task")
             connections.close_all()
             self.wake.set()
 
@@ -483,7 +510,9 @@ def execute_version(ctx, swarm, version, *, part_id: str | None = None) -> Versi
     duration_ms = int((time.monotonic() - started) * 1000)
     reporter.close_swarm_part(ctx.emitter, part_id, status=status, ended_at=iso(ended_at),
                               duration_ms=duration_ms)
-    run.drain_usage()
+    # The last drain; what a lingering task thread reports later goes to
+    # the run directly.
+    run.close_usage()
     cost_usd = run.cost_usd.quantize(Decimal("0.000001"))
     _save(version, status=status, results=results, counts=_counts(results, run_ids),
           cost_usd=cost_usd, worker_requests=run.worker_requests, finished_at=ended_at,

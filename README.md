@@ -114,8 +114,13 @@ With `DEBUG=True` the OpenAPI schema is served at `/api/schema/`, with Swagger U
 ## Agent service
 
 The agent workspace (`apps/agent`, mounted at `/api/v1/agent/`) is a chat agent on
-Claude Opus 5.5 that researches SEO and GEO visibility, compares the two and drafts
-landing pages, AEO articles and ad campaigns. It ships switched off.
+Claude Opus 5.5 that researches SEO and GEO visibility, compares the two and hands
+writing to nine writers: landing pages, AEO articles, ad campaigns, page revisions,
+llms.txt files, comparison pages, social posts, PR (press releases, media pitches,
+correction requests) and messaging briefs. For broad research it runs the research
+agents (`research_swarm`): up to `AGENT_SWARM_MAX_TASKS` agents in parallel, each
+fetching one Google results page, asking one AI engine one prompt, reading one page or
+analysing one prompt. It ships switched off.
 
 **Two processes.** Gunicorn serves the ordinary endpoints (chats, artifacts, reports,
 brand context, suggestions, activity, status). Everything under `/api/v1/agent/live/`
@@ -169,12 +174,57 @@ the agent process also ends such a run as soon as a reader asks for it. A daily
 `AGENT_CHAT_RETENTION_DAYS` (0, the default, keeps every chat; artifacts and reports
 made in a deleted chat stay).
 
-In dev, `runserver` is the agent process (`config/settings/dev.py`; `AGENT_PROCESS`
-defaults to true there). `docker/docker-compose.yml` runs gunicorn's several workers
+In dev, `runserver` is the agent process (`config/settings/dev.py`; `AGENT_ENABLED` and
+`AGENT_PROCESS` default to true there). `docker/docker-compose.yml` runs gunicorn's several workers
 instead, which would interrupt each other's runs, so it sets `AGENT_PROCESS=false` and
 has no agent process; use `docker/docker-compose.dev.yml` to work on the agent. The
 test suite runs turns inline against a fake Anthropic client and never calls the real
 API.
+
+**Running the agent locally.** `scripts/run-local.sh` starts the dev stack
+(`docker/docker-compose.dev.yml`), where the agent is already on. Uncomment and fill in
+the keys in the `.env` it wrote, then run the script again (it recreates the `web`
+container with the new values):
+
+| Key | Needed for |
+| --- | --- |
+| `ANTHROPIC_API_KEY` | Required. Chats, the writers and the research agents' analyses. The key needs access to `AGENT_MODEL` (`claude-opus-5-5`) and `AGENT_WORKER_MODEL` (`claude-haiku-5-5`). |
+| `SERPAPI_KEY` or `SCRAPERAPI_KEY` | Optional. Google results in research; without one, research measures the AI engines only. |
+| `OPENAI_API_KEY`, `GEMINI_API_KEY`, `PERPLEXITY_API_KEY`, `XAI_API_KEY` | Optional. The AI engines research asks (Claude uses `ANTHROPIC_API_KEY`). An engine without a key is skipped and reported as not set up. |
+| `AI_FREE_MONTHLY_CAP_USD` | Optional. An account without a subscription has a small monthly AI allowance, which an Opus reply or two can use up; raise it for local testing, or set the test user's `monthly_ai_cost_cap_usd`. |
+
+`AGENT_ENABLED=false` in `.env` turns the agent off in dev. `GET /api/v1/agent/status/`
+shows what is configured.
+
+**How many agents run at once.** All of these are env settings (defaults in
+`config/settings/base.py`, commented overrides in `.env.prod.example`):
+
+| Setting | Default | Limits |
+| --- | --- | --- |
+| `AGENT_MAX_CONCURRENT_RUNS` | `6` | Replies the agent process runs at once (its run threads). A reply sent while all are busy waits in line: its run reports `queue` and `run.queued` events (below). |
+| `AGENT_USER_ACTIVE_RUNS` | `2` | Replies one user may run at once across chats (a chat always runs one at a time). More spends the allowance faster; the allowance and the per-reply cost cap still stop every reply. |
+| `AGENT_SWARM_MAX_TASKS` | `50` | The one ceiling on research agents per research. The tool refuses larger plans, and the orchestrator's prompt and tool description state the number (new chats pick up a new value; older chats keep theirs). 50 fits 5 prompts with all five engines. |
+| `AGENT_SWARM_WORKERS` | `8` | Research agents running at once in one research. |
+| `AGENT_SWARM_PROCESS_WORKERS` | `16` | Research agents running at once across the process. A task that timed out keeps its slot until its thread returns. |
+| `AGENT_SWARM_SERP_CONCURRENCY`, `_BROWSE_`, `_ENGINE_`, `_HAIKU_` | `5`, `6`, `3`, `8` | Per-provider limits shared by every research (`ENGINE` is per engine). Keep them within the SerpAPI or ScraperAPI plan's concurrency and each engine's rate limits, or agents fail with 429s. Raising the worker counts without these only queues tasks. |
+
+Cost notes: a full research at 50 agents can use about $0.89 of AI allowance (25
+engine answers at $0.02, 35 analyses at $0.004, the report at $0.25), plus 5 to 10
+Google results pages that the platform pays for (`SERPAPI_COST_PER_SEARCH_USD`) and
+no allowance counts. A reply's cost (`cost_usd` on the run and message, `run.usage`)
+includes the AI engines' answers it asked for, and a reply stops at
+`AGENT_RUN_MAX_COST_USD` or `AGENT_RUN_MAX_SECONDS` during engine checks and research
+too. A run still going `AGENT_RUN_MAX_SECONDS` plus a minute after it started is
+stopped by the heartbeat and fails with `run_timeout`; if its thread does not
+answer, the heartbeat lets it go stale and the sweeper ends it as `interrupted`. More
+threads use more memory: size the host before raising these (see below).
+
+**Waiting for a free slot.** While a run waits for a run thread, `queue` on the run
+(the `live/` start responses, the chat's `active_run` and the long-poll response) is
+`{"position": n, "ahead": n - 1, "slots": AGENT_MAX_CONCURRENT_RUNS}`, and its event
+stream carries `run.queued` with the same fields each time its place changes; `queue`
+is `null` once a thread has it (then `run.started` follows) or when the process cannot
+tell (a gunicorn worker).
 
 ## Deploy
 

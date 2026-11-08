@@ -7,6 +7,14 @@ a run whose row no longer matches (the sweeper marked it interrupted) is
 stopped locally. The same thread picks up stop requests that reached
 another process and refreshes the cache key ``status/`` reads to report
 the agent process as live.
+
+The heartbeat is also the watchdog for runs past their deadline: a run
+still going OVERDUE_GRACE_SECONDS after started_at + AGENT_RUN_MAX_SECONDS
+(a provider call that hangs inside a tool) is stopped locally and marked
+``timed_out``, so the runner ends it as failed with run_timeout. Its
+heartbeat stops at the same time: if its thread does not answer the stop,
+the row goes stale and the sweeper ends it as interrupted. A queued run
+(no started_at) is never overdue; the deadline counts from its start.
 """
 from __future__ import annotations
 
@@ -15,6 +23,7 @@ import os
 import socket
 import threading
 import time
+from datetime import timedelta
 
 from django.core.cache import cache
 from django.db import connections
@@ -27,6 +36,8 @@ logger = logging.getLogger("apps")
 
 LIVE_HEARTBEAT_CACHE_KEY = "agent:live:heartbeat"
 LIVE_HEARTBEAT_TTL = 30
+# A running run this long past its deadline is stopped by the heartbeat.
+OVERDUE_GRACE_SECONDS = 60
 _BOOT_TS = int(time.time())
 
 
@@ -43,6 +54,8 @@ class ActiveRun:
         self.cancel_event = threading.Event()
         # The run's row was taken over (interrupted) by someone else.
         self.lost = False
+        # The heartbeat stopped the run for running past its deadline.
+        self.timed_out = False
         self._lock = threading.Lock()
         self._stream = None
 
@@ -151,7 +164,12 @@ class RunRegistry:
         if not ids:
             return
         now = timezone.now()
+        overdue = self._stop_overdue(ids, now)
         for run_id in ids:
+            if run_id in overdue:
+                # No more heartbeats: a thread that does not answer the stop
+                # leaves a stale row the sweeper ends.
+                continue
             updated = AgentRun.objects.filter(
                 id=run_id, status__in=ACTIVE_RUN_STATUSES, executor_id=self.executor_id,
             ).update(heartbeat_at=now)
@@ -171,6 +189,26 @@ class RunRegistry:
         ).values_list("id", flat=True)
         for run_id in requested:
             self.cancel_local(run_id)
+
+    def _stop_overdue(self, ids: list[str], now) -> set[str]:
+        """Stop this process's running runs that are past their deadline by
+        more than OVERDUE_GRACE_SECONDS; returns their ids."""
+        from apps.agent.models import AgentRun
+
+        cutoff = now - timedelta(seconds=agent_conf().run_max_seconds + OVERDUE_GRACE_SECONDS)
+        overdue = {
+            str(run_id) for run_id in AgentRun.objects.filter(
+                id__in=ids, status=RunStatus.RUNNING, executor_id=self.executor_id,
+                started_at__lt=cutoff,
+            ).values_list("id", flat=True)
+        }
+        for run_id in overdue:
+            active = self.get(run_id)
+            if active is not None and not active.timed_out:
+                logger.warning("agent run %s is past its deadline; stopping it", run_id)
+                active.timed_out = True
+                active.cancel()
+        return overdue
 
     def ensure_heartbeat(self) -> None:
         """Start the daemon heartbeat thread (thread mode), once."""

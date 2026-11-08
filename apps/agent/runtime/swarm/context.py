@@ -5,7 +5,11 @@ the ones carried from earlier versions), the Google captures, the page
 fetches (one per URL), the per-prompt engine scans and the analysis
 usage. Tasks run on their own threads in thread mode, so everything they
 write goes through ``lock``; usage is queued for the run's own thread,
-which is the only one that writes the run row.
+which is the only one that writes the run row. Usage that comes after the
+execution's last drain (a thread that outlived its timed-out task) goes
+to the run directly (``close_usage``). The engines' answers count too: their
+cost is captured around each engine call and added like an analysis's,
+without counting as a request.
 """
 from __future__ import annotations
 
@@ -116,10 +120,11 @@ class TaskJob:
         return self.spec.get("inputs") or {}
 
     def stopped(self) -> bool:
-        """Stop was pressed, the research reached its time limit, or the
-        task was finished without this thread (it timed out)."""
+        """Stop was pressed, the research reached its time limit, the run
+        reached its cost ceiling, or the task was finished without this
+        thread (it timed out)."""
         return (bool(getattr(self.reporter, "closed", False)) or self.run.cancelled()
-                or time.monotonic() >= self.run.deadline)
+                or time.monotonic() >= self.run.deadline or self.run.budget_stop is not None)
 
     def check(self) -> None:
         if self.stopped():
@@ -174,6 +179,12 @@ class SwarmRun:
         self.usage: queue.SimpleQueue = queue.SimpleQueue()
         self.cost_usd = Decimal("0")
         self.worker_requests = 0
+        # Queued usage not yet handed to the run (counted by over_budget).
+        self._undrained_usd = Decimal("0")
+        # Set by close_usage: later usage goes to the run directly.
+        self._usage_closed = False
+        # The GateStop (run_cost_limit) that ended this execution early.
+        self.budget_stop = None
         # Category notes added while the tasks run (contract 5b + "category").
         self.notes: list[dict] = []
         self._brand_prompts: dict[str, object] = {}
@@ -335,27 +346,60 @@ class SwarmRun:
     # ── Usage ────────────────────────────────────────────────────────
 
     def add_usage(self, totals: UsageTotals, requests: int = 1) -> None:
-        """An analysis request's usage. It counts toward the run's cost but
-        not its request cap; in thread mode the run's thread adds it."""
+        """An analysis request's usage (or an engine answer's, with
+        ``requests=0``). It counts toward the run's cost but not its
+        request cap; in thread mode the run's thread adds it, until the
+        execution's last drain, after which it goes to the run directly."""
+        zeroed = dataclasses.replace(totals, requests=0)
+        direct = self.inline
         with self.lock:
             self.cost_usd += totals.cost_usd
             self.worker_requests += requests
-        zeroed = dataclasses.replace(totals, requests=0)
-        if self.inline:
-            if self.ctx.add_usage is not None:
-                self.ctx.add_usage(zeroed)
-        else:
-            self.usage.put(zeroed)
+            if not direct and not self._usage_closed:
+                self._undrained_usd += totals.cost_usd
+                self.usage.put(zeroed)
+                return
+            direct = True
+        if direct and self.ctx.add_usage is not None:
+            self.ctx.add_usage(zeroed)
+
+    def add_engine_usage(self, capture) -> None:
+        """The cost of an engine answer (a core.ai_tracking capture)."""
+        if capture is None or not capture.rows:
+            return
+        from apps.agent.llm.usage import engine_usage
+
+        self.add_usage(engine_usage(capture), requests=0)
 
     def drain_usage(self) -> None:
         """Hand the queued usage to the run (the run's own thread only)."""
         total: UsageTotals | None = None
-        while True:
-            try:
-                item = self.usage.get_nowait()
-            except queue.Empty:
-                break
-            total = total or UsageTotals()
-            total.add(item)
+        with self.lock:
+            while True:
+                try:
+                    item = self.usage.get_nowait()
+                except queue.Empty:
+                    break
+                total = total or UsageTotals()
+                total.add(item)
+            if total is not None:
+                self._undrained_usd -= total.cost_usd
         if total is not None and self.ctx.add_usage is not None:
             self.ctx.add_usage(total)
+
+    def close_usage(self) -> None:
+        """The execution's last drain: what a task's thread reports later
+        (it outlived its task) is added to the run directly."""
+        with self.lock:
+            self._usage_closed = True
+        self.drain_usage()
+
+    def over_budget(self):
+        """The GateStop that ends the run (its cost ceiling or deadline,
+        counting usage not drained yet), or None. Remembered once set."""
+        if self.budget_stop is None:
+            stop = self.ctx.over_budget(self._undrained_usd) if hasattr(
+                self.ctx, "over_budget") else None
+            if stop is not None:
+                self.budget_stop = stop
+        return self.budget_stop

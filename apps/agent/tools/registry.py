@@ -17,7 +17,7 @@ from apps.agent.conf import agent_conf
 from apps.agent.llm.gate import CancelRequested, GateStop
 from apps.agent.tools import actions, data, research, swarm
 from apps.agent.tools.context import ToolContext, ToolError, ToolResult
-from apps.agent.tools.schemas import DEFINITIONS, MODELS
+from apps.agent.tools.schemas import DEFINITIONS, MODELS, tool_description
 from apps.agent.tools.server import server_tool_definitions
 from apps.agent.tools.shaping import compact
 
@@ -65,12 +65,14 @@ SWARM_TOOL_NAME = "research_swarm"
 def client_tool_definitions() -> list[dict]:
     """The client tools a new snapshot offers. research_swarm is left out
     while the research agents are turned off (chats pinned to a snapshot
-    that has it get a swarm_disabled result instead)."""
-    swarm_enabled = agent_conf().swarm_enabled
+    that has it get a swarm_disabled result instead). research_swarm's
+    description states the AGENT_SWARM_MAX_TASKS ceiling."""
+    conf = agent_conf()
+    swarm_enabled = conf.swarm_enabled
     return [
         {
             "name": name,
-            "description": DEFINITIONS[name]["description"],
+            "description": tool_description(name, max_agents=conf.swarm_max_tasks),
             "input_schema": DEFINITIONS[name]["input_schema"],
             "eager_input_streaming": True,
         }

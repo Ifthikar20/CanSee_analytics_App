@@ -1,8 +1,8 @@
 """research_swarm: the research agents' planning tool (swarm_contract.md 3).
 
 One tool call runs a whole research: the plan is validated and resolved
-(prompts given as text are tracked first), expanded into 1 to 30 tasks
-(runtime.swarm.plan), checked against the cap and the user's AI
+(prompts given as text are tracked first), expanded into 1 to
+AGENT_SWARM_MAX_TASKS tasks (runtime.swarm.plan), checked against the cap and the user's AI
 allowance, and executed inside the call (runtime.swarm.executor). The
 consolidated table comes back as the one tool_result, so the wire keeps
 exactly one tool_use / tool_result pair however many agents ran.

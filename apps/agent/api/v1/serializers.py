@@ -25,6 +25,7 @@ from apps.agent.constants import (
     FindingSeverity,
     FindingStatus,
     MessageRole,
+    RunStatus,
     SwarmCategory,
     SwarmScope,
 )
@@ -101,6 +102,16 @@ class MessageSerializer(serializers.BaseSerializer):
         }
 
 
+def run_queue(run) -> dict | None:
+    """Contract ``RunQueue``: {position, ahead, slots} while a queued run
+    waits for a free run thread in this process, else None."""
+    if run.status != RunStatus.QUEUED:
+        return None
+    from apps.agent.runtime.dispatch import queue_status
+
+    return queue_status(run.id)
+
+
 class RunSerializer(serializers.BaseSerializer):
     """Contract ``Run``; ``message_id`` is the assistant message it writes."""
 
@@ -111,6 +122,7 @@ class RunSerializer(serializers.BaseSerializer):
             "message_id": str(run.assistant_message_id),
             "status": run.status,
             "last_seq": run.last_seq,
+            "queue": run_queue(run),
         }
 
 
@@ -149,6 +161,7 @@ def chat_detail(view) -> dict:
                 "status": run.status,
                 "message_id": str(run.assistant_message_id),
                 "last_seq": run.last_seq,
+                "queue": run_queue(run),
             }
             if run is not None
             else None

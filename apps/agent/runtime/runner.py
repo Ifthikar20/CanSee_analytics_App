@@ -38,7 +38,7 @@ import time
 from dataclasses import dataclass
 from decimal import Decimal
 
-from django.db import connections
+from django.db import connections, transaction
 from django.utils import timezone
 
 from apps.agent.conf import agent_conf
@@ -55,7 +55,7 @@ from apps.agent.constants import (
 )
 from apps.agent.llm.client import get_client
 from apps.agent.llm.errors import INTERNAL, classify
-from apps.agent.llm.gate import CancelRequested, GateStop, before_request
+from apps.agent.llm.gate import CancelRequested, GateStop, before_request, budget_stop
 from apps.agent.llm.request import MAX_OUTPUT_TOKENS, build_turn_request
 from apps.agent.llm.usage import UsageTotals, estimate_output_tokens, record_request_usage
 from apps.agent.runtime import wire
@@ -76,6 +76,9 @@ MAX_STREAM_RETRIES = 2
 # Seconds before each in-run retry of an overloaded or broken stream.
 RETRY_DELAYS = (2.0, 6.0)
 BREAKER = CircuitBreaker("llm:claude-agent", failure_threshold=5, recovery_timeout=60)
+
+RUN_TIMEOUT = GateStop("run_timeout", "This reply took too long and was stopped.",
+                       retryable=True)
 
 _TERMINAL_PART_STATUS = {"done", "error", "cancelled", "unavailable", "partial",
                          "interrupted"}
@@ -136,20 +139,21 @@ def fail_unstarted(run_id) -> None:
         message_id = (AgentRun.objects.filter(id=run_id)
                       .values_list("assistant_message_id", flat=True).first())
         now = timezone.now()
-        failed = AgentRun.objects.filter(id=run_id, status__in=ACTIVE_RUN_STATUSES).update(
-            status=RunStatus.FAILED, error_code=INTERNAL.code, error_message=INTERNAL.message,
-            finished_at=now,
-        )
-        if failed and message_id:
-            AgentMessage.objects.filter(id=message_id).update(
-                status=MessageStatus.FAILED, error_code=INTERNAL.code,
+        with transaction.atomic():
+            failed = AgentRun.objects.filter(id=run_id, status__in=ACTIVE_RUN_STATUSES).update(
+                status=RunStatus.FAILED, error_code=INTERNAL.code,
                 error_message=INTERNAL.message, finished_at=now,
             )
-        if failed:
-            AgentSwarmVersion.objects.filter(
-                run_id=run_id, status__in=ACTIVE_VERSION_STATUSES,
-            ).update(status=VersionStatus.ERROR, error_code=INTERNAL.code,
-                     error_message=INTERNAL.message, finished_at=now)
+            if failed and message_id:
+                AgentMessage.objects.filter(id=message_id).update(
+                    status=MessageStatus.FAILED, error_code=INTERNAL.code,
+                    error_message=INTERNAL.message, finished_at=now,
+                )
+            if failed:
+                AgentSwarmVersion.objects.filter(
+                    run_id=run_id, status__in=ACTIVE_VERSION_STATUSES,
+                ).update(status=VersionStatus.ERROR, error_code=INTERNAL.code,
+                         error_message=INTERNAL.message, finished_at=now)
     except Exception:
         logger.exception("agent run %s could not be marked failed", run_id)
     store = get_event_store()
@@ -175,6 +179,9 @@ class TurnRunner:
         self.emitter = RunEmitter(run, self.message)
         self.started = time.monotonic()
         self.totals = UsageTotals()
+        # add_usage may come from a research agent's thread that outlived
+        # its task (its usage arrived after the research ended).
+        self._usage_lock = threading.RLock()
         self.history = wire.history_of(wire.path_to(self.user_message))
         self.turn_wire: list[dict] = wire.loads(self.message.wire)
         self.request_index = 0
@@ -210,6 +217,7 @@ class TurnRunner:
             except Exception as exc:
                 logger.exception("agent run %s failed", self.run.id)
                 ending = Ending(MessageStatus.FAILED, error=classify(exc).as_payload())
+            ending = self._overdue_ending(ending)
             self._inline_title()
             self._finish(ending)
         except Exception:
@@ -217,6 +225,15 @@ class TurnRunner:
             # Postgres restart): end it on a new connection.
             logger.exception("agent run %s could not be finished", self.run.id)
             self._finish_after_error(ending)
+
+    def _overdue_ending(self, ending: Ending) -> Ending:
+        """A run the heartbeat stopped for running past its deadline
+        (registry.ActiveRun.timed_out) fails with run_timeout, not as a
+        user's Stop."""
+        if (ending.message_status == MessageStatus.CANCELLED
+                and getattr(self.active, "timed_out", False)):
+            return Ending(MessageStatus.FAILED, error=RUN_TIMEOUT.as_payload())
+        return ending
 
     def _finish_after_error(self, ending: Ending) -> None:
         """Finish once more on new connections and, when even that fails,
@@ -341,12 +358,22 @@ class TurnRunner:
         return Ending(MessageStatus.CANCELLED if outcome.cancelled else MessageStatus.COMPLETE)
 
     def _gate(self) -> None:
-        before_request(self.run, started_monotonic=self.started, requests=self.totals.requests,
-                       cost_usd=self.totals.cost_usd, cancelled=self.active.cancelled)
+        with self._usage_lock:
+            requests, cost_usd = self.totals.requests, self.totals.cost_usd
+        before_request(self.run, started_monotonic=self.started, requests=requests,
+                       cost_usd=cost_usd, cancelled=self.active.cancelled)
         if not BREAKER.allow():
             raise GateStop("upstream_unavailable",
                            "The AI service is unavailable right now. Please try again shortly.",
                            retryable=True)
+
+    def _budget_stop(self, extra_usd: Decimal | None = None) -> GateStop | None:
+        """The run's deadline and cost ceiling, for tools between requests;
+        ``extra_usd`` is spend a tool has seen but not added yet."""
+        with self._usage_lock:
+            cost_usd = self.totals.cost_usd
+        return budget_stop(started_monotonic=self.started,
+                           cost_usd=cost_usd + Decimal(str(extra_usd or 0)))
 
     def _get_client(self):
         if self._client is None:
@@ -373,17 +400,21 @@ class TurnRunner:
         self.add_usage(totals)
 
     def add_usage(self, totals: UsageTotals) -> None:
+        """Add usage to the run: the orchestrator's requests, sub-agents',
+        research analyses and the AI engine answers its tools asked for.
+        Safe from another thread."""
         from apps.agent.models import AgentRun
 
-        self.totals.add(totals)
-        t = self.totals
-        AgentRun.objects.filter(id=self.run.id).update(
-            requests=t.requests, input_tokens=t.input_tokens, output_tokens=t.output_tokens,
-            cache_read_tokens=t.cache_read_tokens, cache_write_tokens=t.cache_write_tokens,
-            web_search_requests=t.web_search_requests, cost_usd=t.cost_usd,
-            usage_estimated=t.estimated,
-        )
-        self.emitter.emit(EventType.RUN_USAGE, **self._usage_payload())
+        with self._usage_lock:
+            self.totals.add(totals)
+            t = self.totals
+            AgentRun.objects.filter(id=self.run.id).update(
+                requests=t.requests, input_tokens=t.input_tokens, output_tokens=t.output_tokens,
+                cache_read_tokens=t.cache_read_tokens, cache_write_tokens=t.cache_write_tokens,
+                web_search_requests=t.web_search_requests, cost_usd=t.cost_usd,
+                usage_estimated=t.estimated,
+            )
+            self.emitter.emit_before_end(EventType.RUN_USAGE, **self._usage_payload())
 
     def _usage_payload(self) -> dict:
         t = self.totals
@@ -438,7 +469,8 @@ class TurnRunner:
             run=self.run, chat=self.chat, website=self.run.website, user=self.run.user,
             emitter=self.emitter, active=self.active, request=req_n, tool_use_id=tool_use_id,
             part_id=part_id, history_text=history_text, add_usage=self.add_usage,
-            check_gate=self._gate, inline=self.conf.run_mode == "inline",
+            check_gate=self._gate, budget_stop=self._budget_stop,
+            inline=self.conf.run_mode == "inline",
             # The research agents end before the run's own deadline.
             extra={"run_started": self.started},
         )
@@ -610,33 +642,41 @@ class TurnRunner:
             MessageStatus.FAILED: RunStatus.FAILED,
         }.get(status, RunStatus.COMPLETED)
         error = ending.error or {}
-        t = self.totals
-        if self._claimed is None:
-            self._claimed = bool(
-                AgentRun.objects.filter(id=self.run.id, status=RunStatus.RUNNING).update(
-                    status=run_status, stop_reason=ending.stop_reason,
-                    error_code=error.get("code", ""), error_message=error.get("message", ""),
-                    finished_at=now, last_seq=parts_seq,
-                )
-            )
-        claimed = self._claimed
-        self._end_versions(run_status, error)
+        with self._usage_lock:
+            usage = {**self._usage_payload(), "estimated": self.totals.estimated}
+            cost_usd = self.totals.cost_usd.quantize(Decimal("0.000001"))
         message_fields = {
             "wire": wire.dumps(self.turn_wire),
             "parts": parts,
             "parts_seq": parts_seq,
             "research": research,
             "model": self.model_used or "",
-            "usage": {**self._usage_payload(), "estimated": t.estimated},
-            "cost_usd": t.cost_usd.quantize(Decimal("0.000001")),
+            "usage": usage,
+            "cost_usd": cost_usd,
         }
-        if claimed:
-            message_fields.update(
-                status=status, stop_reason=ending.stop_reason,
-                error_code=error.get("code", ""), error_message=error.get("message", ""),
-                finished_at=now,
-            )
-        AgentMessage.objects.filter(id=self.message.id).update(**message_fields)
+        # The run's terminal status and its message's are written in one
+        # transaction: when the message write fails, the run stays running
+        # and the retry (_finish_after_error) or the sweeper ends both, so
+        # a finished run never leaves its reply "streaming".
+        with transaction.atomic():
+            claimed = self._claimed
+            if claimed is None:
+                claimed = bool(
+                    AgentRun.objects.filter(id=self.run.id, status=RunStatus.RUNNING).update(
+                        status=run_status, stop_reason=ending.stop_reason,
+                        error_code=error.get("code", ""), error_message=error.get("message", ""),
+                        finished_at=now, last_seq=parts_seq,
+                    )
+                )
+            self._end_versions(run_status, error)
+            if claimed:
+                message_fields.update(
+                    status=status, stop_reason=ending.stop_reason,
+                    error_code=error.get("code", ""), error_message=error.get("message", ""),
+                    finished_at=now,
+                )
+            AgentMessage.objects.filter(id=self.message.id).update(**message_fields)
+        self._claimed = claimed
         if not claimed:
             # The row was ended elsewhere (the sweeper); tell local readers.
             if not self.emitter.ended:

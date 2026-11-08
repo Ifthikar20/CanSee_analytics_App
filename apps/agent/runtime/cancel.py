@@ -8,6 +8,7 @@ the runner finishes the run as cancelled, keeping what is safe to keep.
 """
 from __future__ import annotations
 
+from django.db import transaction
 from django.utils import timezone
 
 from apps.agent.constants import (
@@ -31,16 +32,20 @@ def request_cancel(run) -> str:
     AgentRun.objects.filter(id=run.id, cancel_requested_at__isnull=True).update(
         cancel_requested_at=now,
     )
-    cancelled = AgentRun.objects.filter(id=run.id, status=RunStatus.QUEUED).update(
-        status=RunStatus.CANCELLED, finished_at=now,
-    )
+    # The run and its message end together: a reader never sees a stopped
+    # run whose reply still says streaming.
+    with transaction.atomic():
+        cancelled = AgentRun.objects.filter(id=run.id, status=RunStatus.QUEUED).update(
+            status=RunStatus.CANCELLED, finished_at=now,
+        )
+        if cancelled:
+            AgentMessage.objects.filter(id=run.assistant_message_id).update(
+                status=MessageStatus.CANCELLED, finished_at=now,
+            )
+            AgentSwarmVersion.objects.filter(run_id=run.id, status=VersionStatus.QUEUED).update(
+                status=VersionStatus.CANCELLED, finished_at=now,
+            )
     if cancelled:
-        AgentMessage.objects.filter(id=run.assistant_message_id).update(
-            status=MessageStatus.CANCELLED, finished_at=now,
-        )
-        AgentSwarmVersion.objects.filter(run_id=run.id, status=VersionStatus.QUEUED).update(
-            status=VersionStatus.CANCELLED, finished_at=now,
-        )
         store = get_event_store()
         if store.has(run.id):
             store.append(str(run.id), {
@@ -50,6 +55,9 @@ def request_cancel(run) -> str:
                 "ts": now_iso(),
             })
         get_registry().unregister(run.id)
+        from apps.agent.runtime.dispatch import withdraw
+
+        withdraw(run.id)
         return RunStatus.CANCELLED
     get_registry().cancel_local(run.id)
     return AgentRun.objects.filter(id=run.id).values_list("status", flat=True).first() or run.status
