@@ -10,13 +10,18 @@ ran." result, a paused server tool call without its result goes). The
 celery beat task runs it every minute; reading a chat runs it for that
 chat; the agent process ends a run another executor left behind as soon
 as a reader asks for it.
+
+The same sweeps settle a reply still ``streaming`` whose run has ended
+(``settle_stranded_messages``): it ends as its run did, so it never shows
+a spinner forever and can be regenerated.
 """
 from __future__ import annotations
 
 import logging
 from datetime import timedelta
 
-from django.db.models import F
+from django.db import transaction
+from django.db.models import F, Q
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 
@@ -25,6 +30,7 @@ from apps.agent.constants import (
     ACTIVE_RUN_STATUSES,
     ACTIVE_VERSION_STATUSES,
     LIVE_SWARM_STATUSES,
+    TERMINAL_RUN_STATUSES,
     EventType,
     MessageStatus,
     PartType,
@@ -40,6 +46,10 @@ logger = logging.getLogger("apps")
 _DONE = {"done", "error", "cancelled", "unavailable", "partial", "interrupted"}
 _OPEN_TASK = ("queued", "running")
 INTERRUPTED_VERSION_MESSAGE = "The agent process stopped before this research finished."
+INTERRUPTED_MESSAGE = "The agent process stopped before this reply finished."
+NOT_SAVED_MESSAGE = "This reply was not saved completely."
+# A reply is settled only once its run ended this long ago.
+STRANDED_GRACE_SECONDS = 30
 
 
 def _interrupt_swarm(part: dict) -> dict:
@@ -87,6 +97,15 @@ def _close_parts(parts: list[dict]) -> list[dict]:
     return out
 
 
+def _closed_turn(message) -> list:
+    """The message's stored wire, valid for the next turn."""
+    try:
+        return wire.close_turn(wire.loads(message.wire))
+    except ValueError:
+        logger.warning("agent: unreadable wire on message %s", message.id)
+        return wire.loads(message.wire) if message.wire else []
+
+
 def interrupt_runs(run_ids, *, reason: str) -> int:
     """Move these runs (when still active) to interrupted. Returns how many."""
     from apps.agent.models import AgentMessage, AgentRun, AgentSwarmVersion
@@ -96,30 +115,29 @@ def interrupt_runs(run_ids, *, reason: str) -> int:
     runs = AgentRun.objects.filter(id__in=list(run_ids), status__in=ACTIVE_RUN_STATUSES)
     for run in runs.select_related("assistant_message"):
         now = timezone.now()
-        updated = AgentRun.objects.filter(id=run.id, status=run.status).update(
-            status=RunStatus.INTERRUPTED, finished_at=now, error_code="interrupted",
-            error_message="The agent process stopped before this reply finished.",
-        )
-        if not updated:
-            continue
         message = run.assistant_message
-        try:
-            turn = wire.close_turn(wire.loads(message.wire))
-        except ValueError:
-            logger.warning("agent: unreadable wire on message %s", message.id)
-            turn = wire.loads(message.wire) if message.wire else []
-        AgentMessage.objects.filter(id=message.id).update(
-            status=MessageStatus.INTERRUPTED,
-            wire=wire.dumps(turn),
-            parts=strip_nul(_close_parts(message.parts)),
-            error_code="interrupted",
-            error_message="The agent process stopped before this reply finished.",
-            finished_at=now,
-        )
-        AgentSwarmVersion.objects.filter(run_id=run.id, status__in=ACTIVE_VERSION_STATUSES).update(
-            status=VersionStatus.INTERRUPTED, finished_at=now, error_code="interrupted",
-            error_message=INTERRUPTED_VERSION_MESSAGE,
-        )
+        # The run and its message end together (see settle_stranded_messages).
+        with transaction.atomic():
+            updated = AgentRun.objects.filter(id=run.id, status=run.status).update(
+                status=RunStatus.INTERRUPTED, finished_at=now, error_code="interrupted",
+                error_message=INTERRUPTED_MESSAGE,
+            )
+            if not updated:
+                continue
+            AgentMessage.objects.filter(id=message.id).update(
+                status=MessageStatus.INTERRUPTED,
+                wire=wire.dumps(_closed_turn(message)),
+                parts=strip_nul(_close_parts(message.parts)),
+                error_code="interrupted",
+                error_message=INTERRUPTED_MESSAGE,
+                finished_at=now,
+            )
+            AgentSwarmVersion.objects.filter(
+                run_id=run.id, status__in=ACTIVE_VERSION_STATUSES,
+            ).update(
+                status=VersionStatus.INTERRUPTED, finished_at=now, error_code="interrupted",
+                error_message=INTERRUPTED_VERSION_MESSAGE,
+            )
         if store.has(run.id):
             store.append(str(run.id), {
                 "type": EventType.RUN_INTERRUPTED,
@@ -166,15 +184,66 @@ def _stale(qs, now=None):
             .values_list("id", flat=True))
 
 
+def _stranded_ending(run) -> tuple[str, str, str]:
+    """(message status, error code, error message) for the reply of an
+    ended run: what the run ended as. A completed run whose reply was not
+    saved ends interrupted, since its stored parts may be short."""
+    if run.status == RunStatus.CANCELLED:
+        return MessageStatus.CANCELLED, "", ""
+    if run.status == RunStatus.FAILED:
+        return (MessageStatus.FAILED, run.error_code or "internal_error",
+                run.error_message or "Something went wrong.")
+    if run.status == RunStatus.INTERRUPTED:
+        return (MessageStatus.INTERRUPTED, run.error_code or "interrupted",
+                run.error_message or INTERRUPTED_MESSAGE)
+    return MessageStatus.INTERRUPTED, "interrupted", NOT_SAVED_MESSAGE
+
+
+def settle_stranded_messages(qs=None, now=None) -> int:
+    """Replies still ``streaming`` whose run ended at least
+    STRANDED_GRACE_SECONDS ago (a write that failed after the run's) end
+    as their run did, with their open parts closed and a wire the next
+    turn can follow. Returns how many."""
+    from apps.agent.models import AgentMessage, AgentRun
+
+    now = now or timezone.now()
+    cutoff = now - timedelta(seconds=STRANDED_GRACE_SECONDS)
+    runs = (qs if qs is not None else AgentRun.objects.all()).filter(
+        Q(finished_at__lt=cutoff) | Q(finished_at__isnull=True, created_at__lt=cutoff),
+        status__in=TERMINAL_RUN_STATUSES,
+        assistant_message__status=MessageStatus.STREAMING,
+    ).select_related("assistant_message")
+    count = 0
+    for run in runs:
+        message = run.assistant_message
+        status, code, text = _stranded_ending(run)
+        count += AgentMessage.objects.filter(
+            id=message.id, status=MessageStatus.STREAMING,
+        ).update(
+            status=status, error_code=code, error_message=text,
+            wire=wire.dumps(_closed_turn(message)),
+            parts=strip_nul(_close_parts(message.parts)),
+            finished_at=run.finished_at or now,
+        )
+    if count:
+        logger.warning("agent: %d reply(ies) left streaming after their run ended were settled",
+                       count)
+    return count
+
+
 def sweep_stale_runs(now=None) -> int:
     from apps.agent.models import AgentRun
 
-    return interrupt_runs(list(_stale(AgentRun.objects.all(), now)), reason="stale")
+    interrupted = interrupt_runs(list(_stale(AgentRun.objects.all(), now)), reason="stale")
+    settle_stranded_messages(now=now)
+    return interrupted
 
 
 def sweep_chat(chat_id, now=None) -> int:
     """The lazy sweep when a chat is read."""
     from apps.agent.models import AgentRun
 
-    return interrupt_runs(list(_stale(AgentRun.objects.filter(chat_id=chat_id), now)),
-                          reason="stale")
+    interrupted = interrupt_runs(list(_stale(AgentRun.objects.filter(chat_id=chat_id), now)),
+                                 reason="stale")
+    settle_stranded_messages(AgentRun.objects.filter(chat_id=chat_id), now=now)
+    return interrupted

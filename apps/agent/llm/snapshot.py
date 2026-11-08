@@ -34,7 +34,8 @@ def snapshot_payload(agent_key: str = DEFAULT_ENTRY_AGENT) -> dict:
     return {
         "agent_key": agent_key,
         "version": orchestrator.VERSION,
-        "system": orchestrator.SYSTEM_PROMPT,
+        # The research agents' ceiling is in the text (AGENT_SWARM_MAX_TASKS).
+        "system": orchestrator.system_prompt(conf.swarm_max_tasks),
         "tools": tools,
         "config": {
             "model": conf.model,

@@ -56,8 +56,28 @@ class ToolContext:
     add_usage: Callable[[Any], None] | None = None
     # Raises when the next model request must not go out (llm.gate).
     check_gate: Callable[[], None] | None = None
+    # The GateStop that ends the run when it is past its deadline or cost
+    # ceiling (optionally counting an amount not yet added), else None
+    # (llm.gate.budget_stop); for work between model requests.
+    budget_stop: Callable[..., Any] | None = None
     inline: bool = False
     extra: dict = field(default_factory=dict)
 
     def cancelled(self) -> bool:
         return bool(self.active is not None and self.active.cancelled)
+
+    def over_budget(self, extra_usd=None):
+        """The GateStop that ends the run now (its deadline, or its cost
+        plus ``extra_usd`` not yet added to it), or None."""
+        if self.budget_stop is None:
+            return None
+        return self.budget_stop(extra_usd) if extra_usd else self.budget_stop()
+
+    def add_engine_usage(self, capture) -> None:
+        """Add the AI engine answers a core.ai_tracking capture saw to the
+        run's cost (they are not model requests of the run)."""
+        if self.add_usage is None or capture is None or not capture.rows:
+            return
+        from apps.agent.llm.usage import engine_usage
+
+        self.add_usage(engine_usage(capture))

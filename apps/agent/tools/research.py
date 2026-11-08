@@ -9,12 +9,14 @@ the pane.
 """
 from __future__ import annotations
 
+import dataclasses
 import logging
 import re
 import threading
 import uuid
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timedelta
+from decimal import Decimal
 
 from django.db import close_old_connections, connections
 from django.db.models import Q
@@ -25,7 +27,8 @@ from apps.agent.conf import agent_conf
 from apps.agent.constants import EventType, MessageRole, PartType
 from apps.agent.runtime.events import now_iso
 from apps.agent.tools.context import ToolContext, ToolError, ToolResult
-from apps.agent.tools.shaping import clip, display_url, host_of, untrusted
+from apps.agent.tools.shaping import clip, compact, display_url, host_of, untrusted
+from core.ai_tracking import capture_usage
 
 logger = logging.getLogger("apps")
 
@@ -1020,26 +1023,67 @@ def check_ai_engines(ctx: ToolContext, args) -> ToolResult:
         if not parts[pid]:
             finish(pid, None, None)
     to_crawl = [pid for pid in order if parts[pid]]
+    # The engines' answers cost the run money: each crawl's spend is
+    # captured and added to the run, and the run's deadline and cost
+    # ceiling are checked before every engine is asked (should_stop) and
+    # between prompts. ``inflight`` is spend seen but not yet added.
+    halted = threading.Event()
+    inflight_lock = threading.Lock()
+    inflight: dict[str, object] = {}
+    # pid -> the capture of a crawl that ended, until its spend is added.
+    crawled: dict[str, object] = {}
+    budget: dict[str, object] = {"stop": None}
+
+    def pending_usd():
+        with inflight_lock:
+            return sum((c.cost_usd for c in inflight.values()), Decimal("0"))
+
+    def over_budget():
+        stop = ctx.over_budget(pending_usd())
+        if stop is not None and budget["stop"] is None:
+            budget["stop"] = stop
+        return stop
+
+    def should_stop() -> bool:
+        return ctx.cancelled() or halted.is_set() or over_budget() is not None
+
+    def crawl(pid: str, *, close_db: bool):
+        """(outcome, failure) of one prompt's crawl, its spend added."""
+        with capture_usage() as captured:
+            with inflight_lock:
+                inflight[pid] = captured
+            try:
+                return _crawl(ctx.website, found[pid].prompt, ctx.user, close_db=close_db,
+                              should_stop=should_stop), None
+            except Exception:
+                logger.warning("agent: crawl_prompt failed", exc_info=True)
+                return None, "The scan failed."
+            finally:
+                crawled[pid] = captured
+
+    def settle(pid: str) -> None:
+        """Add a finished crawl's spend to the run (the run's thread only)."""
+        captured = crawled.pop(pid, None)
+        ctx.add_engine_usage(captured)
+        with inflight_lock:
+            inflight.pop(pid, None)
+
     if ctx.inline:
         # Tests and inline runs: the crawl sees this thread's transaction.
         for i, pid in enumerate(to_crawl):
-            if ctx.cancelled():
+            if ctx.cancelled() or over_budget() is not None:
                 stop_remaining(to_crawl[i:])
                 break
             start(pid)
-            try:
-                outcome, failure = _crawl(ctx.website, found[pid].prompt, ctx.user,
-                                          close_db=False, should_stop=ctx.cancelled), None
-            except Exception:
-                logger.warning("agent: crawl_prompt failed", exc_info=True)
-                outcome, failure = None, "The scan failed."
+            outcome, failure = crawl(pid, close_db=False)
+            settle(pid)
             finish(pid, outcome, failure)
             em.checkpoint(force=True)
     else:
         # Workers start a prompt only while the check is still listening;
-        # after Stop they leave its parts alone.
+        # after Stop, or once the run is past its deadline or cost ceiling,
+        # they leave its parts alone.
         lock = threading.Lock()
-        halted = threading.Event()
 
         def work(pid: str):
             with lock:
@@ -1047,12 +1091,8 @@ def check_ai_engines(ctx: ToolContext, args) -> ToolResult:
                     return pid, None, "stopped"
                 start(pid)
             close_old_connections()
-            try:
-                return pid, _crawl(ctx.website, found[pid].prompt, ctx.user, close_db=True,
-                                   should_stop=ctx.cancelled), None
-            except Exception:
-                logger.warning("agent: crawl_prompt failed", exc_info=True)
-                return pid, None, "The scan failed."
+            outcome, failure = crawl(pid, close_db=True)
+            return pid, outcome, failure
 
         pool = ThreadPoolExecutor(max_workers=ENGINE_WORKERS, thread_name_prefix="agent-engines")
         pending = {pool.submit(work, pid): pid for pid in to_crawl}
@@ -1062,12 +1102,13 @@ def check_ai_engines(ctx: ToolContext, args) -> ToolResult:
                 for future in done:
                     del pending[future]
                     pid, outcome, failure = future.result()
+                    settle(pid)
                     if failure == "stopped":
                         stop_remaining([pid])
                         continue
                     finish(pid, outcome, failure)
                     em.checkpoint(force=True)
-                if pending and ctx.cancelled():
+                if pending and (ctx.cancelled() or over_budget() is not None):
                     with lock:
                         halted.set()
                     stop_remaining(pending.values())
@@ -1077,7 +1118,23 @@ def check_ai_engines(ctx: ToolContext, args) -> ToolResult:
             # (should_stop) and end in the background, storing the answers
             # they already have as usual; the run does not wait for them.
             pool.shutdown(wait=not halted.is_set(), cancel_futures=True)
+            # What those crawls already spent counts toward the run.
+            with inflight_lock:
+                left = [dataclasses.replace(c) for c in inflight.values()]
+                inflight.clear()
+                crawled.clear()
+            for captured in left:
+                ctx.add_engine_usage(captured)
 
+    stop = budget["stop"]
+    if stop is not None and not ctx.cancelled() and len(results) < len(order):
+        # Past the run's deadline or cost ceiling: the run ends with what
+        # was answered (the runner answers the call with this result).
+        stop.tool_result = ToolResult.error(compact({
+            "error": stop.message,
+            "prompts": [results[pid] for pid in order if pid in results],
+        }), summary="Stopped")
+        raise stop
     if ctx.cancelled() and len(results) < len(order):
         raise ToolError("Stopped before every engine answered.", summary="Stopped")
     payload = {

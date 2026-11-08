@@ -494,16 +494,16 @@ DEFINITIONS: dict[str, dict] = {
     },
     "research_swarm": {
         "description": (
-            "Run the research agents: a team of up to 30 agents that work in parallel on 1 to 5 "
-            "buyer prompts, each doing one real step: fetching one Google results page, asking "
+            "Run the research agents: a team of up to {max_agents} agents that work in parallel on "
+            "1 to 5 buyer prompts, each doing one real step: fetching one Google results page, asking "
             "one AI engine one prompt, reading one competitor page or the brand's own page, or "
             "analyzing content gaps or cited sources. The user sees every agent's status live. "
             "Returns one consolidated table: per prompt the Google position, the AI Overview, "
             "each engine's mention and rank, the brands ahead, the cited sources and the gap "
             "class, plus the content gaps and the cited sources. Agents per prompt = Google pages "
             "+ engines asked + competitor pages + 2 when content_gaps is on + 1 when citations is "
-            "on; at most 30 in total. Pass rerun_of with an earlier result's swarm_id, and "
-            "nothing else, to run the same research again with fresh data. Google pages and "
+            "on; at most {max_agents} in total. Pass rerun_of with an earlier result's swarm_id, "
+            "and nothing else, to run the same research again with fresh data. Google pages and "
             "engine answers cost money and use the project's allowances."
         ),
         "input_schema": _object({
@@ -573,6 +573,16 @@ DEFINITIONS: dict[str, dict] = {
         }),
     },
 }
+
+# Placeholder in a description for the research agents' ceiling.
+MAX_AGENTS_TOKEN = "{max_agents}"
+
+
+def tool_description(name: str, *, max_agents: int) -> str:
+    """The description of tool ``name`` with the research agents' ceiling
+    (AGENT_SWARM_MAX_TASKS) filled in."""
+    return DEFINITIONS[name]["description"].replace(MAX_AGENTS_TOKEN, str(max_agents))
+
 
 MODELS: dict[str, type[_Input]] = {
     "get_project_overview": GetProjectOverviewInput,

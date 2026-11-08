@@ -17,7 +17,12 @@ from rest_framework import status
 from rest_framework.renderers import JSONRenderer
 from rest_framework.response import Response
 
-from apps.agent.api.v1.serializers import MessageSerializer, RunSerializer, SwarmRerunSerializer
+from apps.agent.api.v1.serializers import (
+    MessageSerializer,
+    RunSerializer,
+    SwarmRerunSerializer,
+    run_queue,
+)
 from apps.agent.api.v1.stream import open_reads, run_ended
 from apps.agent.api.v1.views import AgentAPIView, _validated
 from apps.agent.conf import agent_conf
@@ -172,7 +177,8 @@ def _int_param(value, default: int, *, low: int, high: int) -> int:
 class RunEventsView(_LiveView):
     """GET ?after=&wait=: the run's events after ``after``, waiting up to
     ``wait`` (max 25) seconds for new ones. Not enveloped:
-    {events, next_after, terminal, run_status}. A run that has already
+    {events, next_after, terminal, run_status, queue}; ``queue`` is the
+    contract RunQueue while the run waits for a free thread. A run that has already
     ended answers at once; a user holds at most MAX_OPEN_READS_PER_USER
     polls and streams open at a time (429 too_many_streams)."""
 
@@ -203,11 +209,12 @@ class RunEventsView(_LiveView):
         finally:
             release()
         run.refresh_from_db(fields=["status"])
+        queue = run_queue(run)
         if result.resync is not None:
             event = resync_event(run.id, run.assistant_message_id, after=after,
                                  reason=result.resync)
             return Response({"events": [event], "next_after": after, "terminal": False,
-                             "run_status": run.status})
+                             "run_status": run.status, "queue": queue})
         events = result.events
         # Nothing more will come once the run has ended and nothing is left.
         finished = not events and run.status in TERMINAL_RUN_STATUSES
@@ -216,4 +223,5 @@ class RunEventsView(_LiveView):
             "next_after": events[-1]["seq"] if events else after,
             "terminal": result.terminal or finished,
             "run_status": run.status,
+            "queue": queue,
         })

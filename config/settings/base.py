@@ -518,9 +518,15 @@ AGENT_SHEET_MAX_TOKENS = env.int("AGENT_SHEET_MAX_TOKENS", default=16000)
 AGENT_MAX_REQUESTS_PER_RUN = env.int("AGENT_MAX_REQUESTS_PER_RUN", default=24)
 AGENT_RUN_MAX_SECONDS = env.int("AGENT_RUN_MAX_SECONDS", default=1200)
 AGENT_RUN_MAX_COST_USD = env.float("AGENT_RUN_MAX_COST_USD", default=3.0)
-# Global executor size, and active runs allowed per user.
-AGENT_MAX_CONCURRENT_RUNS = env.int("AGENT_MAX_CONCURRENT_RUNS", default=4)
-AGENT_USER_ACTIVE_RUNS = env.int("AGENT_USER_ACTIVE_RUNS", default=1)
+# Replies the agent process runs at once (its run threads), and replies one
+# user may have running at once across their chats (one per chat always).
+# A reply sent while every run thread is busy waits for one; its run reports
+# its place in line (run.queued, and "queue" on the run). Each run thread
+# can hold a research for up to AGENT_SWARM_MAX_SECONDS and a reply for up to
+# AGENT_RUN_MAX_SECONDS. More parallel replies per user spend the monthly AI
+# allowance faster; the allowance and the per-reply cost cap still apply.
+AGENT_MAX_CONCURRENT_RUNS = env.int("AGENT_MAX_CONCURRENT_RUNS", default=6)
+AGENT_USER_ACTIVE_RUNS = env.int("AGENT_USER_ACTIVE_RUNS", default=2)
 # Prompt-cache TTL ("5m" or "1h") for the system prompt and the history.
 AGENT_CACHE_TTL = env("AGENT_CACHE_TTL", default="1h")
 # Server-side refusal fallback (beta server-side-fallback-2026-07-01).
@@ -546,10 +552,20 @@ AGENT_CHAT_RETENTION_DAYS = env.int("AGENT_CHAT_RETENTION_DAYS", default=0)
 # and AGENT_SWARM_PROCESS_WORKERS across the agent process, with limits per
 # provider on Google results, page fetches, engine requests (per engine)
 # and analysis requests. A swarm stops after AGENT_SWARM_MAX_SECONDS.
+# AGENT_SWARM_MAX_TASKS is the one ceiling: the tool refuses larger plans and
+# the orchestrator's prompt and tool description state it (a new value
+# reaches new chats; older chats keep the text they started with). 50 fits
+# 5 prompts with every engine, one Google and one competitor page, content
+# gaps and citations: about $0.89 of AI allowance at most (report included),
+# plus 5 Google results pages (up to 10 with two pages a prompt) the platform
+# pays for and no allowance counts (SERPAPI_COST_PER_SEARCH_USD each).
+# Raising the worker counts without the per-provider limits below only
+# queues tasks; raise those only within the SerpAPI or ScraperAPI plan's
+# concurrency and each engine's rate limits, or tasks fail with 429s.
 AGENT_SWARM_ENABLED = env.bool("AGENT_SWARM_ENABLED", default=True)
-AGENT_SWARM_MAX_TASKS = env.int("AGENT_SWARM_MAX_TASKS", default=30)
-AGENT_SWARM_WORKERS = env.int("AGENT_SWARM_WORKERS", default=6)
-AGENT_SWARM_PROCESS_WORKERS = env.int("AGENT_SWARM_PROCESS_WORKERS", default=12)
+AGENT_SWARM_MAX_TASKS = env.int("AGENT_SWARM_MAX_TASKS", default=50)
+AGENT_SWARM_WORKERS = env.int("AGENT_SWARM_WORKERS", default=8)
+AGENT_SWARM_PROCESS_WORKERS = env.int("AGENT_SWARM_PROCESS_WORKERS", default=16)
 AGENT_SWARM_SERP_CONCURRENCY = env.int("AGENT_SWARM_SERP_CONCURRENCY", default=5)
 AGENT_SWARM_BROWSE_CONCURRENCY = env.int("AGENT_SWARM_BROWSE_CONCURRENCY", default=6)
 AGENT_SWARM_ENGINE_CONCURRENCY = env.int("AGENT_SWARM_ENGINE_CONCURRENCY", default=3)

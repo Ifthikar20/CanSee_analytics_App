@@ -3,7 +3,8 @@ answer (design section 8b).
 
 The engine is asked through the prompt's EngineScan, which stores the
 answer the way crawl_prompt does (result row, extraction, citations), so
-the prompt page and Overview show it. The analysis (what the answer
+the prompt page and Overview show it. What that costs is added to the
+run's cost. The analysis (what the answer
 recommends and why, and what the brand could change) is a second step:
 when it fails the task is still done, with ``analysis_error``.
 """
@@ -22,6 +23,7 @@ from apps.agent.runtime.swarm.context import (
     skipped,
 )
 from apps.agent.tools.shaping import clip, host_of
+from core.ai_tracking import capture_usage
 
 MAX_BRANDS = 10
 MAX_BRANDS_ABOVE = 6
@@ -161,8 +163,14 @@ def run(job: TaskJob) -> WorkerOutput:
     if not _configured(provider):
         return skipped("not_configured", f"{_key_setting(provider)} is not set.")
     job.check()
-    answer = scan.ask(provider, variant, should_stop=job.stopped,
-                      on_step=lambda _step: job.reporter.step(f"Reading {label}'s answer"))
+    # The engine's answer (and its extraction) is real spend: it counts
+    # toward the run's cost and its cost ceiling, as no model request.
+    with capture_usage() as captured:
+        try:
+            answer = scan.ask(provider, variant, should_stop=job.stopped,
+                              on_step=lambda _step: job.reporter.step(f"Reading {label}'s answer"))
+        finally:
+            swarm_run.add_engine_usage(captured)
     job.release_primary()
     if answer.stopped:
         raise TaskStopped()

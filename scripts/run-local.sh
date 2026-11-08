@@ -101,11 +101,30 @@ ensure_env() {
     say "Creating a minimal .env (add API keys to it later)"
     local content
     content='# Local development settings, created by scripts/run-local.sh.
-# Add provider keys here to run real scans, for example:
-# ANTHROPIC_API_KEY=...  OPENAI_API_KEY=...  GEMINI_API_KEY=...
-# PERPLEXITY_API_KEY=...  XAI_API_KEY=...  SERPAPI_KEY=...  SCRAPERAPI_KEY=...
+# Uncomment and fill in provider keys to run real scans and the agent
+# workspace (/agent), then run scripts/run-local.sh again. Every other
+# setting is listed in .env.prod.example.
 # FIELD_ENCRYPTION_KEY is optional locally (secrets are then stored
 # unencrypted, with a warning); generate one with: make generate-key
+#
+# The agent is on in dev and needs only keys. Required for chats, the
+# writers and the research agents (the key needs the models
+# claude-opus-5-5 and claude-haiku-5-5):
+# ANTHROPIC_API_KEY=
+# Google results for scans and research (one of the two):
+# SERPAPI_KEY=
+# SCRAPERAPI_KEY=
+# The AI engines scans and research ask. An engine without a key is
+# skipped and shown as not set up, never faked:
+# OPENAI_API_KEY=
+# GEMINI_API_KEY=
+# PERPLEXITY_API_KEY=
+# XAI_API_KEY=
+# An account without a subscription has a small monthly AI allowance,
+# which an agent reply or two can use up. Raise it for local testing:
+# AI_FREE_MONTHLY_CAP_USD=20
+# Turn the agent off:
+# AGENT_ENABLED=false
 DEBUG=true
 PUBLIC_SCHEME=http
 ALLOWED_HOSTS=localhost,127.0.0.1

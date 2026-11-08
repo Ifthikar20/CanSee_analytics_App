@@ -39,6 +39,15 @@ class UsageTotals:
         self.estimated = self.estimated or other.estimated
 
 
+def engine_usage(capture) -> UsageTotals:
+    """What AI engine answers (a core.ai_tracking.capture_usage capture)
+    add to a run: their cost. They are no model request of the run (the
+    request cap counts the agent's own) and their tokens are another
+    provider's, so only the cost is added; their ledger rows are already
+    written by the provider call."""
+    return UsageTotals(requests=0, cost_usd=Decimal(str(capture.cost_usd)))
+
+
 def estimate_output_tokens(chars: int) -> int:
     """A conservative token count for streamed text whose usage never came
     (about 3 characters per token, rounded up)."""
