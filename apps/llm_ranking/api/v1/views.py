@@ -59,6 +59,15 @@ class LLMRankingAuditListView(TenantScopedListAPIView):
         if cap > 0:
             spent = month_to_date_cost(request.user)
             if spent >= cap:
+                from apps.metering.services import prompt_runs
+
+                if prompt_runs.is_limited(request.user, website):
+                    # Free accounts count prompt runs and never see dollars.
+                    return Response(
+                        {"error": "monthly_ai_cost_cap_exceeded",
+                         "detail": prompt_runs.ALLOWANCE_USED_FREE},
+                        status=402,
+                    )
                 return Response(
                     {
                         "error": "monthly_ai_cost_cap_exceeded",
@@ -1285,11 +1294,15 @@ class LLMRankingScheduleRunNowView(TenantScopedAPIView):
         from core.ai_tracking import effective_ai_cap, month_to_date_cost
         cap = effective_ai_cap(request.user)
         if cap > 0 and month_to_date_cost(request.user) >= cap:
+            from apps.metering.services import prompt_runs
+
             return Response(
                 {
                     "error": "monthly_ai_cost_cap_exceeded",
                     "code": "ai_allowance_exceeded",
-                    "detail": (
+                    # Free accounts count prompt runs and never see dollars.
+                    "detail": prompt_runs.ALLOWANCE_USED_FREE
+                    if prompt_runs.is_limited(request.user, website) else (
                         f"This account has used its ${cap:.2f} monthly AI "
                         f"allowance. It resets on the 1st of next month."
                     ),
