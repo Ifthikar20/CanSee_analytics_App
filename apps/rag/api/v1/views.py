@@ -28,6 +28,7 @@ from apps.rag.models import AgentCrawlConsent, KnowledgeChunk, KnowledgeSource
 from apps.rag.services.ingest_service import ingest_url, pending_chunks
 from apps.rag.services.retriever import retrieve
 from core.interceptors.pagination import StandardPagination
+from core.interceptors.response_envelope import PageResponse
 from core.resilience import TokenBucket
 from core.views.base import TenantScopedAPIView
 
@@ -140,7 +141,7 @@ class KnowledgeSourceListView(TenantScopedAPIView):
             resp.data["stats"] = stats
             return resp
 
-        return Response({"results": data, "stats": stats})
+        return PageResponse({"results": data, "stats": stats})
 
     def post(self, request, website_id):
         website = self.get_website(website_id)

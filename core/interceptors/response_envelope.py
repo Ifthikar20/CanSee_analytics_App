@@ -1,4 +1,34 @@
 from rest_framework.renderers import JSONRenderer
+from rest_framework.response import Response
+
+
+class PageResponse(Response):
+    """A response whose body is one page of a list.
+
+    ``{"results": [...], ...}`` built by hand (rather than by a DRF
+    paginator) must use this class so EnvelopeRenderer unpacks it into
+    ``data`` and ``meta``. A plain ``Response`` whose body merely has a
+    ``results`` key (an audit with its result rows, a search payload) is
+    left as it is.
+    """
+
+    paginated = True
+
+
+def is_page(data, response) -> bool:
+    """True when ``data`` is one page of a paginated list.
+
+    An explicit ``paginated`` attribute on the response wins. Otherwise the
+    body must have the shape every DRF paginator emits: a ``results`` list
+    beside ``next`` and ``previous`` links. A ``results`` key on its own is
+    not enough, because detail payloads use that name for nested rows.
+    """
+    if not isinstance(data, dict) or not isinstance(data.get("results"), list):
+        return False
+    flag = getattr(response, "paginated", None)
+    if flag is not None:
+        return bool(flag)
+    return "next" in data and "previous" in data
 
 
 class EnvelopeRenderer(JSONRenderer):
@@ -24,8 +54,7 @@ class EnvelopeRenderer(JSONRenderer):
             # Error responses already formatted by exception handler
             return super().render(data, accepted_media_type, renderer_context)
 
-        # Check if data is already wrapped (pagination does this)
-        if isinstance(data, dict) and "results" in data:
+        if is_page(data, response):
             meta = {
                 "count": data.get("count"),
                 "next": data.get("next"),
