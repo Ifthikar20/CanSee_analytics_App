@@ -2,7 +2,8 @@ import logging
 from datetime import timedelta
 
 from django.conf import settings
-from django.db.models import Avg, Count, Q
+from django.db import transaction
+from django.db.models import Avg, Count, F, Q
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.response import Response
@@ -413,35 +414,53 @@ class LLMRankingAuditRunView(TenantScopedAPIView):
                 status=status.HTTP_409_CONFLICT,
             )
 
-        # Reset to pending and clear old results for re-runs
-        if audit.status == LLMRankingAudit.STATUS_FAILED:
-            from apps.llm_ranking.services.ranking_service import SCORE_FIELDS
+        # Claim the run atomically: the row is locked and its status read
+        # again, so two overlapping requests (a double click, two tabs)
+        # cannot both pass the check and dispatch the scan twice.
+        with transaction.atomic():
+            claimed = (
+                LLMRankingAudit.objects.select_for_update()
+                .filter(
+                    id=audit.id,
+                    status__in=[LLMRankingAudit.STATUS_PENDING, LLMRankingAudit.STATUS_FAILED],
+                )
+                .first()
+            )
+            if claimed is None:
+                return Response(
+                    {"error": "A prompt run is already in progress."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            update_fields = ["status", "started_at", "updated_at"]
+            # Clear old results and scores for a re-run of a failed audit.
+            if claimed.status == LLMRankingAudit.STATUS_FAILED:
+                from apps.llm_ranking.services.ranking_service import SCORE_FIELDS
 
-            audit.results.all().delete()
-            audit.status = LLMRankingAudit.STATUS_PENDING
-            for field in SCORE_FIELDS:
-                setattr(audit, field, None)
-            audit.queries_completed = 0
-            audit.total_queries = 0
-            audit.error_message = ""
-            audit.save()
+                claimed.results.all().delete()
+                for field in SCORE_FIELDS:
+                    setattr(claimed, field, None)
+                claimed.queries_completed = 0
+                claimed.total_queries = 0
+                claimed.error_message = ""
+                update_fields += [
+                    *SCORE_FIELDS, "queries_completed", "total_queries", "error_message",
+                ]
+            # RUNNING up front so the polling UI shows a running state on
+            # the next tick. started_at stays empty until prepare_audit
+            # claims the preparation, which is what makes a duplicate
+            # delivery of the scan task a no-op.
+            claimed.status = LLMRankingAudit.STATUS_RUNNING
+            claimed.started_at = None
+            claimed.save(update_fields=update_fields)
 
         # Dispatch through the canonical scan dispatcher: Celery chord in
         # production (LLM_SCAN_MODE=celery), a background thread that
         # closes its DB connections in dev (LLM_SCAN_MODE=inline). Either
         # way the request returns immediately; the frontend polls
         # /audits/<id>/ every 5s while the audit is pending/running, so
-        # partial results stream in rather than the user staring at an
-        # 8-second blocking spinner.
+        # partial results stream in.
         from apps.llm_ranking.services.scan_dispatch import dispatch_scan
 
-        # Flip to RUNNING up front so the polling UI shows a running
-        # state on the next tick — without this, there's a 1-2 second
-        # window where status=pending and the frontend wouldn't know
-        # to poll the detail endpoint.
-        LLMRankingAudit.objects.filter(id=audit.id).update(
-            status=LLMRankingAudit.STATUS_RUNNING,
-        )
         dispatch_scan(str(audit.id))
 
         # Return the audit immediately. status=running tells the
@@ -937,16 +956,32 @@ class LLMRankingHistoryView(TenantScopedAPIView):
     GET — return historical aggregate, per-provider, and per-competitor stats
     for trend charts. The competitor visibility series powers the Brand
     Overview "Competitor Visibility" multi-line chart.
+
+    Bounded: the latest ``limit`` completed audits (default 100, at most
+    365), oldest first. Every per-prompt crawl completes its own audit, so
+    an unbounded history grows by one audit per scheduled prompt per day.
     """
+
+    DEFAULT_LIMIT = 100
+    MAX_LIMIT = 365
 
     def get(self, request, website_id):
         self.get_website(website_id)
-        audits = list(
+        try:
+            limit = int(request.query_params.get("limit", self.DEFAULT_LIMIT))
+        except (TypeError, ValueError):
+            limit = self.DEFAULT_LIMIT
+        limit = max(1, min(limit, self.MAX_LIMIT))
+        latest = list(
             LLMRankingAudit.objects
             .filter(website_id=website_id, status=LLMRankingAudit.STATUS_COMPLETED)
-            .order_by("completed_at")
+            .order_by(F("completed_at").desc(nulls_last=True), "-id")
             .values("id", "completed_at", "overall_score", "mention_rate",
-                    "avg_mention_rank", "providers_queried")
+                    "avg_mention_rank", "providers_queried")[:limit]
+        )
+        # Oldest first for the chart, as before.
+        audits = sorted(
+            latest, key=lambda a: (a["completed_at"] is None, a["completed_at"] or 0),
         )
         if not audits:
             return Response([])
@@ -995,6 +1030,7 @@ class LLMRankingHistoryView(TenantScopedAPIView):
             LLMRankingResult.objects
             .filter(audit_id__in=audit_ids, query_succeeded=True)
             .values("audit_id", "competitors_mentioned", "is_mentioned")
+            .iterator(chunk_size=2000)
         )
         for r in rows:
             aid = r["audit_id"]
@@ -1056,25 +1092,17 @@ class LLMRankingHistoryView(TenantScopedAPIView):
         # Citation share: self-brand mentions / total brand mentions across
         # all responses (us + competitors). Surfaces "of all brand citations
         # in AI answers, what share are us?"
-        for aid in audit_ids:
+        for audit in audits:
+            aid = audit["id"]
             total = per_audit_total_brand_mentions.get(aid, 0)
             our = per_audit_self_brand_mentions.get(aid, 0)
-            share = round(our / total * 100, 1) if total else None
-            for audit in audits:
-                if audit["id"] == aid:
-                    audit["citation_share"] = share
-                    audit["citation_total"] = total
-                    audit["citation_self"] = our
-                    break
-
-        for audit in audits:
+            audit["citation_share"] = round(our / total * 100, 1) if total else None
+            audit["citation_total"] = total
+            audit["citation_self"] = our
             audit["providers"] = provider_by_audit.get(audit["id"], [])
             comps_for_audit = comp_list_by_audit.get(audit["id"], [])
             comps_for_audit.sort(key=lambda c: c["mention_count"], reverse=True)
             audit["competitors"] = comps_for_audit
-            audit.setdefault("citation_share", None)
-            audit.setdefault("citation_total", 0)
-            audit.setdefault("citation_self", 0)
 
         return Response(audits)
 
@@ -1305,27 +1333,45 @@ class LLMRankingScheduleRunNowView(TenantScopedAPIView):
 
         check_prompt_allowance(runner, len(prompts))
 
-        audit = LLMRankingAudit.objects.create(
-            website=website,
-            created_by=runner,
-            business_name=schedule.business_name,
-            business_description=schedule.business_description,
-            industry=schedule.industry,
-            location=schedule.location,
-            keywords=schedule.keywords,
-            prompts=prompts,
-            providers_queried=selected,
-            prompt_source=LLMRankingAudit.PROMPT_SOURCE_LIBRARY,
-        )
+        # The check above read the schedule without a lock. Lock it and
+        # check again before creating the audit, so two overlapping
+        # requests (a double click) cannot both start a run.
+        with transaction.atomic():
+            locked = LLMRankingSchedule.objects.select_for_update().get(pk=schedule.pk)
+            in_flight = (
+                LLMRankingAudit.objects.filter(
+                    id=locked.last_audit_id,
+                    status__in=[LLMRankingAudit.STATUS_PENDING, LLMRankingAudit.STATUS_RUNNING],
+                ).first()
+                if locked.last_audit_id else None
+            )
+            if in_flight is not None:
+                return Response(
+                    {"error": "A prompt run from this schedule is still in progress.",
+                     "audit_id": str(in_flight.id)},
+                    status=status.HTTP_409_CONFLICT,
+                )
+            audit = LLMRankingAudit.objects.create(
+                website=website,
+                created_by=runner,
+                business_name=schedule.business_name,
+                business_description=schedule.business_description,
+                industry=schedule.industry,
+                location=schedule.location,
+                keywords=schedule.keywords,
+                prompts=prompts,
+                providers_queried=selected,
+                prompt_source=LLMRankingAudit.PROMPT_SOURCE_LIBRARY,
+            )
 
-        # Reset failure counter on a manual run — the operator is
-        # explicitly retrying, so the auto-pause gate should reset too.
-        schedule.last_audit = audit
-        schedule.consecutive_failures = 0
-        schedule.last_failure_at = None
-        schedule.save(update_fields=[
-            "last_audit", "consecutive_failures", "last_failure_at", "updated_at",
-        ])
+            # Reset failure counter on a manual run — the operator is
+            # explicitly retrying, so the auto-pause gate should reset too.
+            locked.last_audit = audit
+            locked.consecutive_failures = 0
+            locked.last_failure_at = None
+            locked.save(update_fields=[
+                "last_audit", "consecutive_failures", "last_failure_at", "updated_at",
+            ])
 
         from apps.llm_ranking.tasks import run_llm_ranking_audit
         run_llm_ranking_audit.delay(audit_id=str(audit.id))

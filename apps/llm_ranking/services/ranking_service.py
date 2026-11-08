@@ -383,15 +383,29 @@ class LLMRankingService:
         """
         Run enrichment + flip the audit to RUNNING. Returns the plan dict the
         Celery task uses to fan out cells, or None if the audit isn't runnable.
+
+        Preparation is claimed once per run: only a pending (or freshly
+        claimed running) audit whose ``started_at`` is still empty is
+        prepared, and the claim sets ``started_at``. A second delivery of
+        the same scan (a double dispatch, a redelivered task) returns None
+        instead of enriching and asking every engine again.
         """
         from apps.llm_ranking.models import LLMRankingAudit
         from apps.llm_ranking.services.audit_factory import configured_providers
 
-        try:
-            audit = LLMRankingAudit.objects.select_related("website").get(id=audit_id)
-        except LLMRankingAudit.DoesNotExist:
-            logger.error("LLMRankingAudit %s not found", audit_id)
+        started_at = timezone.now()
+        claimed = LLMRankingAudit.objects.filter(
+            id=audit_id,
+            status__in=[LLMRankingAudit.STATUS_PENDING, LLMRankingAudit.STATUS_RUNNING],
+            started_at__isnull=True,
+        ).update(status=LLMRankingAudit.STATUS_RUNNING, started_at=started_at)
+        if not claimed:
+            if LLMRankingAudit.objects.filter(id=audit_id).exists():
+                logger.info("LLMRankingAudit %s is already prepared or finished", audit_id)
+            else:
+                logger.error("LLMRankingAudit %s not found", audit_id)
             return None
+        audit = LLMRankingAudit.objects.select_related("website").get(id=audit_id)
 
         # Only engines that are implemented AND have a key are asked. An
         # unconfigured engine would only add failed cells.
@@ -463,7 +477,7 @@ class LLMRankingService:
         audit.status = LLMRankingAudit.STATUS_RUNNING
         audit.total_queries = total
         audit.queries_completed = 0
-        audit.started_at = timezone.now()
+        audit.started_at = started_at
         audit.providers_queried = provider_keys
         # Snapshot the enriched context onto the audit so cells don't have to
         # rescrape. Stored as a single string field via JSON to keep the schema

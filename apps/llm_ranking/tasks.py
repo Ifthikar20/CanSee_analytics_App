@@ -20,6 +20,8 @@ def run_llm_ranking_audit(self, *, audit_id: str) -> None:
     The aggregator task is the chord callback — it computes scores once
     every cell has either committed a row or hit max retries.
     """
+    from django.db.models import F
+
     from apps.llm_ranking.models import LLMRankingAudit
     from apps.llm_ranking.services.ranking_service import LLMRankingService
 
@@ -28,7 +30,9 @@ def run_llm_ranking_audit(self, *, audit_id: str) -> None:
         # Fast (a few HTTP calls); doing it inside the chord adds no value.
         plan = LLMRankingService.prepare_audit(audit_id=audit_id)
         if not plan:
-            return  # already terminal or non-existent
+            # Missing, not runnable (marked failed), or already prepared by
+            # another delivery of this task.
+            return
 
         cells = [
             query_provider_prompt_task.s(
@@ -47,9 +51,17 @@ def run_llm_ranking_audit(self, *, audit_id: str) -> None:
         chord(cells)(aggregate_audit_results_task.s(audit_id=audit_id))
     except Exception as exc:
         logger.error("LLM ranking audit %s failed: %s", audit_id, exc)
+        retrying = self.request.retries < self.max_retries
         try:
+            # A retry prepares the run again, so it releases the claim
+            # (started_at) and leaves the audit pending; the last attempt
+            # marks it failed.
             LLMRankingAudit.objects.filter(id=audit_id).update(
-                status=LLMRankingAudit.STATUS_FAILED,
+                status=(
+                    LLMRankingAudit.STATUS_PENDING if retrying
+                    else LLMRankingAudit.STATUS_FAILED
+                ),
+                started_at=None if retrying else F("started_at"),
                 error_message=str(exc)[:500],
             )
         except Exception:
