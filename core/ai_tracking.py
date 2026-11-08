@@ -66,26 +66,47 @@ PRICING = {
     "claude-haiku-4-5-20251001": {"input": 1.00, "output": 5.00},
     "claude-haiku-4-5": {"input": 1.00, "output": 5.00},
     "claude-3-haiku-20240307": {"input": 0.25, "output": 1.25},
-    # OpenAI
+    # OpenAI. The GPT-5.x rows are the standard-tier rates below the
+    # long-context threshold; an engine-check prompt is far below it.
     "gpt-4o-mini": {"input": 0.15, "output": 0.60},
     "gpt-4o": {"input": 2.50, "output": 10.00},
     "gpt-4-turbo": {"input": 10.00, "output": 30.00},
+    "gpt-5.5": {"input": 5.00, "output": 30.00},
+    "gpt-5.6-sol": {"input": 5.00, "output": 30.00},
+    "gpt-5.6-terra": {"input": 2.50, "output": 15.00},
+    "gpt-5.6-luna": {"input": 1.00, "output": 6.00},
     "text-embedding-3-small": {"input": 0.02, "output": 0.00},
-    # Google
+    # Google. gemini-2.5-flash is GeminiProvider's default. The 3.x Flash
+    # rows use Google's standard rate ($1.50 / $7.50), not the lower
+    # introductory price that runs to 2026-12-31, and gemini-3.5-flash is
+    # priced like its 3.x siblings, so these can only overshoot.
     "gemini-1.5-flash": {"input": 0.075, "output": 0.30},
     "gemini-1.5-pro": {"input": 1.25, "output": 5.00},
     "gemini-2.0-flash": {"input": 0.10, "output": 0.40},
+    "gemini-2.5-flash": {"input": 0.30, "output": 2.50},
+    "gemini-3.5-flash": {"input": 1.50, "output": 7.50},
+    "gemini-3.7-flash": {"input": 1.50, "output": 7.50},
+    "gemini-3.1-pro-preview": {"input": 2.00, "output": 12.00},
     # Perplexity. Sonar bills a per-request web-search fee on top of
     # tokens; "per_call" models that as a flat USD adder per API call,
     # set at the high-context tier so the estimate can only overshoot.
     "sonar": {"input": 1.00, "output": 1.00, "per_call": 0.008},
     "sonar-pro": {"input": 3.00, "output": 15.00, "per_call": 0.014},
+    "sonar-reasoning-pro": {"input": 2.00, "output": 8.00, "per_call": 0.014},
     # Legacy Sonar names kept so historical rows keep re-pricing correctly.
     "llama-3.1-sonar-small-128k-online": {"input": 0.20, "output": 0.20},
     "llama-3.1-sonar-large-128k-online": {"input": 1.00, "output": 1.00},
     # xAI
     "grok-4": {"input": 3.00, "output": 15.00},
+    "grok-4.6": {"input": 2.00, "output": 6.00},
+    "grok-4.5": {"input": 2.00, "output": 6.00},
+    "grok-4.1-fast": {"input": 0.20, "output": 0.50},
     "grok-3": {"input": 3.00, "output": 15.00},
+    # DeepSeek (synthesis and saved-prompt baseline). Both ids are priced
+    # at the highest rate DeepSeek has listed for them (the old reasoner
+    # price); current rates are lower, so the estimate can only overshoot.
+    "deepseek-chat": {"input": 0.55, "output": 2.19},
+    "deepseek-reasoner": {"input": 0.55, "output": 2.19},
     # Fallback for models without a row. It is a mid-tier rate, so a model
     # priced above it would be understated against the margin cap: every
     # model the product selects on its own (provider defaults, MODEL_VARIANTS)
@@ -114,16 +135,30 @@ MODEL_PROVIDER = {
     "gpt-4o-mini": "openai",
     "gpt-4o": "openai",
     "gpt-4-turbo": "openai",
+    "gpt-5.5": "openai",
+    "gpt-5.6-sol": "openai",
+    "gpt-5.6-terra": "openai",
+    "gpt-5.6-luna": "openai",
     "text-embedding-3-small": "openai",
     "gemini-1.5-flash": "google",
     "gemini-1.5-pro": "google",
     "gemini-2.0-flash": "google",
+    "gemini-2.5-flash": "google",
+    "gemini-3.5-flash": "google",
+    "gemini-3.7-flash": "google",
+    "gemini-3.1-pro-preview": "google",
     "sonar": "perplexity",
     "sonar-pro": "perplexity",
+    "sonar-reasoning-pro": "perplexity",
     "llama-3.1-sonar-small-128k-online": "perplexity",
     "llama-3.1-sonar-large-128k-online": "perplexity",
     "grok-4": "xai",
+    "grok-4.6": "xai",
+    "grok-4.5": "xai",
+    "grok-4.1-fast": "xai",
     "grok-3": "xai",
+    "deepseek-chat": "deepseek",
+    "deepseek-reasoner": "deepseek",
 }
 
 
