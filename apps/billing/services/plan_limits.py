@@ -213,6 +213,12 @@ def org_plan_for(user):
             return None
         org = membership.organization
         user._org_cache = org
+    return plan_for_org(org)
+
+
+def plan_for_org(org) -> str:
+    """The plan an Organization row grants its members, legacy names
+    mapped to the live tiers (no flag or membership checks)."""
     return _LEGACY_MAP.get(org.plan, org.plan)
 
 

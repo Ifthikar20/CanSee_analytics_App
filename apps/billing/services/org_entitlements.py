@@ -43,6 +43,26 @@ def seats_used(org) -> int:
     return org.members.count() + pending
 
 
+def seat_available(org, *, holding_invitation: bool = False) -> bool:
+    """Whether one more person may take a seat in ``org``.
+
+    ``holding_invitation``: the person is accepting an invitation, which
+    already reserves its seat (``seats_used`` counts it), so only accepted
+    members are compared with the cap. Everyone else (a new invitation,
+    domain or SSO auto-join, an operator add) needs a free seat on top of
+    the members and the live invitations.
+
+    An org that is over its cap (its plan's seat count was lowered after
+    people joined) keeps every member; it just cannot add anyone until it
+    is back under the cap.
+    """
+    cap = seat_limit_for(org)
+    if cap <= 0:
+        return True
+    taken = org.members.count() if holding_invitation else seats_used(org)
+    return taken < cap
+
+
 def seats_block(org) -> dict | None:
     """The session/UI payload: {used, max}. None when unlimited."""
     limit = seat_limit_for(org)

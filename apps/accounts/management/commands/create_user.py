@@ -106,11 +106,10 @@ class Command(BaseCommand):
 
         # Seats are the enterprise billing unit; an operator-added member
         # takes one exactly like an accepted invitation does.
-        from apps.billing.services.org_entitlements import seat_limit_for, seats_used
+        from apps.billing.services.org_entitlements import seat_available, seat_limit_for
 
-        cap = seat_limit_for(org)
-        if cap > 0 and seats_used(org) >= cap:
-            raise CommandError(f"{org.name} has no free seats ({cap} in use).")
+        if not seat_available(org):
+            raise CommandError(f"{org.name} has no free seats ({seat_limit_for(org)} in use).")
         if not getattr(settings, "ORG_FEATURES_ENABLED", False):
             self.stdout.write(self.style.WARNING(
                 "ORG_FEATURES_ENABLED is off: the membership is saved, but organization "

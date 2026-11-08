@@ -124,8 +124,16 @@ _PROMPT_PLAN = {
     "autopilot": True,
     "sms_digest": True,
 }
-PLAN_LIMITS[Plan.PROMPTS_100] = {**_PROMPT_PLAN, "price_monthly": 80, "tracked_prompts": 100}
-PLAN_LIMITS[Plan.PROMPTS_200] = {**_PROMPT_PLAN, "price_monthly": 140, "tracked_prompts": 200}
+# Seats (``team_members``, -1 = unlimited): the $80 plan is a one-person
+# plan; the $140 plan carries up to five seats. Lowering a plan's seat count
+# never removes anyone: an org already over it keeps its members and cannot
+# add more (apps.billing.services.org_entitlements.seat_available).
+PLAN_LIMITS[Plan.PROMPTS_100] = {
+    **_PROMPT_PLAN, "price_monthly": 80, "tracked_prompts": 100, "team_members": 1,
+}
+PLAN_LIMITS[Plan.PROMPTS_200] = {
+    **_PROMPT_PLAN, "price_monthly": 140, "tracked_prompts": 200, "team_members": 5,
+}
 
 # What each plan is called on the pricing window, the billing page and in
 # messages. One place, so renaming a plan is a one-line change.

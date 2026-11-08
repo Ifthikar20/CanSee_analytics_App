@@ -219,31 +219,36 @@ class OAuthService:
                     code="invitation_email_mismatch",
                     status_code=403,
                 )
-            if user is None:
-                user = User.objects.create_user(
-                    email=email,
-                    password=None,
-                    full_name=full_name,
-                    company_name=invitation.organization.name,
-                    is_email_verified=True,
-                )
-                is_new_user = True
-                identity = SocialIdentity.objects.create(
+            # Atomic: a seat-cap refusal inside add_member must roll back
+            # the account and identity created for this invitation.
+            from django.db import transaction
+
+            with transaction.atomic():
+                if user is None:
+                    user = User.objects.create_user(
+                        email=email,
+                        password=None,
+                        full_name=full_name,
+                        company_name=invitation.organization.name,
+                        is_email_verified=True,
+                    )
+                    is_new_user = True
+                    identity = SocialIdentity.objects.create(
+                        user=user,
+                        provider="google",
+                        subject=sub,
+                        tenant=hd,
+                        email_at_link=email,
+                    )
+                OrgService.add_member(
+                    organization=invitation.organization,
                     user=user,
-                    provider="google",
-                    subject=sub,
-                    tenant=hd,
-                    email_at_link=email,
+                    role=invitation.role,
+                    invited_by=invitation.invited_by,
+                    joined_via="invite",
                 )
-            OrgService.add_member(
-                organization=invitation.organization,
-                user=user,
-                role=invitation.role,
-                invited_by=invitation.invited_by,
-                joined_via="invite",
-            )
-            invitation.accepted_at = timezone.now()
-            invitation.save(update_fields=["accepted_at"])
+                invitation.accepted_at = timezone.now()
+                invitation.save(update_fields=["accepted_at"])
             org = invitation.organization
             joined_org = True
 
