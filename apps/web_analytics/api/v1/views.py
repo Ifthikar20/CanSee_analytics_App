@@ -94,13 +94,17 @@ class Ga4OAuthCallbackView(APIView):
     authentication_classes = []
 
     def _spa_redirect(self, website_id, outcome: str, reason: str = "") -> HttpResponseRedirect:
-        # GA4 lives on the website detail page (with the pixel snippet).
+        # GA4 is managed in Settings > Connections; the SPA makes the
+        # named website active before it reads the result.
+        from urllib.parse import urlencode
+
         base = settings.FRONTEND_URL.rstrip("/")
-        path = f"/websites/{website_id}" if website_id else "/websites"
-        url = f"{base}{path}?ga4={outcome}"
+        query = {"ga4": outcome}
+        if website_id:
+            query["website"] = str(website_id)
         if reason:
-            url += f"&reason={reason}"
-        return HttpResponseRedirect(url)
+            query["reason"] = reason
+        return HttpResponseRedirect(f"{base}/settings/connections?{urlencode(query)}")
 
     def get(self, request):
         if not _feature_enabled():
@@ -184,7 +188,7 @@ class Ga4SelectPropertyView(GatedTenantView):
 
 class Ga4DisconnectView(GatedTenantView):
     def delete(self, request, website_id):
-        website = self.get_website(website_id)
+        website = self.get_website(website_id, min_role="admin")
         integration = _get_integration(website, "ga")
         if integration is not None:
             ga4_oauth.disconnect(integration)
@@ -416,7 +420,7 @@ class CloudflareSelectZoneView(GatedTenantView):
 
 class CloudflareDisconnectView(GatedTenantView):
     def delete(self, request, website_id):
-        website = self.get_website(website_id)
+        website = self.get_website(website_id, min_role="admin")
         integration = _get_integration(website, "cloudflare")
         if integration is not None:
             # Nothing to revoke remotely; the tenant owns the token.

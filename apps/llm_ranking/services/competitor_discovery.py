@@ -12,9 +12,17 @@ from urllib.parse import urlparse
 import requests
 from django.conf import settings
 
+from apps.citations.services.domain_classifier import _matches_suffix, is_aggregator
+
 logger = logging.getLogger("apps")
 
 SEARCH_TIMEOUT = 8  # seconds
+
+# Social networks and forums the legacy filter also skipped, on top of the
+# shared AGGREGATOR_DOMAINS.
+_EXTRA_SKIP_DOMAINS = frozenset({
+    "twitter.com", "x.com", "facebook.com", "instagram.com",
+})
 
 
 def discover_competitors(
@@ -109,22 +117,14 @@ def _extract_competitor(
     parsed = urlparse(link)
     domain = _normalize_domain(parsed.netloc)
 
-    # Skip own domain
-    if own_domain and own_domain in domain:
+    # Skip own domain (and its subdomains), by suffix: "acme.com" must not
+    # drop "notacme.com".
+    if own_domain and (domain == own_domain or domain.endswith("." + own_domain)):
         return None
 
-    # Skip aggregator/review sites (not competitors)
-    skip_domains = {
-        "g2.com", "capterra.com", "trustradius.com", "getapp.com",
-        "softwareadvice.com", "producthunt.com", "alternativeto.net",
-        "slashdot.org", "reddit.com", "quora.com", "wikipedia.org",
-        "medium.com", "youtube.com", "linkedin.com", "twitter.com",
-        "x.com", "facebook.com", "instagram.com", "github.com",
-        "stackoverflow.com", "techcrunch.com", "forbes.com",
-        "crunchbase.com", "bloomberg.com", "businessinsider.com",
-        "google.com", "bing.com", "yahoo.com", "amazon.com",
-    }
-    if any(skip in domain for skip in skip_domains):
+    # Skip aggregator/review/social sites (not competitors). Suffix match:
+    # a substring test let "x.com" drop dropbox.com and wix.com.
+    if is_aggregator(domain) or _matches_suffix(domain, _EXTRA_SKIP_DOMAINS):
         return None
 
     # Skip if the title contains "review" or "comparison" (review articles)

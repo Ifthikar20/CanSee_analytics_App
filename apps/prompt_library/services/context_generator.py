@@ -1,14 +1,17 @@
-"""Generate a batch of templated prompts from a free-form user context.
+"""Generate a batch of prompts from a free-form user context.
 
 Calls the synthesis provider (DeepSeek by default; Anthropic when DeepSeek
-isn't configured) with a strict-JSON instruction asking for ``count`` diverse,
-natural-feeling templated prompts in the style of questions a real person
+isn't configured) with a strict-JSON instruction asking for ``count``
+diverse, natural-feeling prompts in the style of questions a real person
 might ask an AI assistant. Returns a list of envelopes the API layer can
 serialise or persist.
 
-The function is defensive: any error path (no provider configured, malformed
-JSON, truncated response, network exception) returns a deterministic
-single-prompt fallback so the UI never crashes.
+Nothing is substituted when generation is impossible: a missing provider
+raises ``SynthesisNotConfigured`` and a failed or unusable call raises
+``SynthesisFailed``. The model only writes prompt text and picks a style
+and intent bucket from fixed lists; it is not asked to estimate
+popularity or where a question is asked, and is told not to invent
+business names.
 """
 from __future__ import annotations
 
@@ -37,61 +40,46 @@ ALLOWED_STYLES = {
 }
 ALLOWED_BUCKETS = {"category", "comparison", "problem", "local"}
 
+
+class SynthesisNotConfigured(Exception):
+    """No synthesis provider has an API key."""
+
+    code = "synthesis_not_configured"
+
+
+class SynthesisFailed(Exception):
+    """The provider call failed or returned nothing usable."""
+
+    code = "synthesis_failed"
+
+
 _SYSTEM = (
-    "You are a senior researcher who writes natural-feeling questions people "
-    "ask AI assistants like ChatGPT, Claude, Gemini, and Perplexity in real "
-    "life. Your prompts should sound like something a real person typed — "
-    "first-person, conversational, sometimes meandering, sometimes terse. "
-    "They should NOT sound like SEO listicle headlines (no 'best X 2026', "
-    "'top 10 Y'). They should feel like overheard chatter, group-chat asks, "
-    "Reddit posts, or driving-around questions.\n\n"
-    "Each prompt MUST be CONCRETE. Invent or recall plausible business names, "
-    "real-sounding locations, persona details, and specific contexts based on "
-    "the user's input. Do NOT use placeholder syntax like '{{ company_name }}' "
-    "or 'Brand X'. Use specific (invented if needed) names like 'Dave's Bagels' "
-    "or 'Morningside Bakery'.\n\n"
-    "Mix tones: skeptical, curious, frustrated, excited, gossipy, lazy."
+    "You write natural-feeling questions people ask AI assistants like "
+    "ChatGPT, Claude, Gemini, and Perplexity in real life. Your prompts "
+    "should sound like something a real person typed — first-person, "
+    "conversational, sometimes meandering, sometimes terse. They should NOT "
+    "sound like SEO listicle headlines (no 'best X 2026', 'top 10 Y').\n\n"
+    "Use only the business names, places and details given in the user's "
+    "context. Do not invent business names. Do not use placeholder syntax "
+    "like '{{ company_name }}' or 'Brand X'.\n\n"
+    "Mix tones: skeptical, curious, frustrated, excited, lazy."
 )
 
 _USER_TEMPLATE = (
-    "Generate {count} DISTINCT, fully-concrete prompts inspired by the user "
-    "context below. Each prompt should reference plausible specific names, "
-    "places, or persona details — invent them if needed (5-10 different "
-    "made-up business names is fine; reuse them across prompts to feel like "
-    "the same neighbourhood).\n\n"
-    "MIX LENGTHS DELIBERATELY:\n"
-    "- 4 short prompts (one sentence, ≤ 15 words, terse)\n"
-    "- 8 medium prompts (2 sentences, 15-30 words)\n"
-    "- 8 long prompts (3-4 sentences, 30-60 words, anecdotal, conversational, "
-    "with side comments and personal context)\n\n"
+    "Generate {count} DISTINCT prompts inspired by the user context below.\n\n"
+    "MIX LENGTHS DELIBERATELY: some short (one sentence, at most 15 words), "
+    "some medium (2 sentences, 15-30 words), some long (3-4 sentences, "
+    "30-60 words, conversational, with personal context).\n\n"
     "MIX STYLES across the {count} items. Use as many of these styles as "
     "possible: story, question, comparison, local, how_to, recommendation, "
-    "skeptical, discovery, problem, verification, experience. Aim for at "
-    "least 7 different style values.\n\n"
+    "skeptical, discovery, problem, verification, experience.\n\n"
     'CONTEXT: """{context_text}"""\n\n'
     "Output strict JSON: a list of {count} objects, each with these keys:\n"
-    "  prompt_text    (string — the full, concrete prompt text. No placeholders.)\n"
+    "  prompt_text    (string — the full prompt text. No placeholders.)\n"
     "  style          (one of: story, question, comparison, local, how_to, "
     "listicle, recommendation, skeptical, discovery, problem, verification, "
     "experience)\n"
-    "  intent_bucket  (one of: category, comparison, problem, local)\n"
-    "  trend_score    (integer 0-100; your best estimate of how popular / "
-    "trending this question is on Google right now, where 100 = extremely "
-    "common search intent and 0 = obscure niche)\n"
-    "  keywords       (array of 3-6 short EXACT substrings from prompt_text "
-    "that are the MOST demand-driving phrases — neighbourhood, brand, "
-    "category-specific terminology, distinctive adjectives in quotes. "
-    "Each substring MUST appear verbatim in prompt_text.)\n"
-    "  seen_in        (one of: reddit, quora, google_search, hacker_news, "
-    "yelp, tiktok, youtube_comments, twitter, forum, news_comments, "
-    "ai_chat — the SINGLE most-likely real-world surface where a person "
-    "would actually post or type this exact question)\n"
-    "  community      (optional short string — when seen_in is reddit, the "
-    "subreddit name like 'r/saas'; when quora a topic; when youtube a "
-    "channel handle. Empty string if no obvious match.)\n\n"
-    "Vary seen_in deliberately across the batch — some prompts are Reddit-"
-    "shaped, others Quora, others typed straight into ChatGPT. Don't put "
-    "everything in one bucket.\n\n"
+    "  intent_bucket  (one of: category, comparison, problem, local)\n\n"
     "Return ONLY the JSON array, no commentary."
 )
 
@@ -106,7 +94,8 @@ _RELATED_SYSTEM = (
 _RELATED_USER_TEMPLATE = (
     'Existing prompt: "{seed}"\n'
     "Write {count} short related questions on the same topic and audience, "
-    "each from a different angle. Be concrete; no placeholders.\n"
+    "each from a different angle. No placeholders, and no business names "
+    "that are not in the existing prompt.\n"
     'Return only a JSON array of objects with keys: "prompt_text" (string), '
     '"style" (one of question, comparison, how_to, local, problem), '
     '"intent_bucket" (one of category, comparison, problem, local).'
@@ -139,60 +128,36 @@ def _extract_json_array(text: str) -> list[Any]:
         return data if isinstance(data, list) else []
     except Exception:
         pass
-    # Repair attempt: trim to last complete object and close the array.
-    last_brace = candidate.rfind("}")
-    if last_brace == -1:
-        return []
-    repaired = candidate[: last_brace + 1] + "]"
-    try:
-        data = json.loads(repaired)
-        return data if isinstance(data, list) else []
-    except Exception:
-        return []
+    # Repair attempt for a response cut off mid-array: keep every element
+    # that decodes completely and drop the truncated tail. Cutting at the
+    # last "}" is not enough, because "}" also appears inside strings (the
+    # {{ variable }} placeholders), so the cut could land mid-string.
+    return _complete_elements(candidate)
 
 
-def _fallback_single(context_text: str) -> list[dict]:
-    """Deterministic safety net so the UI always has at least one row.
-
-    Uses the user's context verbatim (truncated) so the result is at least
-    contextually relevant when the synthesis provider is unavailable.
-    """
-    ctx = (context_text or "").strip() or "this scenario"
-    prompt_text = (
-        f"Has anyone here actually checked out the spots involved in: "
-        f"{ctx[:240]}? Looking for honest takes."
-    )
-    word_count = len([w for w in prompt_text.split() if w])
-    if word_count <= 14:
-        length_band = "short"
-    elif word_count <= 30:
-        length_band = "medium"
-    else:
-        length_band = "long"
-    return [
-        {
-            "template_text": prompt_text,
-            "template_variables": [],
-            "prompt_text": prompt_text,
-            "preview_text": prompt_text,
-            "style": "question",
-            "intent_bucket": "category",
-            "trend_score": 50,
-            "keywords": [],
-            "word_count": word_count,
-            "length_band": length_band,
-            "seen_in": "ai_chat",
-            "community": "",
-        }
-    ]
+def _complete_elements(candidate: str) -> list[Any]:
+    """The elements of a JSON array that decode in full, in order, up to
+    the first one that does not (``candidate`` starts with ``[``)."""
+    decoder = json.JSONDecoder()
+    items: list[Any] = []
+    pos, size = 1, len(candidate)
+    while True:
+        while pos < size and candidate[pos] in " \t\r\n,":
+            pos += 1
+        if pos >= size or candidate[pos] == "]":
+            return items
+        try:
+            item, pos = decoder.raw_decode(candidate, pos)
+        except ValueError:
+            return items
+        items.append(item)
 
 
 def _normalise_item(raw: Any) -> dict | None:
     if not isinstance(raw, dict):
         return None
-    # Accept either the new concrete-prompt schema (prompt_text) or the older
-    # template-with-placeholders schema (template_text) so older callers and
-    # offline fixtures keep working.
+    # Accept either the concrete-prompt schema (prompt_text) or the older
+    # template-with-placeholders schema (template_text).
     prompt_text = str(raw.get("prompt_text") or raw.get("template_text") or "").strip()
     if len(prompt_text) < 10:
         return None
@@ -202,36 +167,9 @@ def _normalise_item(raw: Any) -> dict | None:
     bucket = str(raw.get("intent_bucket") or "category").strip().lower()
     if bucket not in ALLOWED_BUCKETS:
         bucket = "category"
-    try:
-        trend_score = int(raw.get("trend_score", 50))
-    except (TypeError, ValueError):
-        trend_score = 50
-    trend_score = max(0, min(100, trend_score))
     # Variables are extracted defensively — concrete prompts won't have any,
     # but if the model slips in a {{ slot }} we still capture it for storage.
     template_variables = extract_variables(prompt_text)
-    # Keywords: keep only those that actually appear in the prompt text. The
-    # frontend highlights them; nothing else, so verbatim match is the safest
-    # contract.
-    raw_keywords = raw.get("keywords") or []
-    if isinstance(raw_keywords, str):
-        raw_keywords = [raw_keywords]
-    keywords: list[str] = []
-    seen: set[str] = set()
-    lower_prompt = prompt_text.lower()
-    for kw in raw_keywords:
-        if not isinstance(kw, str):
-            continue
-        kw = kw.strip().strip("\"'")
-        if len(kw) < 2 or kw.lower() not in lower_prompt:
-            continue
-        key = kw.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        keywords.append(kw)
-        if len(keywords) >= 8:
-            break
     # Word + length band — server-side so the frontend filter is just a
     # simple equality check.
     word_count = len([w for w in prompt_text.split() if w])
@@ -241,36 +179,37 @@ def _normalise_item(raw: Any) -> dict | None:
         length_band = "medium"
     else:
         length_band = "long"
-    # 'seen_in' — the real-world surface where this prompt is most likely
-    # to be asked. Validated against an allow-list; fall back to 'ai_chat'
-    # which is the safest assumption ("typed into ChatGPT directly").
-    ALLOWED_SEEN_IN = {
-        "reddit", "quora", "google_search", "hacker_news", "yelp",
-        "tiktok", "youtube_comments", "twitter", "forum",
-        "news_comments", "ai_chat",
-    }
-    seen_in = str(raw.get("seen_in") or "ai_chat").strip().lower().replace("-", "_").replace(" ", "_")
-    if seen_in not in ALLOWED_SEEN_IN:
-        seen_in = "ai_chat"
-    community = str(raw.get("community") or "").strip()
-    if len(community) > 80:
-        community = community[:80]
     return {
         # Legacy fields kept for storage/compat with the existing Prompt model.
         "template_text": prompt_text,
         "template_variables": template_variables,
         "preview_text": prompt_text,
-        # Primary field the new UI surfaces.
         "prompt_text": prompt_text,
         "style": style,
         "intent_bucket": bucket,
-        "trend_score": trend_score,
-        "keywords": keywords,
         "word_count": word_count,
         "length_band": length_band,
-        "seen_in": seen_in,
-        "community": community,
     }
+
+
+def _query(provider, user_prompt: str, system: str, *, user, audit_id: str, role: str) -> str:
+    """Run one synthesis call and return its text, or raise SynthesisFailed."""
+    try:
+        result = provider.query(
+            user_prompt,
+            system,
+            user=user,
+            website=None,
+            audit_id=audit_id,
+            role=role,
+        )
+    except Exception as exc:
+        logger.warning("%s provider call failed: %s", audit_id, exc)
+        raise SynthesisFailed() from exc
+    if not getattr(result, "succeeded", False):
+        logger.warning("%s provider call unsuccessful: %s", audit_id, getattr(result, "error", ""))
+        raise SynthesisFailed()
+    return getattr(result, "text", "") or ""
 
 
 def generate_from_context(
@@ -281,53 +220,34 @@ def generate_from_context(
 ) -> tuple[list[dict], str]:
     """Return (items, provider_name).
 
-    ``provider_name`` is the synthesis provider that produced the items
-    ("deepseek", "claude", ...) or "fallback" if no provider was usable.
+    Raises ``SynthesisNotConfigured`` when no synthesis provider has a key
+    and ``SynthesisFailed`` when the call fails or yields no usable prompt.
     """
+    from apps.llm_ranking.providers import get_synthesis_provider
+
     context_text = (context_text or "").strip()
-    if not context_text:
-        return _fallback_single(""), "fallback"
-
-    try:
-        from apps.llm_ranking.providers import get_synthesis_provider
-    except Exception as exc:  # pragma: no cover — import-time only
-        logger.warning("context_generator: provider import failed: %s", exc)
-        return _fallback_single(context_text), "fallback"
-
     provider = get_synthesis_provider()
     if provider is None:
-        return _fallback_single(context_text), "fallback"
+        raise SynthesisNotConfigured()
 
-    user_prompt = _USER_TEMPLATE.format(count=count, context_text=context_text)
-    try:
-        result = provider.query(
-            user_prompt,
-            _SYSTEM,
-            user=user,
-            website=None,
-            audit_id="prompt_library_context_generator",
-            role="synthesis",
-        )
-    except Exception as exc:
-        logger.warning("context_generator provider call failed: %s", exc)
-        return _fallback_single(context_text), getattr(provider, "name", "fallback")
-
-    if not getattr(result, "succeeded", False):
-        return _fallback_single(context_text), getattr(provider, "name", "fallback")
-
-    raw_items = _extract_json_array(getattr(result, "text", "") or "")
+    text = _query(
+        provider,
+        _USER_TEMPLATE.format(count=count, context_text=context_text),
+        _SYSTEM,
+        user=user,
+        audit_id="prompt_library_context_generator",
+        role="synthesis",
+    )
     items: list[dict] = []
-    for raw in raw_items:
+    for raw in _extract_json_array(text):
         norm = _normalise_item(raw)
         if norm is not None:
             items.append(norm)
         if len(items) >= count:
             break
-
     if not items:
-        return _fallback_single(context_text), getattr(provider, "name", "fallback")
-
-    return items, getattr(provider, "name", "deepseek")
+        raise SynthesisFailed()
+    return items, getattr(provider, "name", "")
 
 
 def generate_related_prompts(
@@ -338,58 +258,35 @@ def generate_related_prompts(
 ) -> tuple[list[dict], str]:
     """Return (items, provider_name) of prompts related to ``seed_prompt``.
 
-    Best-effort recommender used by the create-prompt flow to suggest
-    follow-on prompts. Because this is a secondary operation (not a core
-    audit) it is kept deliberately cheap:
-
-    * Pins DeepSeek (the cheapest tooling provider) rather than the default
-      synthesis chain. A safety fallback to Claude/GPT only kicks in when
-      DeepSeek has no key configured.
-    * Uses a small system + user instruction and a low ``count`` to minimise
-      token spend.
-
-    Token usage is still metered per-user: passing ``user`` to
-    ``provider.query`` records an ``AITokenUsage`` row (tagged role
-    "recommendation") that counts toward the user's usage and monthly cost
-    cap. Returns an empty list on any failure so the UI just shows nothing.
+    Secondary recommender used by the create-prompt flow, kept cheap: it
+    pins DeepSeek (falling back to Claude/GPT only when DeepSeek has no
+    key) and asks for a small ``count``. Token usage is metered against
+    ``user``. Raises ``SynthesisNotConfigured`` / ``SynthesisFailed`` like
+    ``generate_from_context``.
     """
+    from apps.llm_ranking.providers import get_synthesis_provider
+
     seed = (seed_prompt or "").strip()
-    if not seed:
-        return [], "fallback"
     count = max(1, min(int(count or 5), 10))
-
-    try:
-        from apps.llm_ranking.providers import get_synthesis_provider
-    except Exception as exc:  # pragma: no cover — import-time only
-        logger.warning("generate_related_prompts: provider import failed: %s", exc)
-        return [], "fallback"
-
     provider = get_synthesis_provider("deepseek")
     if provider is None:
-        return [], "fallback"
+        raise SynthesisNotConfigured()
 
-    user_prompt = _RELATED_USER_TEMPLATE.format(seed=seed[:300], count=count)
-    try:
-        result = provider.query(
-            user_prompt,
-            _RELATED_SYSTEM,
-            user=user,
-            website=None,
-            audit_id="prompt_library_related",
-            role="recommendation",
-        )
-    except Exception as exc:
-        logger.warning("generate_related_prompts provider call failed: %s", exc)
-        return [], getattr(provider, "name", "fallback")
-
-    if not getattr(result, "succeeded", False):
-        return [], getattr(provider, "name", "fallback")
-
+    text = _query(
+        provider,
+        _RELATED_USER_TEMPLATE.format(seed=seed[:300], count=count),
+        _RELATED_SYSTEM,
+        user=user,
+        audit_id="prompt_library_related",
+        role="recommendation",
+    )
     items: list[dict] = []
-    for raw in _extract_json_array(getattr(result, "text", "") or ""):
+    for raw in _extract_json_array(text):
         norm = _normalise_item(raw)
         if norm is not None:
             items.append(norm)
         if len(items) >= count:
             break
-    return items, getattr(provider, "name", "deepseek")
+    if not items:
+        raise SynthesisFailed()
+    return items, getattr(provider, "name", "")

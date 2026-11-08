@@ -179,15 +179,14 @@ app.conf.task_routes = {
     "apps.llm_ranking.tasks.*": {"queue": "ai"},
     "apps.citations.tasks.*": {"queue": "ai"},
     "apps.brand_vault.tasks.*": {"queue": "ai"},
-    "apps.content_studio.tasks.*": {"queue": "ai"},
 }
 ```
 
 Queue topology:
 
 - `default` — fast in-process work (analytics aggregation, pixel, accounts)
-- `ai` — LLM-backed work (ranking audits, source scans, content briefs, brand vault, agent runs)
-- `integrations` — third-party OAuth token refresh, GSC sync, HubSpot/Semrush/Google Ads
+- `ai` — LLM-backed work (ranking audits, source scans, brand vault)
+- `integrations` — third-party HTTP (OAuth token refresh, Search Console, SerpAPI, Polar, report digests) and long batch deletes
 - `webhooks` — outbound webhook delivery to user-controlled URLs
 - `high`, `low` — reserved for priority separation (currently unused)
 

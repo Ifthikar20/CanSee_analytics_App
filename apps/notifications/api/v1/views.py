@@ -174,33 +174,22 @@ class IntegrationConnectionListView(TenantScopedAPIView):
                 from apps.notifications.services.slack_service import SlackService
                 SlackService.send_message(
                     webhook_url=connection.webhook_url,
-                    text=(
-                        "Cansee connected. You'll receive daily growth "
-                        "reports, brand-security alerts, and hot lead "
-                        "alerts here."
-                    ),
+                    text="Cansee connected. You'll receive the daily report here.",
                 )
             elif connection.platform == "discord":
                 from apps.notifications.services.discord_service import DiscordService
                 DiscordService.send_message(
                     webhook_url=connection.webhook_url,
                     title="Cansee Connected",
-                    # Name only what actually sends today; trend digests and
-                    # milestones are stored preferences with no sender yet.
-                    description=(
-                        "You'll receive daily growth reports, brand-security "
-                        "alerts, and hot lead alerts here."
-                    ),
+                    # Name only what actually sends today: the daily report.
+                    description="You'll receive the daily report here.",
                 )
             elif connection.platform == "teams":
                 from apps.notifications.services.teams_service import TeamsService
                 TeamsService.send_message(
                     webhook_url=connection.webhook_url,
                     title="Cansee connected",
-                    text=(
-                        "You'll receive daily growth reports, brand-security "
-                        "alerts, and hot lead alerts here."
-                    ),
+                    text="You'll receive the daily report here.",
                 )
         except Exception as e:
             logger.warning(f"Test message failed for {connection.platform}: {e}")
@@ -237,3 +226,28 @@ class IntegrationConnectionDetailView(TenantScopedAPIView):
         IntegrationConnection.objects.filter(id=pk, user=request.user).delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
+
+class IntegrationLinkCodeView(TenantScopedAPIView):
+    """POST — create a one-time code that links a Slack workspace or Discord
+    server to this connection.
+
+    Running ``/cansee link <code>`` in the workspace (a request Slack or
+    Discord signs) is what sets and verifies the workspace id; the id can't
+    be typed in. Each code works once, for 15 minutes.
+    """
+
+    def post(self, request, pk):
+        from apps.notifications.services.chat_link import (
+            LINKABLE_PLATFORMS,
+            create_link_code,
+        )
+
+        connection = IntegrationConnection.objects.filter(id=pk, user=request.user).first()
+        if connection is None:
+            return Response({"error": "Connection not found"}, status=status.HTTP_404_NOT_FOUND)
+        if connection.platform not in LINKABLE_PLATFORMS:
+            return Response(
+                {"error": "Only Slack and Discord connections can be linked to a workspace."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return Response(create_link_code(connection), status=status.HTTP_201_CREATED)

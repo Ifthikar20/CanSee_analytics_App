@@ -20,7 +20,7 @@ Used by source_resolver when the pixel has no data but GA4 is connected —
 Metric mapping is honest, not cosmetic: totalUsers -> unique visitors,
 screenPageViews -> page views, averageSessionDuration -> avg session
 ("M:SS" string like the pixel), GA4 bounceRate (1 - engagementRate,
-fraction) -> bounce %. hot_leads has no GA4 analogue and stays 0.
+fraction) -> bounce %. Trends are None when the previous period is empty.
 Chart windows are zero-filled like DailyStatsService.get_chart_data, so
 the frontend's noData heuristic behaves identically.
 
@@ -82,14 +82,12 @@ def _overview(period: str, **values) -> dict:
         "period": period,
         "total_visitors": 0,
         "total_pageviews": 0,
-        # Pixel-only lead scoring; no GA4 analogue — never faked.
-        "hot_leads": 0,
-        "visitor_growth_pct": 0,
-        "pageviews_trend": 0,
-        "avg_session": "0:00",
-        "session_trend": 0,
-        "bounce_rate": 0,
-        "bounce_trend": 0,
+        "visitor_growth_pct": None,
+        "pageviews_trend": None,
+        "avg_session": None,
+        "session_trend": None,
+        "bounce_rate": None,
+        "bounce_trend": None,
         "realtime": 0,
         "data_source": SOURCE_NAME,
     }
@@ -97,9 +95,10 @@ def _overview(period: str, **values) -> dict:
     return base
 
 
-def _trend(current: float, previous: float) -> float:
+def _trend(current: float, previous: float) -> float | None:
+    # Nothing in the previous window means the change is unknown, not 0%.
     if not previous:
-        return 0
+        return None
     return round((current - previous) / previous * 100, 1)
 
 

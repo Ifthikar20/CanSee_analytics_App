@@ -29,6 +29,7 @@ from core.validators.safe_http import FetchError, safe_get
 from services.sources import logic as sources_logic
 from services.sources.logic import (  # noqa: F401
     MAX_TEXT_CHARS,
+    PAGE_DEADLINE,
     PAGE_TIMEOUT,
     USER_AGENT,
 )
@@ -51,7 +52,10 @@ def read_yelp(url: str) -> dict:
 def read_page(url: str) -> dict:
     """Fetch a regular page through the SSRF guard and extract its text."""
     try:
-        resp = safe_get(url, timeout=PAGE_TIMEOUT, headers={"User-Agent": USER_AGENT})
+        resp = safe_get(
+            url, timeout=PAGE_TIMEOUT, deadline=PAGE_DEADLINE,
+            headers={"User-Agent": USER_AGENT},
+        )
     except FetchError as exc:
         return sources_logic.result(
             sources_logic.fetch_error_status(str(exc)), "page", detail=str(exc)

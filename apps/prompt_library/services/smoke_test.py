@@ -58,6 +58,8 @@ def smoke_test_prompt(
     Returns a dict with ``ok``, ``provider``, ``filled_prompt``,
     ``response_text``, ``mentioned``, ``citations_count``,
     ``citations_sample``, ``latency_ms``, ``cost_usd``, and ``error``.
+    ``cost_usd`` is None: the cost is recorded in the usage ledger, not
+    computed here.
     """
     filled, missing = resolve_for_website(website, prompt)
 
@@ -71,7 +73,7 @@ def smoke_test_prompt(
         "citations_count": 0,
         "citations_sample": [],
         "latency_ms": 0,
-        "cost_usd": 0.0,
+        "cost_usd": None,
         "error": "",
     }
 
@@ -88,15 +90,21 @@ def smoke_test_prompt(
         envelope["error"] = f"provider_not_configured: {provider}"
         return envelope
 
+    from apps.metering.services import prompt_runs
+
     t0 = time.monotonic()
     try:
-        result = instance.query(
-            filled,
-            "",
-            user=user,
-            website=website,
-            audit_id="prompt_library_smoke_test",
-            role="smoke_test",
+        # One prompt run; with none left the engine is not asked.
+        result = prompt_runs.guard(
+            lambda: instance.query(
+                filled,
+                "",
+                user=user,
+                website=website,
+                audit_id="prompt_library_smoke_test",
+                role="smoke_test",
+            ),
+            user=user, website=website, engine=provider, feature="smoke_test",
         )
     except Exception as exc:
         envelope["error"] = str(exc)[:300]

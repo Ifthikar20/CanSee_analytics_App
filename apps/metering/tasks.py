@@ -289,3 +289,14 @@ def prune_polar_outbox():
         status=PolarEventOutbox.STATUS_DEAD, updated_at__lt=now - timedelta(days=90)
     ).delete()[0]
     return {"sent_deleted": sent_deleted, "dead_deleted": dead_deleted}
+
+
+# ── Prompt runs ───────────────────────────────────────────────────────────
+
+
+@shared_task(name="apps.metering.tasks.release_stale_prompt_runs")
+def release_stale_prompt_runs():
+    """Give back prompt runs a worker reserved and never settled."""
+    from apps.metering.services import prompt_runs
+
+    return {"released": prompt_runs.release_stale()}

@@ -138,9 +138,6 @@ if SENTRY_DSN:  # noqa: F405
         environment="production",
     )
 
-# Hard-wire dev billing OFF in prod regardless of env var. Stripe is
-# the only path to a real subscription on this environment.
-
 # Fail closed on field encryption in prod: EncryptedTextField refuses to store
 # or read plaintext, and `manage.py check --deploy` errors if FIELD_ENCRYPTION_KEY
 # is missing or invalid. Never store OAuth tokens / webhook secrets in the clear.

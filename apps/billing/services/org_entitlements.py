@@ -43,6 +43,26 @@ def seats_used(org) -> int:
     return org.members.count() + pending
 
 
+def seat_available(org, *, holding_invitation: bool = False) -> bool:
+    """Whether one more person may take a seat in ``org``.
+
+    ``holding_invitation``: the person is accepting an invitation, which
+    already reserves its seat (``seats_used`` counts it), so only accepted
+    members are compared with the cap. Everyone else (a new invitation,
+    domain or SSO auto-join, an operator add) needs a free seat on top of
+    the members and the live invitations.
+
+    An org that is over its cap (its plan's seat count was lowered after
+    people joined) keeps every member; it just cannot add anyone until it
+    is back under the cap.
+    """
+    cap = seat_limit_for(org)
+    if cap <= 0:
+        return True
+    taken = org.members.count() if holding_invitation else seats_used(org)
+    return taken < cap
+
+
 def seats_block(org) -> dict | None:
     """The session/UI payload: {used, max}. None when unlimited."""
     limit = seat_limit_for(org)
@@ -84,15 +104,69 @@ def prompts_used_this_month(user) -> int:
     Counted at audit creation (len of the prompt list) — a prompt spends
     allowance once regardless of how many providers answer it. Python-side
     sum because ``prompts`` is a JSON list with no portable DB length.
+
+    Autopilot's audits (the ones an AutopilotRunPrompt points to) are left
+    out: the number means "prompts you queue yourself", so a daily run never
+    uses up the month and refuses the owner's own scans.
+
+    Prompts of audits deleted this month still count (record_deleted_audit
+    keeps them), so deleting an audit never hands its prompts back.
     """
     from apps.llm_ranking.models import LLMRankingAudit
 
-    now = timezone.now()
-    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    month_start = _month_start()
     prompt_lists = LLMRankingAudit.objects.filter(
-        created_by=user, created_at__gte=month_start,
+        created_by=user, created_at__gte=month_start, autopilot_rows__isnull=True,
     ).values_list("prompts", flat=True)
-    return sum(len(p or []) for p in prompt_lists)
+    return sum(len(p or []) for p in prompt_lists) + _deleted_prompts(user, month_start)
+
+
+def _month_start():
+    now = timezone.now()
+    return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+
+def _deleted_counter_filter(user_id, month_start) -> dict:
+    from apps.metering.models import UsageCounter
+
+    return {
+        "meter": UsageCounter.METER_DELETED_AUDIT_PROMPTS,
+        "account_key": f"user:{user_id}",
+        "period_key": month_start.date().isoformat(),
+    }
+
+
+def _deleted_prompts(user, month_start) -> int:
+    from apps.metering.models import UsageCounter
+
+    if user is None or not getattr(user, "pk", None):
+        return 0
+    return (
+        UsageCounter.objects.filter(**_deleted_counter_filter(user.pk, month_start))
+        .values_list("value", flat=True).first()
+        or 0
+    )
+
+
+def record_deleted_audit(audit) -> None:
+    """Keep the prompts of an audit about to be deleted on its creator's
+    month, when they count toward the monthly prompt allowance (created
+    this month, not by Autopilot). Call before ``audit.delete()``."""
+    from django.db.models import F
+
+    from apps.metering.models import UsageCounter
+
+    month_start = _month_start()
+    count = len(audit.prompts or [])
+    if (
+        not count or not audit.created_by_id or audit.created_at is None
+        or audit.created_at < month_start or audit.autopilot_rows.exists()
+    ):
+        return
+    counter, _ = UsageCounter.objects.get_or_create(
+        **_deleted_counter_filter(audit.created_by_id, month_start),
+    )
+    UsageCounter.objects.filter(pk=counter.pk).update(value=F("value") + count)
 
 
 def check_prompt_allowance(user, requested: int) -> None:

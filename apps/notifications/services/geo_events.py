@@ -13,7 +13,7 @@ from apps.notifications.services.notification_service import NotificationService
 
 logger = logging.getLogger("apps")
 
-# Cumulative prompt-volume thresholds for prompt-coverage milestone events.
+# Cumulative answered-query thresholds for coverage milestone events.
 PROMPT_COVERAGE_MILESTONES = (50, 100, 250, 500, 1000, 2500, 5000, 10000)
 
 # Absolute mention-rate point delta that counts as a meaningful shift between
@@ -24,9 +24,19 @@ VISIBILITY_DELTA_THRESHOLD = 10.0
 def record_audit_events(audit) -> None:
     """Fan an audit's completion out to a set of in-app notifications.
 
-    Producer-only. Each step is independently guarded so a single failure
-    can't block audit save or block sibling notifications.
+    Only completed audits with a measured score qualify: a run where no
+    query was answered has nothing to report. Producer-only. Each step is
+    independently guarded so a single failure can't block audit save or
+    block sibling notifications.
     """
+    from apps.llm_ranking.models import LLMRankingAudit
+
+    if (
+        audit.status != LLMRankingAudit.STATUS_COMPLETED
+        or audit.overall_score is None
+        or audit.mention_rate is None
+    ):
+        return
     for emit in (
         _emit_audit_complete,
         _emit_visibility_change,
@@ -51,12 +61,18 @@ def _website_name(audit) -> str:
 
 
 def _previous_audit(audit):
+    """The website's previous completed prompt run.
+
+    Only runs from the audit pipeline count (they record ``total_queries``);
+    single-prompt scans are not comparable with a full run.
+    """
     from apps.llm_ranking.models import LLMRankingAudit
     return (
         LLMRankingAudit.objects
         .filter(
             website_id=audit.website_id,
             status=LLMRankingAudit.STATUS_COMPLETED,
+            total_queries__gt=0,
         )
         .exclude(id=audit.id)
         .order_by("-completed_at")
@@ -110,7 +126,7 @@ def _emit_audit_complete(audit) -> None:
 
 def _emit_visibility_change(audit) -> None:
     prev = _previous_audit(audit)
-    if prev is None:
+    if prev is None or prev.mention_rate is None:
         return
     delta = audit.mention_rate - prev.mention_rate
     if abs(delta) < VISIBILITY_DELTA_THRESHOLD:
@@ -166,8 +182,9 @@ def _emit_prompt_coverage_milestone(audit) -> None:
         website_id=audit.website_id,
         status=LLMRankingAudit.STATUS_COMPLETED,
     )
-    total = LLMRankingResult.objects.filter(audit__in=completed_audits).count()
-    this_audit = LLMRankingResult.objects.filter(audit=audit).count()
+    answered = LLMRankingResult.objects.filter(query_succeeded=True)
+    total = answered.filter(audit__in=completed_audits).count()
+    this_audit = answered.filter(audit=audit).count()
     previous = total - this_audit
     crossed = next(
         (t for t in PROMPT_COVERAGE_MILESTONES if previous < t <= total),
@@ -178,10 +195,10 @@ def _emit_prompt_coverage_milestone(audit) -> None:
     NotificationService.create(
         user=audit.created_by,
         notification_type="milestone",
-        title=f"{crossed:,} prompts tracked",
+        title=f"{crossed:,} AI answers measured",
         message=(
-            f"{_website_name(audit)} has now been measured against "
-            f"{crossed:,} prompts across LLMs."
+            f"{_website_name(audit)} has now been measured in "
+            f"{crossed:,} AI answers."
         ),
         data={
             "audit_id": str(audit.id),

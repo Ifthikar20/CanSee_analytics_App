@@ -12,26 +12,9 @@ logger = logging.getLogger("apps")
 def extract_facts_for_website(website_id: str, limit: int = 50) -> int:
     from apps.brand_vault.services.fact_extractor import extract_facts_for_website as _impl
     try:
-        result = _impl(website_id, limit=limit)
+        return _impl(website_id, limit=limit)
     except Exception as exc:  # pragma: no cover
         logger.exception("brand_vault.extract_facts_for_website(%s) failed: %s", website_id, exc)
-        return 0
-    # Chain tone sampling so Phase 4's voice guard has fresh exemplars.
-    try:
-        sample_tone_for_website.delay(website_id)
-    except Exception as exc:  # pragma: no cover
-        logger.warning("Could not queue sample_tone_for_website(%s): %s", website_id, exc)
-    return result
-
-
-@shared_task(name="apps.brand_vault.tasks.sample_tone_for_website")
-def sample_tone_for_website(website_id: str, target_count: int = 30) -> int:
-    """Run the tone sampler for a website. Returns new sample count."""
-    from apps.brand_vault.services.tone_sampler import sample_tone_from_chunks
-    try:
-        return sample_tone_from_chunks(website_id, target_count=target_count)
-    except Exception as exc:  # pragma: no cover
-        logger.exception("brand_vault.sample_tone_for_website(%s) failed: %s", website_id, exc)
         return 0
 
 
@@ -229,40 +212,57 @@ def run_brand_pulse() -> int:
 
 @shared_task(name="apps.brand_vault.tasks.refresh_fact_embeddings")
 def refresh_fact_embeddings() -> int:
-    """Re-embed BrandFacts with missing or fallback-dim embeddings. Daily cron.
+    """Embed BrandFacts that have no model vector. Daily cron.
 
-    Besides NULL embeddings, this repairs facts embedded under a hash
-    fallback (32- or 256-dim): those vectors are invisible to the
-    1536-dim semantic space and would otherwise stay broken forever.
-    Only attempted when a real embedding key is configured.
+    Covers facts stored without a vector (embeddings were unavailable)
+    and facts still holding a legacy 32- or 256-dim word-hash vector,
+    which are invisible to the 1536-dim semantic space. Does nothing
+    until an embedding key is configured. A website whose embedding is
+    refused (spent allowance, API error) is skipped until the next run.
     """
-    from django.conf import settings
     from django.db.models import Q
 
     from apps.brand_vault.models import BrandFact
     from apps.brand_vault.services.embeddings import embed_text
-    from apps.rag.services.embedder import OPENAI_DIM
+    from apps.rag.services.embedder import OPENAI_DIM, embeddings_configured
 
-    qs = BrandFact.objects.filter(embedding__isnull=True)
+    if not embeddings_configured():
+        return 0
+
+    candidates = list(
+        BrandFact.objects.filter(Q(embedding__isnull=True) | Q(embedding=[]))
+        .select_related("website__user")
+        .iterator(chunk_size=200)
+    )
+    stale = (
+        BrandFact.objects.filter(embedding__isnull=False)
+        .exclude(embedding=[])
+        .select_related("website__user")
+        .iterator(chunk_size=200)
+    )
+    candidates += [f for f in stale if len(f.embedding or []) != OPENAI_DIM]
+
     count = 0
-    candidates = list(qs.iterator(chunk_size=200))
-    if getattr(settings, "OPENAI_API_KEY", ""):
-        stale = BrandFact.objects.filter(
-            Q(embedding__isnull=False) & ~Q(embedding=[]),
-        ).iterator(chunk_size=200)
-        candidates += [f for f in stale if len(f.embedding or []) != OPENAI_DIM]
+    refused_websites: set = set()
     for fact in candidates:
+        if fact.website_id in refused_websites:
+            continue
+        vector, _model = embed_text(
+            f"{fact.subject} {fact.predicate} {fact.object}",
+            website=fact.website,
+            # Cron work: spend goes to the website owner, explicitly
+            # tagged system so the usage breakdown can tell it apart.
+            user=getattr(fact.website, "user", None),
+            metadata={"actor": "system"},
+        )
+        if not vector:
+            refused_websites.add(fact.website_id)
+            continue
+        fact.embedding = vector
         try:
-            fact.embedding = embed_text(
-                f"{fact.subject} {fact.predicate} {fact.object}",
-                website=fact.website,
-                # Cron work: spend goes to the website owner, explicitly
-                # tagged system so the usage breakdown can tell it apart.
-                user=getattr(fact.website, "user", None),
-                metadata={"actor": "system"},
-            )
             fact.save(update_fields=["embedding", "updated_at"])
-            count += 1
         except Exception as exc:  # pragma: no cover
             logger.warning("refresh_fact_embeddings(%s) failed: %s", fact.id, exc)
+            continue
+        count += 1
     return count

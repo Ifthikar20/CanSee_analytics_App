@@ -1,0 +1,360 @@
+"""What the agent workspace offers, and whether it can run right now.
+
+``agents()`` is the fixed catalog behind GET agents/, and
+``report_templates(user)`` the report templates behind GET
+report-templates/. ``status_for(user)``
+reports the live configuration (switch, process, model, which AI engines
+and Google search have keys, the user's allowance, which writing agents
+it can start and whether the research agents are on); every value comes
+from settings or the usage ledger, never from a default that pretends.
+"""
+from __future__ import annotations
+
+from decimal import Decimal
+
+from django.core.cache import cache
+
+from apps.agent.conf import agent_conf, api_key_configured
+from apps.agent.constants import AGENT_TEAMS, OUTPUT_KIND_BY_AGENT, TEAM_LABELS, AgentKey
+from apps.agent.runtime.registry import LIVE_HEARTBEAT_CACHE_KEY
+
+# Display order (design/p2_contract.md 12b); the copy is exact.
+_CATALOG = (
+    {
+        "key": AgentKey.GAP_ANALYST.value,
+        "name": "Gap Analyst",
+        "description": (
+            "Researches where you rank on Google and in AI answers for the prompts "
+            "you track, compares the two and writes a report you can save."
+        ),
+        "starter": (
+            "Research how we rank on Google and in AI answers for our tracked prompts, "
+            "and compare the two."
+        ),
+    },
+    {
+        "key": AgentKey.PAGE_OPTIMIZER.value,
+        "name": "Page Optimizer",
+        "description": (
+            "Rewrites one page of your site against the prompts you track, the searches "
+            "engines ran and the crawler audit, and lists every change with the measurement "
+            "behind it."
+        ),
+        "starter": "Optimize our page that engines retrieve but never cite.",
+    },
+    {
+        "key": AgentKey.AEO_ARTICLE.value,
+        "name": "AEO Article Agent",
+        "description": (
+            "Writes an answer-first article (Markdown) built to be quoted and cited "
+            "by AI engines."
+        ),
+        "starter": "Write an article that answers the question our buyers ask most.",
+    },
+    {
+        "key": AgentKey.LLMS_TXT.value,
+        "name": "llms.txt Agent",
+        "description": (
+            "Drafts an llms.txt file that points AI tools to the most useful pages of your site."
+        ),
+        "starter": "Draft an llms.txt file for our site.",
+    },
+    {
+        "key": AgentKey.COMPARISON_PAGE.value,
+        "name": "Comparison Page Agent",
+        "description": (
+            "Writes a comparison page between you and one competitor you track, using only "
+            "what each side's own pages say."
+        ),
+        "starter": "Write a comparison page with our closest competitor.",
+    },
+    {
+        "key": AgentKey.LANDING_PAGE.value,
+        "name": "Landing Page Agent",
+        "description": (
+            "Drafts a complete landing page (HTML) for one search intent, written "
+            "from your brand context."
+        ),
+        "starter": "Draft a landing page for the search where we are missing the most.",
+    },
+    {
+        "key": AgentKey.AD_CAMPAIGN.value,
+        "name": "Ad Campaign Agent",
+        "description": (
+            "Builds a Google Search campaign as a sheet: ad groups, keywords, "
+            "negatives, ads and sitelinks, checked against Google's limits."
+        ),
+        "starter": "Build a Google Search ad campaign for our main offering.",
+    },
+    {
+        "key": AgentKey.SOCIAL_POSTS.value,
+        "name": "Social Posts Agent",
+        "description": (
+            "Turns a draft or a topic into LinkedIn posts, X posts or an X thread, counted "
+            "against each network's limit."
+        ),
+        "starter": "Write LinkedIn and X posts for our latest article.",
+    },
+    {
+        "key": AgentKey.PR_WRITER.value,
+        "name": "PR Agent",
+        "description": (
+            "Drafts a press release, a media pitch, or correction requests to the publishers "
+            "whose pages repeat a claim your evidence contradicts."
+        ),
+        "starter": "Draft correction requests for an inaccurate claim AI engines repeat.",
+    },
+    {
+        "key": AgentKey.MESSAGING_BRIEF.value,
+        "name": "Messaging Agent",
+        "description": (
+            "Writes a messaging brief from your context: positioning, proof points with their "
+            "sources, and how AI engines describe you now."
+        ),
+        "starter": "Write a messaging brief for our main offering.",
+    },
+)
+
+
+def agents() -> list[dict]:
+    """The ten agents, in display order (contract: GET agents/), each with
+    its teams (the primary one first)."""
+    return [
+        {**entry, "output_kind": OUTPUT_KIND_BY_AGENT[entry["key"]],
+         "teams": [{"key": team, "label": TEAM_LABELS[team]} for team in AGENT_TEAMS[entry["key"]]]}
+        for entry in _CATALOG
+    ]
+
+
+def agent_name(key: str) -> str:
+    """Display name of an agent key ("Landing Page Agent")."""
+    for entry in _CATALOG:
+        if entry["key"] == key:
+            return entry["name"]
+    return key
+
+
+def engines() -> list[dict]:
+    """The AI engines the scan pipeline asks, and whether each has a key.
+
+    Same keys, labels and order as the search-gap overview.
+    """
+    from apps.citations.services.url_analytics import model_key
+    from apps.llm_ranking.providers import PROVIDERS
+    from apps.prompt_library.services.prompt_stats import MODEL_LABELS, is_configured
+    from apps.search_gap.services.overview import ENGINE_ORDER
+
+    return [
+        {
+            "key": model_key(provider),
+            "label": MODEL_LABELS.get(provider, provider),
+            "configured": is_configured(PROVIDERS[provider]),
+        }
+        for provider in ENGINE_ORDER
+        if provider in PROVIDERS
+    ]
+
+
+def live_available() -> bool:
+    """True in the agent process, or when one has heartbeated recently (the
+    agent process refreshes LIVE_HEARTBEAT_CACHE_KEY every few seconds)."""
+    if agent_conf().process:
+        return True
+    try:
+        return bool(cache.get(LIVE_HEARTBEAT_CACHE_KEY))
+    except Exception:
+        # A cache outage must not take status/ down with it.
+        return False
+
+
+def writers(user) -> dict:
+    """Whether the user's remaining AI allowance can start each writing
+    agent (the check run_agent makes before it starts one), the least it
+    needs, so the workspace can disable a writer before the user pays for
+    an orchestrator turn, and the most one new draft's writer request
+    costs (its output limit at $20 per MTok plus WRITER_INPUT_USD_MAX)."""
+    from apps.agent.subagents.base import (
+        OUTPUT_PRICE_PER_TOKEN,
+        WRITER_INPUT_USD_MAX,
+        _specs,
+        writer_budget,
+    )
+
+    conf = agent_conf()
+    out = {}
+    for key, spec in _specs().items():
+        limit = int(spec.max_tokens(conf))
+        max_tokens, minimum, _cap, _spent = writer_budget(user, limit)
+        most = OUTPUT_PRICE_PER_TOKEN * limit + WRITER_INPUT_USD_MAX
+        out[key] = {
+            "available": max_tokens >= minimum,
+            "needs_usd": float(OUTPUT_PRICE_PER_TOKEN * minimum),
+            "max_usd": str(most.quantize(Decimal("0.01"))),
+        }
+    return out
+
+
+def status_for(user, website=None, runs_needed: int | None = None) -> dict:
+    """Contract: GET status/. Answers even when the agent is switched off.
+
+    ``website`` (optional) reads the prompt runs of that project's owner;
+    ``runs_needed`` (optional) is what the caller is about to ask, so the
+    setup block can say when fewer runs are left."""
+    from apps.agent.services import setup_status
+    from apps.citations.services import serp_google
+    from apps.metering.services import prompt_runs
+    from apps.metering.services.usage_reader import allowance_status
+
+    conf = agent_conf()
+    allowance = allowance_status(user)
+    runs = prompt_runs.status(user, website)
+    live = live_available()
+    configured = api_key_configured()
+    engine_rows = setup_status.engines(user)
+    google = setup_status.google(user)
+    return {
+        "enabled": conf.enabled,
+        "live_available": live,
+        # Whether ANTHROPIC_API_KEY is set; without it no run can start.
+        "configured": configured,
+        "model": conf.model,
+        # [{key, provider, label, configured, key_setting, reason}];
+        # key_setting is "" unless the viewer is staff or DEBUG is on.
+        "engines": engine_rows,
+        "serp_configured": serp_google.is_configured(),
+        "google": google,
+        "web_tools_enabled": conf.web_tools_enabled,
+        "allowance": {
+            "cap_usd": allowance["cap_usd"],
+            "spent_usd": allowance["spent_usd"],
+            "exceeded": allowance["exceeded"],
+            "warning": allowance["warning"],
+            # Free accounts count prompt runs; their dollar cap is hidden.
+            "show_usd": runs["unlimited"],
+        },
+        "prompt_runs": runs,
+        "research": setup_status.research(
+            conf=conf, configured=configured, live=live,
+            allowance_exceeded=bool(allowance["exceeded"]), engine_rows=engine_rows,
+            google_block=google, free=not runs["unlimited"],
+        ),
+        "setup": setup_status.setup(
+            user, conf=conf, configured=configured, live=live, engine_rows=engine_rows,
+            google_block=google, runs=runs, allowance=allowance, runs_needed=runs_needed,
+        ),
+        "writers": writers(user),
+        # A reply starts no new request once it has used this much.
+        "limits": {"run_cost_usd": f"{Decimal(str(conf.run_max_cost_usd)):.2f}"},
+        # The research agents (research_swarm and re-runs).
+        "swarm": {
+            "enabled": conf.swarm_enabled,
+            "max_agents": conf.swarm_max_tasks,
+            "worker_model": conf.worker_model,
+        },
+    }
+
+
+# ── Report templates ──────────────────────────────────────────────────────
+
+
+def _shows_settings(user) -> bool:
+    """Staff, and local or DEBUG builds, also see the setting to change."""
+    from django.conf import settings
+
+    return bool(getattr(settings, "DEBUG", False) or getattr(user, "is_staff", False))
+
+
+def _note(code: str, message: str, setting: str) -> dict:
+    return {"code": code, "message": message, "setting": setting}
+
+
+def template_unavailable(template) -> dict | None:
+    """Why the workspace cannot run this template ({code, message,
+    setting}), or None. A missing engine or Google search is only a
+    limitation unless the template cannot work without it."""
+    from apps.agent.report_templates import NOT_USED, REQUIRED, SAVED
+    from apps.agent.services import measured
+    from apps.agent.tools.registry import client_tool_definitions
+    from apps.citations.services import serp_google
+
+    if template.needs_insights and not measured.insights_enabled():
+        return _note("insights_off",
+                     f"{template.name} needs the Sentiment and Fact check analysis, which isn't "
+                     "turned on for this workspace.", "INSIGHTS_ENABLED")
+    offered = {t["name"] for t in client_tool_definitions()}
+    if not set(template.required_tools) <= offered:
+        return _note("tools_missing", f"{template.name} isn't available on this workspace.", "")
+    google = serp_google.is_configured()
+    if template.google == REQUIRED and not google:
+        return _note("google_not_configured", "Google search isn't set up on this workspace.",
+                     "SERPAPI_KEY")
+    if template.google not in (NOT_USED, SAVED) and template.engines not in (NOT_USED, SAVED) \
+            and not google and not any(e["configured"] for e in engines()):
+        return _note("nothing_configured",
+                     "Google search and the AI engines aren't set up on this workspace.",
+                     "SERPAPI_KEY")
+    return None
+
+
+def template_limitations(template) -> list[dict]:
+    """What a runnable template will report as not configured."""
+    from apps.agent.report_templates import NOT_USED, SAVED
+    from apps.agent.tools.research import engine_catalog
+    from apps.citations.services import serp_google
+
+    out = []
+    if template.google not in (NOT_USED, SAVED) and not serp_google.is_configured():
+        out.append(_note("google_not_configured",
+                         "Google search isn't set up on this workspace, so Google results show "
+                         "as not configured.", "SERPAPI_KEY"))
+    if template.engines not in (NOT_USED, SAVED):
+        for engine in engine_catalog():
+            if not engine["configured"]:
+                out.append(_note("engine_not_configured",
+                                 f"{engine['label']} isn't set up on this workspace.",
+                                 engine["key_setting"]))
+    if template.research_agents and not agent_conf().swarm_enabled:
+        out.append(_note("research_agents_off",
+                         "The research agents are turned off, so the agent runs single searches "
+                         "and checks instead.", "AGENT_SWARM_ENABLED"))
+    return out
+
+
+def report_templates(user) -> list[dict]:
+    """Contract: GET report-templates/ (apps.agent.report_templates)."""
+    from apps.agent.report_templates import TEMPLATES
+
+    show = _shows_settings(user)
+
+    def public(note: dict | None) -> dict | None:
+        if note is None:
+            return None
+        out = {"code": note["code"], "message": note["message"]}
+        if show and note["setting"]:
+            out["setting"] = note["setting"]
+        return out
+
+    out = []
+    for template in TEMPLATES.values():
+        unavailable = public(template_unavailable(template))
+        out.append({
+            "id": template.key,
+            "name": template.name,
+            "purpose": template.purpose,
+            "header_fields": list(template.header_fields),
+            "sections": [
+                {"title": s.title, "shows": s.shows, "source": s.source, "repeat": s.repeat}
+                for s in template.sections
+            ],
+            "requirements": {
+                "google": template.google,
+                "engines": template.engines,
+                "research_agents": template.research_agents,
+                "runs_checks": template.runs_checks,
+                "note": template.requirement_note,
+            },
+            "available": unavailable is None,
+            "unavailable": unavailable,
+            "limitations": [public(n) for n in template_limitations(template)],
+        })
+    return out

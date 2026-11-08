@@ -25,7 +25,7 @@ from django.conf import settings
 from apps.brand_vault.models import BrandFact, FactStatus
 from apps.brand_vault.services.embeddings import embed_text
 from apps.brand_vault.services.fact_versioning import record_creation
-from core.llm import ClaudeUtility
+from core.llm import ClaudeUtility, configured_claude_model
 
 logger = logging.getLogger("apps")
 
@@ -46,7 +46,7 @@ def _call_llm(text: str, *, website=None) -> list[dict]:
     instead of raising. ``website`` attributes the token spend to the
     tenant in core.ai_tracking.
     """
-    result = ClaudeUtility(model="claude-sonnet-4-20250514", max_tokens=1024).query(
+    result = ClaudeUtility(model=configured_claude_model(), max_tokens=1024).query(
         EXTRACTION_PROMPT.format(text=text),
         user=getattr(website, "user", None),
         website=website,
@@ -137,25 +137,36 @@ def _persist_items(items: list[dict], *, website, source_chunk=None, source_url=
             confidence=max(0.0, min(1.0, confidence)),
             status=status,
         )
-        try:
-            fact.embedding = embed_text(
-                f"{subject} {predicate} {obj}",
-                user=getattr(website, "user", None), website=website,
-            )
+        # No vector when embeddings are unavailable; refresh_fact_embeddings
+        # fills it in later.
+        vector, _model = embed_text(
+            f"{subject} {predicate} {obj}",
+            user=getattr(website, "user", None), website=website,
+        )
+        if vector:
+            fact.embedding = vector
             fact.save(update_fields=["embedding", "updated_at"])
-        except Exception:
-            pass
         record_creation(fact)
         created.append(fact)
     return created
 
 
 def extract_facts_for_website(website_id: str, limit: int = 50) -> int:
-    """Iterate KnowledgeChunks that have no facts yet, extract from each."""
-    from apps.rag.models import KnowledgeChunk
+    """Iterate Brand Input chunks that have no facts yet, extract from each.
+
+    Only the brand's own material is read: the knowledge base also
+    mirrors AI answers, findings and audit context, and a fact minted
+    from those would be AI output presented as the brand's word.
+    """
+    from apps.rag.models import KnowledgeChunk, KnowledgeSource
 
     qs = (
-        KnowledgeChunk.objects.filter(website_id=website_id, facts__isnull=True)
+        KnowledgeChunk.objects.filter(
+            website_id=website_id,
+            facts__isnull=True,
+            source__source_app=KnowledgeSource.SOURCE_APP_BRAND_INPUT,
+            source__kind__in=KnowledgeSource.BRAND_INPUT_KINDS,
+        )
         .distinct()
         .order_by("source_id", "chunk_index")[:limit]
     )
@@ -166,8 +177,3 @@ def extract_facts_for_website(website_id: str, limit: int = 50) -> int:
         except Exception as exc:  # pragma: no cover
             logger.warning("extract_facts_for_chunk(%s) failed: %s", chunk.id, exc)
     return total
-
-
-# Test/manual hook so callers can persist pre-parsed items without an LLM.
-def persist_extracted_items(items: list[dict], *, website, source_chunk=None, source_url=""):
-    return _persist_items(items, website=website, source_chunk=source_chunk, source_url=source_url)

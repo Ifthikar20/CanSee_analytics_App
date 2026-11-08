@@ -30,13 +30,12 @@ from apps.llm_ranking.models import LLMRankingAudit
 from core.views import TenantScopedAPIView, TenantScopedListAPIView
 
 
-def _get_audit_for_user(user, audit_id):
-    """Return the audit if its website belongs to ``user``, else 404."""
+def _get_audit_for_user(user, audit_id, *, min_role: str = "member"):
+    """Return the audit if ``user`` can reach its website, else 404/403."""
     from apps.websites.services.website_service import WebsiteService
 
     audit = get_object_or_404(LLMRankingAudit, id=audit_id)
-    # Will raise 404/403 if the user does not own the website.
-    WebsiteService.get_for_user(user=user, website_id=audit.website_id)
+    WebsiteService.get_for_user(user=user, website_id=audit.website_id, min_role=min_role)
     return audit
 
 
@@ -44,7 +43,7 @@ class AuditCitationsView(TenantScopedListAPIView):
     """List citations for one audit. Filterable by provider + source_class."""
 
     def get(self, request, audit_id):
-        audit = _get_audit_for_user(request.user, audit_id)
+        audit = _get_audit_for_user(request.user, audit_id, min_role="viewer")
         qs = Citation.objects.filter(audit=audit).select_related("result")
 
         provider = request.query_params.get("provider")
@@ -65,7 +64,7 @@ class AuditSourceInfluenceView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request, audit_id):
-        audit = _get_audit_for_user(request.user, audit_id)
+        audit = _get_audit_for_user(request.user, audit_id, min_role="viewer")
         return Response(compute_audit_breakdown(audit))
 
 
@@ -426,7 +425,10 @@ class SourceScanDetailView(TenantScopedAPIView):
         scan = self.get_tenant_object(
             SourceScan.objects.filter(website=website), pk=scan_id
         )
-        from apps.citations.services.source_scan import derive_opportunities
+        from apps.citations.services.source_scan import (
+            derive_opportunities,
+            is_summary_derived,
+        )
 
         payload = _scan_summary(scan)
         # Key is "rows", not "results": the EnvelopeRenderer treats any
@@ -446,6 +448,9 @@ class SourceScanDetailView(TenantScopedAPIView):
                 "relevance_note": r.relevance_note,
                 "fetch_status": r.fetch_status,
                 "content_kind": r.content_kind,
+                # True when the page could not be read and its brands were
+                # taken from a Perplexity summary instead.
+                "summary_derived": is_summary_derived(r),
                 "word_count": r.word_count,
                 "brands": r.brands,
                 "analysis_error": r.analysis_error,

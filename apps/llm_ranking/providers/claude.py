@@ -23,6 +23,22 @@ class ClaudeProvider(LLMProvider):
     rpm = 40
     burst = 15
 
+    # Output budget for models that answer without thinking unless asked
+    # (Haiku 4.5, the 4.x Sonnet and Opus models). A buying-guide answer
+    # with a ranked list often runs past 1024 tokens and was cut off; the
+    # bill follows what the model writes, not this cap.
+    ANSWER_MAX_TOKENS = 4096
+    # Model families that think whenever `thinking` is omitted (adaptive by
+    # default, or always on). max_tokens caps thinking plus the answer on
+    # these, so a 1024 budget can end mid-list; they get room for both, and
+    # low effort keeps the thinking short for a listing-style answer.
+    THINKING_BY_DEFAULT = (
+        "claude-sonnet-5", "claude-opus-5", "claude-fable-5",
+        "claude-mythos-5", "claude-haiku-5",
+    )
+    THINKING_MAX_TOKENS = 8000
+    THINKING_EFFORT = "low"
+
     def __init__(self):
         super().__init__()
         self.model = getattr(settings, "LLM_CLAUDE_MODEL", "") or self.DEFAULT_MODEL
@@ -34,12 +50,16 @@ class ClaudeProvider(LLMProvider):
         from apps.llm_ranking.services.regions import get_region
 
         client = anthropic.Anthropic(api_key=self.api_key)
+        thinks = self.model.startswith(self.THINKING_BY_DEFAULT)
+        max_tokens = self.THINKING_MAX_TOKENS if thinks else self.ANSWER_MAX_TOKENS
         kwargs = dict(
             model=self.model,
-            max_tokens=1024,
+            max_tokens=max_tokens,
             system=system_prompt or DEFAULT_SYSTEM,
             messages=[{"role": "user", "content": prompt}],
         )
+        if thinks:
+            kwargs["output_config"] = {"effort": self.THINKING_EFFORT}
         if getattr(settings, "LLM_WEBSEARCH_ENABLED", False):
             tool: dict = {
                 "type": "web_search_20250305",
@@ -75,6 +95,25 @@ class ClaudeProvider(LLMProvider):
             if getattr(b, "type", "") == "text" and getattr(b, "text", "")
         ).strip()
 
+        usage = resp.usage
+        # Server-side searches are billed per search on top of the tokens.
+        searches = int(getattr(getattr(usage, "server_tool_use", None),
+                               "web_search_requests", 0) or 0)
+
+        # Only a finished answer is a measurement. A refusal, an answer cut
+        # off at max_tokens or a turn the web search paused is a failure, so
+        # a scan never records "not named" from an answer that never got
+        # there. The call was still billed, so its usage goes with it.
+        incomplete = _incomplete_answer(resp, text, max_tokens)
+        if incomplete:
+            return ProviderResult(
+                succeeded=False,
+                error=incomplete,
+                input_tokens=usage.input_tokens,
+                output_tokens=usage.output_tokens,
+                web_search_requests=searches,
+            )
+
         # Sources, Perplexity-style: URLs Claude itself cited (in first-cited
         # order), then the retrieved-but-uncited pages, capped so a 5-search
         # answer cannot flood the citations pipeline (which has no cap of its
@@ -85,9 +124,8 @@ class ClaudeProvider(LLMProvider):
         seen: set[str] = set()
 
         def _url_of(item):
-            # On the pinned SDK, citation entries and search results arrive
-            # as plain dicts (unknown-to-the-SDK fields land in model_extra
-            # unparsed); newer SDK versions type them. Accept both.
+            # SDK 2.x types citation entries and search results; older SDKs
+            # returned them as plain dicts. Accept both.
             if isinstance(item, dict):
                 return item.get("url")
             return getattr(item, "url", None)
@@ -108,10 +146,49 @@ class ClaudeProvider(LLMProvider):
                     for r in content:
                         _add(_url_of(r))
 
+        search_queries, web_searches = _search_queries(resp) if "tools" in kwargs else ([], 0)
         return ProviderResult(
             succeeded=True,
             text=text,
-            input_tokens=resp.usage.input_tokens,
-            output_tokens=resp.usage.output_tokens,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
             citations=citations,
+            web_search_requests=searches,
+            searched=searches > 0,
+            search_queries=search_queries,
+            web_searches=web_searches,
         )
+
+
+def _search_queries(resp) -> tuple[list[str], int]:
+    """(query texts, searches run) from the web_search server_tool_use
+    blocks: one block per search, its query in ``input.query``. SDK 2.x
+    types the blocks; older SDKs and test doubles use dicts."""
+    from .openai_compat import _get, clean_search_queries
+
+    queries, searches = [], 0
+    for b in getattr(resp, "content", None) or []:
+        if _get(b, "type") != "server_tool_use" or _get(b, "name") != "web_search":
+            continue
+        searches += 1
+        tool_input = _get(b, "input", None)
+        queries.append(_get(tool_input, "query", None) if tool_input is not None else None)
+    return clean_search_queries(queries), searches
+
+
+def _incomplete_answer(resp, text: str, max_tokens: int) -> str:
+    """Why ``resp`` is not a complete answer, or "" when it is one."""
+    stop = getattr(resp, "stop_reason", None)
+    if stop == "refusal":
+        # stop_details is informational and may be absent; branch on
+        # stop_reason only.
+        category = getattr(getattr(resp, "stop_details", None), "category", None)
+        suffix = f" ({category})" if category else ""
+        return f"refusal: Claude declined to answer{suffix}"
+    if stop == "max_tokens":
+        return f"max_tokens: the answer was cut off at the {max_tokens}-token limit"
+    if stop == "pause_turn":
+        return "pause_turn: the web search paused the turn before an answer was written"
+    if not text:
+        return "empty_answer: Claude returned no answer text"
+    return ""

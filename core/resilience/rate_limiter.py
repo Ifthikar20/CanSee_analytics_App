@@ -18,9 +18,13 @@ Usage:
 from __future__ import annotations
 
 import logging
+import math
 import time
 
 logger = logging.getLogger("core.resilience")
+
+# Shortest time a bucket's state is kept in the cache.
+_MIN_STATE_TTL_SECONDS = 300
 
 
 class RateLimited(Exception):
@@ -47,6 +51,19 @@ class TokenBucket:
     @property
     def _key(self) -> str:
         return f"rl:{self.name}"
+
+    @property
+    def _state_ttl(self) -> int:
+        """Seconds to keep the bucket state: at least a full refill from empty.
+
+        If the state expired sooner, a missing key would be read as a full
+        bucket and a slow-refilling bucket would hand out a fresh burst after
+        every pause, well above its steady rate.
+        """
+        if self.refill_per_second <= 0:
+            return _MIN_STATE_TTL_SECONDS
+        full_refill = math.ceil(self.capacity / self.refill_per_second)
+        return max(_MIN_STATE_TTL_SECONDS, full_refill)
 
     def _redis(self):
         try:
@@ -81,11 +98,11 @@ class TokenBucket:
 
             if tokens < n:
                 # Persist the refilled state so future calls see it.
-                cache.set(self._key, (tokens, now), timeout=300)
+                cache.set(self._key, (tokens, now), timeout=self._state_ttl)
                 return False
 
             tokens -= n
-            cache.set(self._key, (tokens, now), timeout=300)
+            cache.set(self._key, (tokens, now), timeout=self._state_ttl)
             return True
         except Exception as exc:
             logger.warning("TokenBucket[%s] cache failure (failing open): %s", self.name, exc)

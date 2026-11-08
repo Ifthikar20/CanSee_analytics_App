@@ -116,3 +116,44 @@ def overall(ai_scores, search: int | None) -> dict:
         "value": value,
         "class": classify(ai, search),
     }
+
+
+def search_score_ceiling(depth: int | None) -> int:
+    """The best search score a site missing from the top ``depth`` can have.
+
+    Not found in the top 10 means position 11 or later: a search score
+    from 0 up to 55. Not found in the top 100 is 0 exactly.
+    """
+    if not depth or depth < 1:
+        return 0
+    return search_score(depth + 1)
+
+
+def overall_range(ai_scores, search_max: int) -> dict:
+    """The gap against a Google side known only as a range, 0 to ``search_max``.
+
+    Google was read to some depth without finding the site, so its search
+    score lies anywhere in that range. The class is definite only when both
+    ends of the range give the same class; the value is then a lower bound
+    (``value_min``), never a number the data does not support. Otherwise the
+    class is no data and ``definite`` is False.
+    """
+    present = [s for s in ai_scores if s is not None]
+    ai = round(sum(present) / len(present)) if present else None
+    base = {"ai_score": ai, "search_score": None, "search_score_max": search_max,
+            "value": None, "value_min": None, "definite": False, "class": NO_DATA}
+    if ai is None:
+        return base
+    best_case, worst_case = classify(ai, search_max), classify(ai, 0)
+    if best_case != worst_case:
+        return base
+    return {**base, "value_min": ai - search_max, "definite": True, "class": worst_case}
+
+
+def classify_range(ai: int | None, search_max: int) -> str:
+    """One engine's class against a Google range, or no data when it is not definite."""
+    if ai is None:
+        return NO_DATA
+    best_case, worst_case = classify(ai, search_max), classify(ai, 0)
+    return worst_case if best_case == worst_case else NO_DATA
+

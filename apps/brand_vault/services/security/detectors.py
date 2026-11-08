@@ -864,7 +864,8 @@ _DETECT_FN = {
 }
 
 # Legacy issue code -> detector code, for rows written before detector
-# codes existed (and for dormant-agent rows, which only carry an issue).
+# codes existed (and for rows from the removed security agents, which
+# only carry an issue).
 ISSUE_FALLBACK: dict[str, str] = {
     SafetyAlert.ISSUE_NEGATIVE: "BS-SENT-001",
     SafetyAlert.ISSUE_SENTIMENT_DROP: "BS-SENT-002",

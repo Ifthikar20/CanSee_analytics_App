@@ -1,8 +1,8 @@
-# RAG — Per-User Retrieval-Augmented Knowledge Base
+# RAG — Retrieval-Augmented Knowledge Base
 
 ## Purpose
 
-Maintain a per-user, per-website knowledge base of scraped content
+Maintain a per-website knowledge base of scraped content
 (websites, blogs, product pages, audit context) with embeddings, so
 prompts and provider system messages can be **grounded in real
 business facts retrieved by semantic similarity**.
@@ -21,7 +21,7 @@ Audit enrichment ┴──> ingest_url / ingest_site
                           │
                           ├── domain_scanner (HTML -> text)
                           ├── chunker (split + overlap)
-                          ├── embedder (OpenAI / hash fallback)
+                          ├── embedder (OpenAI; pending when unavailable)
                           └── KnowledgeSource + KnowledgeChunk rows
                                             │
                                             ▼
@@ -33,8 +33,8 @@ Audit per-cell   ─────► retrieve(query=prompt) ──► sys-prompt 
 
 | Model | Purpose |
 |---|---|
-| `KnowledgeSource` | One ingested URL belonging to (user, website). Tracks status, kind, content_hash for change detection, chunk_count. Unique on (user, website, url). |
-| `KnowledgeChunk` | Embedded text segment from a KnowledgeSource. Stores embedding as a JSON list of floats plus model name + dimension so we can mix embeddings across upgrades. |
+| `KnowledgeSource` | One ingested URL belonging to a website (`user` records who added it). Tracks status, kind, content_hash for change detection, chunk_count. Unique on (website, url). |
+| `KnowledgeChunk` | Text segment from a KnowledgeSource. Stores the embedding as a JSON list of floats plus model name + dimension. `embedding_model` is `pending` (empty vector) when embeddings were unavailable at ingest, and `hash-256` on legacy word-hash rows; neither is ever scored. |
 
 ## Services
 
@@ -44,8 +44,8 @@ Audit per-cell   ─────► retrieve(query=prompt) ──► sys-prompt 
 - Token counts approximated as `words / 0.75` — no tokenizer dependency
 
 ### `embedder.py`
-- **Primary**: OpenAI `text-embedding-3-small` (1536 dim) via the existing OpenAI SDK
-- **Fallback**: deterministic 256-dim hash-based bag-of-words embedder. Not semantic, but lets tests + dev environments without an API key exercise the full retrieval path
+- OpenAI `text-embedding-3-small` (1536 dim) via the existing OpenAI SDK, which retries transient errors
+- No fallback: without a key, with a spent AI allowance, or when the call fails, it raises `EmbeddingUnavailable` with a reason code (`embeddings_not_configured`, `ai_allowance_exhausted`, `embeddings_failed`)
 - Token usage logged via `core.ai_tracking.record_usage` so embedding spend appears alongside provider + extraction spend
 
 ### `crawler.py`
@@ -59,13 +59,15 @@ Audit per-cell   ─────► retrieve(query=prompt) ──► sys-prompt 
 - `ingest_url(user, website, url, kind, title, text=None)` — single page
 - `ingest_site(user, website, seed_url, page_cap, depth)` — crawl + bulk ingest
 - `ingest_audit_context(user, website, audit_id, llm_context)` — feeds an audit's enrichment back into the KB so the next audit draws on it (the "learning" loop)
-- Content-hash short-circuit: an unchanged page is not re-embedded
+- Content-hash short-circuit: an unchanged page is not re-chunked; only its missing vectors are filled in
+- When embeddings are unavailable the chunks are still stored, without a vector and marked `pending`
+- `embed_pending_chunks(...)` embeds pending and legacy hash chunks in place (chunk ids, and the facts linked to them, are kept)
 - All chunk writes are transactional: old chunks for a source are deleted and new ones bulk-inserted
 
 ### `retriever.py`
-- `retrieve(user, website, query, top_k, kinds)` — cosine similarity, scoped to (user, website)
-- `retrieve_context_block(...)` — returns retrieved chunks formatted as a system-prompt-ready block under a `=== KNOWLEDGE BASE ===` header
-- Mismatched embedding dims (e.g. after upgrading from the fallback to OpenAI) are silently skipped rather than corrupting the ranking
+- `retrieve(user, website, query, top_k, kinds)` — cosine similarity over the website's model-embedded chunks; returns `RetrievalHits` (a list) with a `reason`
+- `reason` is `None` after a normal search; when the search cannot run the hits are empty and `reason` is an embedder code or `embeddings_pending` (chunks exist, none has a vector yet)
+- `retrieve_context_block(...)` / `format_context_block(hits)` — retrieved chunks as a system-prompt-ready block under a `=== KNOWLEDGE BASE ===` header, or `""`
 
 ## API
 
@@ -77,7 +79,7 @@ All endpoints are `TenantScopedAPIView` — authenticated + website-scoped.
 | POST | `/api/v1/rag/<wid>/sources/` | `KnowledgeSourceListView` | Enqueue ingest of a single URL or a full crawl |
 | GET  | `/api/v1/rag/<wid>/sources/<sid>/` | `KnowledgeSourceDetailView` | Source + its chunks |
 | DELETE | `/api/v1/rag/<wid>/sources/<sid>/` | `KnowledgeSourceDetailView` | Remove source + chunks |
-| POST | `/api/v1/rag/<wid>/retrieve/` | `RetrieveView` | Top-k retrieval against the KB |
+| POST | `/api/v1/rag/<wid>/retrieve/` | `RetrieveView` | Top-k retrieval against the KB; `reason` explains an empty result that is not a plain no-match |
 
 ## Celery tasks
 
@@ -124,20 +126,22 @@ If a single user's corpus exceeds ~10K chunks, swap candidate
 selection for pgvector + an HNSW index without changing call sites —
 `retrieve()` is the only function that reads embeddings.
 
+## Management commands
+
+- `embed_pending_chunks [--website <id>] [--dry-run]` — embeds chunks stored
+  without a vector (and legacy hash vectors) once embeddings work.
+- `rag_reindex` — mirrors model vectors into the optional vector index.
+
 ## Embedding model upgrade path
 
 `KnowledgeChunk.embedding_model` and `embedding_dim` are stored per
-chunk so a model upgrade is a non-issue:
-
-1. Run a backfill management command that re-embeds all chunks under
-   the new model.
-2. Until backfill completes, `retrieve()` skips chunks whose
-   embedding dimension doesn't match the current query embedding.
+chunk. Until a re-embed completes, `retrieve()` skips chunks whose
+embedding dimension doesn't match the current query embedding.
 
 ## Tests
 
 | File | Coverage |
 |---|---|
 | `tests/test_chunker.py` | Section detection, overlap, default labels |
-| `tests/test_embedder.py` | Hash fallback determinism, similarity math |
+| `tests/test_embedder.py` | Similarity math |
 | `tests/test_retriever.py` | Relevance ranking, user/website scoping, kind filter, context block formatting |

@@ -50,19 +50,3 @@ class EmailService:
             domain = to.rsplit("@", 1)[-1] if "@" in (to or "") else "?"
             logger.error("Email send failed (domain=%s): %s", domain, e)
             return False
-
-    @staticmethod
-    def send_hot_lead_alert(*, user, lead) -> None:
-        from apps.notifications.models import NotificationPreference
-        try:
-            prefs = user.notification_preferences
-            if not prefs.hot_lead_email:
-                return
-        except NotificationPreference.DoesNotExist:
-            return
-
-        EmailService.send_email(
-            to=user.email,
-            subject=f"Hot lead detected — Score {lead.score}",
-            html_content=f"<p>A new hot lead with score {lead.score} was detected on your website.</p>",
-        )

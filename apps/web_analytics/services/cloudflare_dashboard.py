@@ -248,9 +248,10 @@ query ($zone: String!, $since: Time!, $now: Time!) {
 """
 
 
-def _trend(current: float, previous: float) -> float:
+def _trend(current: float, previous: float) -> float | None:
+    # Nothing in the previous window means the change is unknown, not 0%.
     if not previous:
-        return 0
+        return None
     return round((current - previous) / previous * 100, 1)
 
 
@@ -270,14 +271,13 @@ def _overview(period: str, **values) -> dict:
         "period": period,
         "total_visitors": 0,
         "total_pageviews": 0,
-        "hot_leads": 0,
-        "visitor_growth_pct": 0,
-        "pageviews_trend": 0,
-        # No session model at the edge; the frontend hides these tiles.
-        "avg_session": "0:00",
-        "session_trend": 0,
-        "bounce_rate": 0,
-        "bounce_trend": 0,
+        "visitor_growth_pct": None,
+        "pageviews_trend": None,
+        # No session model at the edge, so these stay None.
+        "avg_session": None,
+        "session_trend": None,
+        "bounce_rate": None,
+        "bounce_trend": None,
         "realtime": 0,
         "data_source": SOURCE_NAME,
     }
@@ -370,10 +370,11 @@ def _skeleton(bucket_kind: str, now, count: int) -> list[dict]:
 
 def _breakdown_slices(api_token, zone_id, since, now, stats) -> dict:
     """Adaptive breakdowns: pages, devices, OS, browsers, countries.
-    One doc; failure empties all five (KPIs untouched)."""
+    One doc; failure empties all five (KPIs untouched) and says so with
+    ``failed``, so an empty slice never reads as "nothing recorded"."""
     empty = {
         "pages": [], "devices": [], "operating_systems": [],
-        "browsers": [], "countries": [], "flagged": [],
+        "browsers": [], "countries": [], "flagged": [], "failed": True,
     }
     zone = _zone(_post_graphql(
         api_token,
@@ -417,6 +418,7 @@ def _breakdown_slices(api_token, zone_id, since, now, stats) -> dict:
             {"name": row["name"], "pct": row["pct"], "visitors": row["count"]}
             for row in _named_estimates(zone.get("countries"), "clientCountryName", limit=10)
         ],
+        "failed": False,
     }
 
 
@@ -572,6 +574,9 @@ def _build_from_rollups(api_token, zone_id, period, dataset_key, zone_settings, 
             "operating_systems": slices["operating_systems"],
         },
         "countries": slices["countries"],
+        # True when the adaptive query failed: pages and devices are then
+        # empty because they were not loaded, not because none were seen.
+        "breakdowns_failed": slices["failed"],
     }
 
 
@@ -639,6 +644,7 @@ def _build_from_adaptive(api_token, zone_id, period, zone_settings, stats):
             "operating_systems": slices["operating_systems"],
         },
         "countries": slices["countries"],
+        "breakdowns_failed": slices["failed"],
     }
 
 

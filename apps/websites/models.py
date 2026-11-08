@@ -147,12 +147,6 @@ class Integration(TimestampMixin):
         ("ga_hosted", "Cansee Google tag"),
         ("cloudflare", "Cloudflare"),
         ("gsc", "Google Search Console"),
-        ("facebook", "Facebook Ads"),
-        ("shopify", "Shopify"),
-        ("mailchimp", "Mailchimp"),
-        ("google_drive", "Google Drive"),
-        ("canva", "Canva"),
-        ("hubspot", "HubSpot"),
     ]
 
     website = models.ForeignKey(Website, on_delete=models.CASCADE, related_name="integrations")

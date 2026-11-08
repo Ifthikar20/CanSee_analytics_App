@@ -7,7 +7,8 @@ sample can be replayed. Strategies:
 * ``stratified`` — equal slots per :class:`IntentBucket`, with overflow
   buckets back-filling under-quota buckets.
 * ``recent``     — newest active prompts first.
-* ``top_demand`` — highest demand_score first.
+* ``top_demand`` — highest source score first (the stored ranking score;
+  the strategy keeps its API name, there is no demand signal).
 """
 from __future__ import annotations
 
@@ -71,7 +72,8 @@ def sample_prompts_for_audit(
     rng = random.Random(seed)
 
     pool = list(
-        Prompt.objects.filter(industry=industry, is_active=True).only(
+        Prompt.objects.visible_to_website(audit_run.website)
+        .filter(industry=industry, is_active=True).only(
             "id", "text", "intent_bucket", "source", "demand_score", "created_at"
         )
     )

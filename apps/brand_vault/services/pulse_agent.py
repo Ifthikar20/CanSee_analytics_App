@@ -69,7 +69,8 @@ def _traffic_section(website) -> dict | None:
     return {
         "total_visitors": overview.get("total_visitors", 0),
         "total_pageviews": overview.get("total_pageviews", 0),
-        "visitor_growth_pct": overview.get("visitor_growth_pct", 0),
+        # None when the prior week had no visitors: growth is unknown.
+        "visitor_growth_pct": overview.get("visitor_growth_pct"),
     }
 
 
@@ -79,9 +80,12 @@ def _visibility_section(website) -> dict | None:
     overview = build_overview_for_website(website.user, website)
     if not isinstance(overview, dict) or not overview.get("has_data"):
         return None
+    if overview.get("brand_current") is None:
+        return None
     return {
-        "visibility_pct": overview.get("brand_current", 0.0),
-        "delta_pct": overview.get("brand_delta_pct", 0.0),
+        "visibility_pct": overview["brand_current"],
+        # None with fewer than two measured months.
+        "delta_pct": overview.get("brand_delta_pct"),
     }
 
 
@@ -327,20 +331,30 @@ def _section_lines(digest: dict) -> list[tuple[str, str]]:
 
     visibility = digest.get("visibility")
     if visibility is not None:
+        delta = visibility["delta_pct"]
+        trend = (
+            f"{delta:+.1f}% trend" if delta is not None
+            else "no earlier month to compare"
+        )
         sections.append((
             "Visibility",
             f"{visibility['visibility_pct']}% of AI answers mention the brand "
-            f"({visibility['delta_pct']:+.1f}% trend).",
+            f"({trend}).",
         ))
 
     traffic = digest.get("traffic")
     if traffic is not None:
         growth = traffic["visitor_growth_pct"]
+        change = (
+            f"{'+' if growth >= 0 else ''}{growth}% vs the prior week"
+            if growth is not None
+            else "no visitors the prior week to compare"
+        )
         sections.append((
             "Traffic",
             f"{traffic['total_visitors']:,} visitors and "
             f"{traffic['total_pageviews']:,} pageviews in the last 7 days "
-            f"({'+' if growth >= 0 else ''}{growth}% vs the prior week).",
+            f"({change}).",
         ))
 
     security = digest.get("security") or {}

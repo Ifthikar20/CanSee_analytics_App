@@ -1,8 +1,7 @@
-"""Brand Security agent framework.
+"""Brand Security.
 
-Independent agents (each in ``services/security/agents/``) inspect the brand
-across specific vectors: LLM answers, SERPs, Reddit / social, Google Trends,
-and impersonation. Each agent's job is to catch a distinct class of narrative
-risk before it goes unnoticed and to attribute every alert it raises back to
-itself so the UI can show *what* was caught and *who* caught it.
+Findings are derived from the AI answers the audits and prompt runs
+already stored: ``response_auditor`` runs the detector registry in
+``detectors`` over each answer and escalates nuanced findings to the LLM
+``judge``. There is no separate scan.
 """

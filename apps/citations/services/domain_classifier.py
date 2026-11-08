@@ -49,8 +49,39 @@ _PODCAST_HOST_HINTS = ("spotify.com", "apple.com", "podcasts.apple.com",
                        "podbean.com", "buzzsprout.com")
 
 
+# Sites that list, review or discuss companies rather than being one: review
+# and comparison directories, search engines, marketplaces and big
+# publishers. A Google result on one of these is never itself a competitor.
+# Matched by domain suffix (``is_aggregator``), so "x.com" never matches
+# "dropbox.com".
+AGGREGATOR_DOMAINS = frozenset({
+    "g2.com", "capterra.com", "trustradius.com", "getapp.com", "softwareadvice.com",
+    "producthunt.com", "alternativeto.net", "saasworthy.com", "sourceforge.net",
+    "slant.co", "gartner.com", "crozdesk.com", "trustpilot.com", "clutch.co",
+    "goodfirms.co", "yelp.com", "bbb.org", "crunchbase.com", "zapier.com",
+    "techradar.com", "pcmag.com", "reddit.com", "quora.com", "youtube.com",
+    "github.com", "linkedin.com", "medium.com", "wikipedia.org", "amazon.com",
+    "bing.com", "yahoo.com", "duckduckgo.com", "apps.apple.com", "play.google.com",
+    "slashdot.org", "stackoverflow.com", "techcrunch.com", "forbes.com",
+    "bloomberg.com", "businessinsider.com",
+})
+
+
 def _matches_suffix(host: str, suffixes: Iterable[str]) -> bool:
     return any(host == s or host.endswith("." + s) for s in suffixes)
+
+
+def is_aggregator(host: str) -> bool:
+    """True when ``host`` belongs to a directory, review site, search engine
+    or marketplace (``AGGREGATOR_DOMAINS``, or any google.* domain)."""
+    host = (host or "").lower().strip(".")
+    if host.startswith("www."):
+        host = host[4:]
+    if not host:
+        return False
+    if host.split(".")[0] == "google" or ".google." in f".{host}":
+        return True
+    return _matches_suffix(host, AGGREGATOR_DOMAINS)
 
 
 def _rule_classify(apex: str, host: str) -> str:

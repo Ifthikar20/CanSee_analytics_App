@@ -33,9 +33,6 @@ urlpatterns = [
     path("<uuid:website_id>/event-log/", analytics_views.EventLogView.as_view(), name="analytics-event-log"),
     path("<uuid:website_id>/access-log/", analytics_views.AnalyticsAccessLogView.as_view(), name="analytics-access-log"),
 
-    # Dynamic SEO Optimization
+    # Legacy tracking script (tracking only); kept for existing installs.
     path("<uuid:website_id>/seo-script/", dynamic_seo_views.SEOScriptView.as_view(), name="seo-script"),
-    path("<uuid:website_id>/seo-rules/", dynamic_seo_views.SEORulesView.as_view(), name="seo-rules"),
-    path("<uuid:website_id>/seo-report/", dynamic_seo_views.SEOReportView.as_view(), name="seo-report"),
-    path("<uuid:website_id>/seo-embed/", dynamic_seo_views.SEOEmbedCodeView.as_view(), name="seo-embed"),
 ]

@@ -1,8 +1,7 @@
-"""REST endpoints for Brand Security.
+"""REST endpoints for Brand Security, under ``/api/v1/brand-security/``.
 
-Live under ``/api/v1/brand-security/``. The legacy ``/brand-vault/safety/*``
-endpoints in ``views.py`` stay in place for a release so existing UI clients
-keep working while we migrate. Prefer these views for new work.
+Findings come from the response auditor, which reads the AI answers the
+audits and prompt runs already stored. There is no scan to trigger.
 """
 from __future__ import annotations
 
@@ -10,7 +9,8 @@ import uuid
 from collections import Counter
 from datetime import datetime, time
 
-from django.db.models import Case, Count, IntegerField, Q, Value, When
+from django.conf import settings
+from django.db.models import Case, IntegerField, Q, Value, When
 from django.utils import timezone
 from django.utils.dateparse import parse_date, parse_datetime
 from rest_framework import status
@@ -19,20 +19,10 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.brand_vault.api.v1.serializers import (
-    BrandSecurityAgentPatchSerializer,
-    BrandSecurityAgentSerializer,
     BrandSecurityConfigSerializer,
     SafetyAlertSerializer,
-    SafetyPromptCreateSerializer,
-    SafetyPromptSerializer,
 )
-from apps.brand_vault.models import (
-    BrandPulse,
-    BrandSecurityAgent,
-    BrandSecurityConfig,
-    SafetyAlert,
-    SafetyPrompt,
-)
+from apps.brand_vault.models import BrandPulse, BrandSecurityConfig, SafetyAlert
 from apps.brand_vault.services.security import response_auditor
 from apps.brand_vault.services.security.detectors import (
     CATEGORIES,
@@ -40,8 +30,7 @@ from apps.brand_vault.services.security.detectors import (
     DETECTORS,
     ISSUE_FALLBACK,
 )
-from apps.brand_vault.services.security.orchestrator import ensure_agent_rows
-from apps.brand_vault.services.security.registry import agent_catalog
+from apps.rag.services.embedder import embeddings_configured
 from core.exceptions import ResourceNotFound
 from core.views import TenantScopedAPIView, TenantScopedListAPIView
 
@@ -50,63 +39,6 @@ _SEVERITY_WEIGHTS = {
     SafetyAlert.SEVERITY_MEDIUM: 4,
     SafetyAlert.SEVERITY_LOW: 1,
 }
-
-
-# Starter prompts seeded on first activation. {brand} is substituted with the
-# first brand term (falls back to website name/domain).
-_STARTER_PROMPTS: dict[str, tuple[str, ...]] = {
-    "llm_truth": (
-        "What is {brand}?",
-        "Is {brand} a scam?",
-        "Tell me about {brand}",
-        "Is {brand} legit?",
-    ),
-    "serp_reputation": (
-        "{brand} reviews",
-        "{brand} complaints",
-        "{brand} scam",
-        "{brand} lawsuit",
-    ),
-    "sentiment_pulse": (
-        "{brand}",
-        "bad experience with {brand}",
-        "{brand} review",
-        "is {brand} legit",
-    ),
-}
-
-
-def _resolve_brand_name(website) -> str:
-    """Best-effort brand name for prompt seeding. Falls back to website name."""
-    from apps.brand_vault.services.security.agents._helpers import brand_terms
-
-    terms = brand_terms(website, {})
-    if terms:
-        return terms[0]
-    return (website.name or "").strip() or "our brand"
-
-
-def _seed_starter_prompts(website, agent_id: str, user) -> int:
-    """Insert starter prompts for ``agent_id`` if the list is empty. Returns
-    the number of prompts inserted (0 if the agent has no starter set or
-    already had prompts).
-    """
-    templates = _STARTER_PROMPTS.get(agent_id)
-    if not templates:
-        return 0
-    if SafetyPrompt.objects.filter(website=website, agent_id=agent_id).exists():
-        return 0
-    brand = _resolve_brand_name(website)
-    inserted = 0
-    for tpl in templates:
-        text = tpl.format(brand=brand)[:500]
-        _, created = SafetyPrompt.objects.get_or_create(
-            website=website, agent_id=agent_id, text=text,
-            defaults={"created_by": user if user and user.is_authenticated else None},
-        )
-        if created:
-            inserted += 1
-    return inserted
 
 
 _CATEGORY_DISPLAY = dict(CATEGORIES)
@@ -151,23 +83,26 @@ class BrandSecurityTaxonomyView(APIView):
 
 
 class BrandSecurityOverviewView(TenantScopedAPIView):
-    """Top-of-page summary tiles: health, counters, and last-scan timing."""
+    """Top-of-page summary tiles: health, counters, and last-check timing.
+
+    ``health_score`` is null and ``scan_status`` is "not_scanned" until
+    the auditor has checked at least one stored answer for the website:
+    no alerts on unchecked answers is not a clean bill of health.
+    ``fact_checks`` is "unavailable" when the grounded fact check cannot
+    run (no judge key, no embedding key, or the judge switched off);
+    ``missing_keys`` names the keys to add.
+    """
 
     def get(self, request, website_id):
+        from apps.llm_ranking.models import LLMRankingAudit
+
         website = self.get_website(website_id)
         open_alerts = SafetyAlert.objects.filter(
             website=website, status=SafetyAlert.STATUS_OPEN,
         )
 
         by_severity = Counter(open_alerts.values_list("severity", flat=True))
-        penalty = sum(
-            _SEVERITY_WEIGHTS.get(sev, 0) * n
-            for sev, n in by_severity.items()
-        )
-        health = max(0, min(100, 100 - penalty))
-
         by_source = Counter(open_alerts.values_list("source", flat=True))
-        by_agent = Counter(open_alerts.values_list("agent_id", flat=True))
 
         # Per-detector and per-category counts for the summary chips.
         # Legacy rows without a detector code fall back via their issue.
@@ -179,31 +114,55 @@ class BrandSecurityOverviewView(TenantScopedAPIView):
             by_detector[code or "other"] += 1
             by_category[detector.category if detector else "other"] += 1
 
-        agents = ensure_agent_rows(website)
-        last_run_at = max(
-            (a.last_run_at for a in agents if a.last_run_at),
-            default=None,
-        )
-        next_run_at = min(
-            (a.next_run_at for a in agents if a.next_run_at),
-            default=None,
-        )
-
-        # The auditor runs on completion hooks, so "last checked" is the
-        # newest scanned response rather than an agent run timestamp.
+        # The auditor runs when an audit completes and again in the hourly
+        # catch-up sweep, so the last check is the newest of: a completed
+        # audit with stored answers, the sweep watermark, and a finding.
         config = BrandSecurityConfig.objects.filter(website=website).first()
-        last_scan_at = config.last_response_scan_at if config else None
+        last_sweep_at = config.last_response_scan_at if config else None
+        last_audit_at = (
+            LLMRankingAudit.objects
+            .filter(
+                website=website,
+                status=LLMRankingAudit.STATUS_COMPLETED,
+                completed_at__isnull=False,
+                results__query_succeeded=True,
+            )
+            .order_by("-completed_at")
+            .values_list("completed_at", flat=True)
+            .first()
+        )
         latest_alert = (
             SafetyAlert.objects.filter(website=website)
             .order_by("-detected_at")
             .values_list("detected_at", flat=True)
             .first()
         )
-        candidates = [t for t in (last_run_at, last_scan_at, latest_alert) if t]
+        candidates = [t for t in (last_audit_at, last_sweep_at, latest_alert) if t]
         last_checked_at = max(candidates) if candidates else None
+
+        if last_checked_at is None:
+            health = None
+            scan_status = "not_scanned"
+        else:
+            penalty = sum(
+                _SEVERITY_WEIGHTS.get(sev, 0) * n
+                for sev, n in by_severity.items()
+            )
+            health = max(0, min(100, 100 - penalty))
+            scan_status = "scanned"
+
+        missing_keys = []
+        if not (getattr(settings, "ANTHROPIC_API_KEY", "") or ""):
+            missing_keys.append("ANTHROPIC_API_KEY")
+        if not embeddings_configured():
+            missing_keys.append("OPENAI_API_KEY")
+        judge_on = bool(getattr(settings, "BRAND_SECURITY_JUDGE_ENABLED", True)) and (
+            config is None or config.llm_judge_enabled
+        )
 
         return Response({
             "health_score": health,
+            "scan_status": scan_status,
             "open_alerts": open_alerts.count(),
             "by_severity": {
                 "high": by_severity.get(SafetyAlert.SEVERITY_HIGH, 0),
@@ -211,88 +170,12 @@ class BrandSecurityOverviewView(TenantScopedAPIView):
                 "low": by_severity.get(SafetyAlert.SEVERITY_LOW, 0),
             },
             "by_source": dict(by_source),
-            "by_agent": dict(by_agent),
             "by_detector": dict(by_detector),
             "by_category": dict(by_category),
-            "last_run_at": last_run_at,
             "last_checked_at": last_checked_at,
-            "next_run_at": next_run_at,
-            "prompts_monitored": SafetyPrompt.objects.filter(
-                website=website, status=SafetyPrompt.STATUS_ACTIVE,
-            ).count(),
+            "fact_checks": "available" if judge_on and not missing_keys else "unavailable",
+            "missing_keys": missing_keys,
         })
-
-
-class BrandSecurityAgentsView(TenantScopedAPIView):
-    """List every registered agent with its per-website state."""
-
-    def get(self, request, website_id):
-        website = self.get_website(website_id)
-        ensure_agent_rows(website)
-
-        catalog = {row["agent_id"]: row for row in agent_catalog()}
-        rows = list(
-            BrandSecurityAgent.objects.filter(website=website).order_by("agent_id"),
-        )
-
-        # One aggregation query for open-alert counts by (agent, severity).
-        counts = (
-            SafetyAlert.objects.filter(
-                website=website, status=SafetyAlert.STATUS_OPEN,
-            )
-            .values("agent_id", "severity")
-            .annotate(n=Count("id"))
-        )
-        agg: dict[str, dict[str, int]] = {}
-        for c in counts:
-            agg.setdefault(c["agent_id"], {})[c["severity"]] = c["n"]
-
-        payload = []
-        for row in rows:
-            meta = catalog.get(row.agent_id, {})
-            by_sev = agg.get(row.agent_id, {})
-            row.display_name = meta.get("display_name", row.agent_id)
-            row.tagline = meta.get("tagline", "")
-            row.color = meta.get("color", "slate")
-            row.sources = meta.get("sources", [])
-            row.open_high = by_sev.get(SafetyAlert.SEVERITY_HIGH, 0)
-            row.open_medium = by_sev.get(SafetyAlert.SEVERITY_MEDIUM, 0)
-            row.open_low = by_sev.get(SafetyAlert.SEVERITY_LOW, 0)
-            row.open_alerts = row.open_high + row.open_medium + row.open_low
-            payload.append(BrandSecurityAgentSerializer(row).data)
-
-        return Response(payload)
-
-
-class BrandSecurityAgentDetailView(TenantScopedAPIView):
-    """PATCH an agent's config (enable, sensitivity, schedule)."""
-
-    def _get(self, request, website_id, agent_id) -> BrandSecurityAgent:
-        website = self.get_website(website_id)
-        try:
-            row = BrandSecurityAgent.objects.get(
-                website=website, agent_id=agent_id,
-            )
-        except BrandSecurityAgent.DoesNotExist as exc:
-            raise ResourceNotFound("Agent not found.") from exc
-        return row
-
-    def patch(self, request, website_id, agent_id):
-        row = self._get(request, website_id, agent_id)
-        ser = BrandSecurityAgentPatchSerializer(data=request.data, partial=True)
-        ser.is_valid(raise_exception=True)
-        was_enabled = row.enabled
-        for field, value in ser.validated_data.items():
-            setattr(row, field, value)
-        row.save()
-        # Seed starter prompts the first time a prompt-driven agent is
-        # activated so the user has a working list to edit.
-        if (
-            not was_enabled and row.enabled
-            and agent_id in _STARTER_PROMPTS
-        ):
-            _seed_starter_prompts(row.website, agent_id, request.user)
-        return Response(BrandSecurityAgentSerializer(row).data)
 
 
 def _parse_boundary(value: str | None, *, end: bool = False):
@@ -425,7 +308,7 @@ class BrandSecurityAlertActionView(TenantScopedAPIView):
 
 
 class BrandSecurityConfigView(TenantScopedAPIView):
-    """Read or update the per-website brand terms + negative keywords."""
+    """Read or update the per-website brand terms and the LLM judge switch."""
 
     def get(self, request, website_id):
         website = self.get_website(website_id)
@@ -438,11 +321,6 @@ class BrandSecurityConfigView(TenantScopedAPIView):
         terms = request.data.get("brand_terms")
         if isinstance(terms, list):
             cfg.brand_terms = [str(x).strip() for x in terms if str(x).strip()]
-        negatives = request.data.get("negative_keywords")
-        if isinstance(negatives, list):
-            cfg.negative_keywords = [
-                str(x).strip() for x in negatives if str(x).strip()
-            ]
         llm_judge = request.data.get("llm_judge_enabled")
         if isinstance(llm_judge, bool):
             cfg.llm_judge_enabled = llm_judge
@@ -482,44 +360,3 @@ class BrandPulseView(TenantScopedAPIView):
             pulse.frequency = frequency
         pulse.save()
         return Response(self._payload(pulse))
-
-
-class BrandSecurityPromptsView(TenantScopedListAPIView):
-    """List or create SafetyPrompts. Filter by ``?agent_id=xxx`` to scope."""
-
-    def get(self, request, website_id):
-        website = self.get_website(website_id)
-        qs = SafetyPrompt.objects.filter(website=website)
-        agent_id = request.query_params.get("agent_id")
-        if agent_id:
-            qs = qs.filter(agent_id=agent_id)
-        qs = qs.order_by("-created_at")
-        return self.paginated_response(qs, SafetyPromptSerializer)
-
-    def post(self, request, website_id):
-        website = self.get_website(website_id)
-        ser = SafetyPromptCreateSerializer(data=request.data)
-        ser.is_valid(raise_exception=True)
-        text = ser.validated_data["text"].strip()
-        agent_id = ser.validated_data.get("agent_id") or "llm_truth"
-        prompt, created = SafetyPrompt.objects.get_or_create(
-            website=website, agent_id=agent_id, text=text,
-            defaults={"created_by": request.user},
-        )
-        return Response(
-            SafetyPromptSerializer(prompt).data,
-            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
-        )
-
-
-class BrandSecurityPromptDetailView(TenantScopedAPIView):
-    """Delete a SafetyPrompt."""
-
-    def delete(self, request, prompt_id):
-        try:
-            prompt = SafetyPrompt.objects.select_related("website").get(id=prompt_id)
-        except SafetyPrompt.DoesNotExist as exc:
-            raise ResourceNotFound("Prompt not found.") from exc
-        self.get_website(prompt.website_id)
-        prompt.delete()
-        return Response(status=status.HTTP_204_NO_CONTENT)

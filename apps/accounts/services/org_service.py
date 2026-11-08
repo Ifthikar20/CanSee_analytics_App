@@ -65,29 +65,25 @@ class OrgService:
         *, organization: Organization, user: User, role: str,
         invited_by: User | None = None, joined_via: str = "invite",
     ) -> OrganizationMember:
-        """Create a membership, enforcing the one-org-per-user rule.
+        """Create a membership, enforcing the one-org-per-user rule and
+        the org's seat cap.
 
-        JIT joins (Workspace domain auto-join and SAML provisioning) are
-        additionally seat-gated here: invitations reserve their seat at
-        create time, but auto-join is an unbounded door — without this
-        check a big Workspace or IdP directory could blow straight past
-        the negotiated seat count.
+        Every path that adds a person is seat-gated here. An accepted
+        invitation (``joined_via="invite"``) already reserved its seat when
+        it was created, so it only needs the members to be under the cap;
+        JIT joins (Workspace domain auto-join and SAML provisioning) and
+        operator adds need a free seat on top of the pending invitations,
+        because auto-join is an unbounded door: without this check a big
+        Workspace or IdP directory could blow straight past the seat count.
+        An org that is over its cap after a plan change keeps its members
+        and cannot add more. The org row is locked so two concurrent joins
+        cannot both take the last seat.
         """
-        if joined_via in ("domain_jit", "sso_jit"):
-            from apps.billing.services.org_entitlements import (
-                seat_limit_for,
-                seats_used,
-            )
+        from apps.billing.services.org_entitlements import (
+            seat_available,
+            seat_limit_for,
+        )
 
-            seat_cap = seat_limit_for(organization)
-            if seat_cap > 0 and seats_used(organization) >= seat_cap:
-                raise CanseeException(
-                    f"{organization.name} has no seats available. Ask your "
-                    "workspace admin to add seats or invite you directly.",
-                    code="no_seats_available",
-                    status_code=403,
-                    details={"limit": seat_cap},
-                )
         with transaction.atomic():
             # Lock the user row so a concurrent invite-accept and domain-JIT
             # join can't both slip past the membership check.
@@ -97,6 +93,24 @@ class OrgService:
                 if existing.organization_id == organization.id:
                     return existing
                 raise AlreadyInOrganization()
+            Organization.objects.select_for_update().filter(pk=organization.pk).first()
+            if not seat_available(organization, holding_invitation=joined_via == "invite"):
+                seat_cap = seat_limit_for(organization)
+                if joined_via == "invite":
+                    raise CanseeException(
+                        f"All {seat_cap} seats in {organization.name} are taken. "
+                        "Ask your workspace admin to free a seat.",
+                        code="plan_limit_exceeded",
+                        status_code=403,
+                        details={"limit": seat_cap},
+                    )
+                raise CanseeException(
+                    f"{organization.name} has no seats available. Ask your "
+                    "workspace admin to add seats or invite you directly.",
+                    code="no_seats_available",
+                    status_code=403,
+                    details={"limit": seat_cap},
+                )
             member = OrganizationMember.objects.create(
                 organization=organization,
                 user=user,
@@ -214,16 +228,18 @@ class OrgService:
             expires_at__lte=timezone.now(),
         ).update(revoked_at=timezone.now())
 
-        # Seat gate: seats are the enterprise billing unit — members plus
-        # pending invites occupy them. Custom org packages override the
-        # plan's team_members number.
+        # Seat gate: seats are the billing unit — members plus pending
+        # invites occupy them. Custom org packages override the plan's
+        # team_members number. An org over its cap after a plan change
+        # keeps its members but cannot invite.
         from apps.billing.services.org_entitlements import (
+            seat_available,
             seat_limit_for,
             seats_used,
         )
 
         seat_cap = seat_limit_for(org)
-        if seat_cap > 0 and seats_used(org) >= seat_cap:
+        if not seat_available(org):
             raise CanseeException(
                 f"All {seat_cap} seats are taken. Remove a member, revoke a "
                 "pending invitation, or contact us to add seats.",
@@ -358,22 +374,25 @@ class OrgService:
             )
 
         AuthService._enforce_password_policy(password)
-        user = User.objects.create_user(
-            email=invitation.email,
-            password=password,
-            full_name=full_name,
-            company_name=invitation.organization.name,
-            is_email_verified=True,
-        )
-        OrgService.add_member(
-            organization=invitation.organization,
-            user=user,
-            role=invitation.role,
-            invited_by=invitation.invited_by,
-            joined_via="invite",
-        )
-        invitation.accepted_at = timezone.now()
-        invitation.save(update_fields=["accepted_at"])
+        # Atomic: a seat-cap refusal inside add_member must not leave an
+        # account behind that would then block the retry as "user_exists".
+        with transaction.atomic():
+            user = User.objects.create_user(
+                email=invitation.email,
+                password=password,
+                full_name=full_name,
+                company_name=invitation.organization.name,
+                is_email_verified=True,
+            )
+            OrgService.add_member(
+                organization=invitation.organization,
+                user=user,
+                role=invitation.role,
+                invited_by=invitation.invited_by,
+                joined_via="invite",
+            )
+            invitation.accepted_at = timezone.now()
+            invitation.save(update_fields=["accepted_at"])
 
         result = TokenService.issue_session(
             user, method="invite", ip_address=ip_address, user_agent=user_agent

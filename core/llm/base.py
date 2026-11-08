@@ -49,10 +49,18 @@ def allowance_denial(user) -> str | None:
     if user is None:
         return None
     try:
-        from core.ai_tracking import effective_ai_cap, month_to_date_cost
+        from core.ai_tracking import ai_allowance_plan, effective_ai_cap, month_to_date_cost
+        from core.utils.constants import Plan
 
         cap = effective_ai_cap(user)
         if cap > 0 and month_to_date_cost(user) >= cap:
+            if ai_allowance_plan(user) == Plan.FREE:
+                # The free plan's dollar cap is a hidden backstop: its
+                # accounts count prompt runs and never see dollars.
+                return (
+                    "monthly_ai_allowance_exceeded: the account has "
+                    "used this month's free AI allowance"
+                )
             return (
                 "monthly_ai_allowance_exceeded: the account has "
                 f"used its ${cap:.2f} monthly AI allowance"
@@ -81,6 +89,18 @@ class ProviderResult:
     # Perplexity return these out-of-band; the answer text only carries
     # [1][2] markers, so text extraction alone can never recover them).
     citations: list = field(default_factory=list)
+    # Server-side web searches the upstream ran and bills per search
+    # (Anthropic's web_search tool); priced into the recorded cost.
+    web_search_requests: int = 0
+    # True when the answer came from a web search that carried the user's
+    # location (the region passed to query()).
+    searched: bool = False
+    # The web searches the engine reported running while it answered (query
+    # fan-outs). None: this provider does not report searches; [] and 0: it
+    # reports them and ran none. A search can come without its query text,
+    # so web_searches may exceed len(search_queries).
+    search_queries: list | None = None
+    web_searches: int | None = None
 
     @property
     def total_tokens(self) -> int:
@@ -146,13 +166,14 @@ class LLMProvider:
         """
         Run a single prompt against the provider.
 
-        Records token usage centrally on success, attributed to ``module``
-        (the AITokenUsage module key — pass the calling app's name so the
-        per-module spend breakdown stays honest). Retryable call sites
-        (Celery acks_late tasks) pass ``idempotency_key`` so a redelivered
-        task cannot double-count the same logical call; ``extra_metadata``
-        adds flat tags to the usage row (e.g. actor="system" for
-        scheduled work). On failure returns a ProviderResult with
+        Records token usage centrally for every call the upstream billed
+        (a failed result that reports tokens included), attributed to
+        ``module`` (the AITokenUsage module key — pass the calling app's
+        name so the per-module spend breakdown stays honest). Retryable
+        call sites (Celery acks_late tasks) pass ``idempotency_key`` so a
+        redelivered task cannot double-count the same logical call;
+        ``extra_metadata`` adds flat tags to the usage row (e.g.
+        actor="system" for scheduled work). On failure returns a ProviderResult with
         succeeded=False and the upstream error string — callers should
         check `.succeeded` rather than catching exceptions.
         """
@@ -206,17 +227,21 @@ class LLMProvider:
 
         result.duration_ms = int((time.monotonic() - t0) * 1000)
 
-        if result.succeeded:
+        # Tokens on a result mean the upstream answered and billed the call,
+        # even when the answer is unusable (a refusal, an answer cut off at
+        # max_tokens): the service is healthy, and the spend is real.
+        billed = bool(result.input_tokens or result.output_tokens)
+        if result.succeeded or billed:
             breaker.record_success()
-            if result.input_tokens or result.output_tokens:
-                self._record(
-                    result=result, user=user, website=website,
-                    audit_id=audit_id, role=role, module=module,
-                    idempotency_key=idempotency_key,
-                    extra_metadata=extra_metadata,
-                )
         else:
             breaker.record_failure()
+        if billed:
+            self._record(
+                result=result, user=user, website=website,
+                audit_id=audit_id, role=role, module=module,
+                idempotency_key=idempotency_key,
+                extra_metadata=extra_metadata,
+            )
         return result
 
     # ── To implement in subclasses ────────────────────────────────────────
@@ -249,6 +274,7 @@ class LLMProvider:
                 duration_ms=result.duration_ms,
                 metadata=metadata,
                 idempotency_key=idempotency_key,
+                web_search_requests=getattr(result, "web_search_requests", 0),
             )
         except Exception as exc:  # never let bookkeeping break a query
             logger.warning("record_usage failed for %s: %s", self.name, exc)

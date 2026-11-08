@@ -7,10 +7,14 @@ class Segment(models.TextChoices):
 
 
 class Plan(models.TextChoices):
-    # ── Live model (2026-08): Free -> Pro $45/mo self-serve -> Business custom ──
+    # ── Live model (2026-11): Free -> 100 or 200 tracked prompts, monthly ->
+    # Business custom. Pro ($45/mo, 2026-08) is kept for its subscribers but
+    # no longer offered.
     FREE = "free", "Free"
     PRO = "pro", "Pro ($45/mo)"
     BUSINESS = "business", "Business (custom)"
+    PROMPTS_100 = "prompts_100", "100 prompts ($80/mo)"
+    PROMPTS_200 = "prompts_200", "200 prompts ($140/mo)"
     # Legacy aliases for migration compatibility — these still appear
     # on existing Subscription/User rows and must keep resolving to a
     # real plan via PLAN_LIMITS until a backfill migrates them.
@@ -24,14 +28,25 @@ class Plan(models.TextChoices):
 # ── Feature limits per plan ──────────────────────────────────────────
 #
 # ``max_prompts_per_audit`` is the headline LLM-ranking gate — every
-# call to ``LLMRankingService.generate_prompts`` reads this off the
-# user's current plan and caps the prompt list accordingly. Bumping a
-# user's tier widens the cap on the next audit immediately.
+# audit reads it off the user's current plan (max_prompts_for_user) and
+# caps the prompt list accordingly. Bumping a user's tier widens the cap
+# on the next audit immediately.
+#
+# ``tracked_prompts`` caps the active (unarchived) prompts an account tracks
+# across its projects (apps.billing.services.tracked_prompts); -1 is
+# unlimited. ``autopilot`` (the daily run) and ``sms_digest`` (its one text
+# a day) are what plan_limits.plan_allows answers.
+#
+# ``monthly_prompt_runs`` is the free plan's allowance of engine answers per
+# billing period: one prompt answered by one AI engine is one run, shared by
+# every project and engine of the account (apps.metering.services.
+# prompt_runs; settings.FREE_MONTHLY_PROMPT_RUNS overrides the free number).
+# -1 is unlimited.
 PLAN_LIMITS = {
     # Free: what an account WITHOUT an active/trialing subscription gets.
-    # The AI allowance is a small acquisition cost (settings.
-    # AI_FREE_MONTHLY_CAP_USD, default $1/month) — enough to feel the
-    # product, not enough to burn margin.
+    # The allowance is 20 prompt runs a month. A hidden AI spend backstop
+    # (settings.AI_FREE_MONTHLY_CAP_USD, default $3/month) bounds the
+    # Claude-only work around them; free accounts never see it in dollars.
     Plan.FREE: {
         "segment": Segment.INDIVIDUAL,
         "price_monthly": 0,
@@ -45,22 +60,12 @@ PLAN_LIMITS = {
         "competitors": 3,
         "max_prompts_per_audit": 5,
         "max_audits_per_month": 2,
-        # Dedicated prompt allowance per account per calendar month —
-        # every prompt queued into an audit draws it down. -1 = unlimited.
-        "monthly_prompts": 10,
-        "providers_allowed": ["claude", "gpt4"],
-        "pipeline_builder": False,
-        "trend_intelligence": False,
-        "sso": False,
-        "api_access": False,
-        "white_label": False,
-        "dedicated_support": False,
-        "tabs": [
-            "dashboard", "projects", "analytics", "leads",
-            "heatmaps", "keywords",
-            "llm_ranking",
-            "integrations", "billing", "settings",
-        ],
+        # The free plan is metered in prompt runs, not queued prompts.
+        "monthly_prompts": -1,
+        "monthly_prompt_runs": 20,
+        "tracked_prompts": 5,
+        "autopilot": False,
+        "sms_digest": False,
     },
     # Pro carries the full self-serve feature set at $45/mo. The AI spend
     # wall (65% of price -> $29.25/mo of model cost) is what protects
@@ -79,19 +84,10 @@ PLAN_LIMITS = {
         "max_prompts_per_audit": 15,
         "max_audits_per_month": 30,           # daily cadence cap
         "monthly_prompts": 100,
-        "providers_allowed": ["claude", "gpt4", "gemini", "perplexity"],
-        "pipeline_builder": True,
-        "trend_intelligence": True,
-        "sso": False,
-        "api_access": True,
-        "white_label": False,
-        "dedicated_support": False,
-        "tabs": [
-            "dashboard", "projects", "analytics", "leads",
-            "heatmaps", "keywords",
-            "llm_ranking",
-            "integrations", "billing", "settings",
-        ],
+        "monthly_prompt_runs": -1,
+        "tracked_prompts": 100,
+        "autopilot": True,
+        "sms_digest": True,
     },
     Plan.BUSINESS: {
         "segment": Segment.ENTERPRISE,
@@ -109,20 +105,53 @@ PLAN_LIMITS = {
         # Per-SEAT default for enterprise orgs; each org can carry a
         # negotiated override (Organization.monthly_prompt_allowance).
         "monthly_prompts": 200,
-        "providers_allowed": ["claude", "gpt4", "gemini", "perplexity"],
-        "pipeline_builder": True,
-        "trend_intelligence": True,
-        "sso": True,
-        "api_access": True,
-        "white_label": True,
-        "dedicated_support": True,
-        "tabs": [
-            "dashboard", "projects", "analytics", "leads",
-            "heatmaps", "keywords",
-            "llm_ranking",
-            "integrations", "billing", "settings",
-        ],
+        "monthly_prompt_runs": -1,
+        "tracked_prompts": -1,
+        "autopilot": True,
+        "sms_digest": True,
     },
+}
+
+# The two self-serve plans share everything but the price and the tracked
+# prompts. Autopilot asks every tracked prompt every day, which would spend
+# a monthly prompt queue in one day, so ``monthly_prompts`` is unlimited:
+# the AI allowance (price x AI_SPEND_CAP_RATIO) is what bounds spend.
+_PROMPT_PLAN = {
+    "segment": Segment.INDIVIDUAL,
+    "price_yearly": 0,
+    "trial_days": 0,
+    "projects": 5,
+    "pageviews": 250_000,
+    "team_members": 5,
+    "ai_credits_monthly": 600,
+    "integrations": 10,
+    "competitors": 25,
+    "max_prompts_per_audit": 50,
+    "max_audits_per_month": -1,
+    "monthly_prompts": -1,
+    "monthly_prompt_runs": -1,
+    "autopilot": True,
+    "sms_digest": True,
+}
+# Seats (``team_members``, -1 = unlimited): the $80 plan is a one-person
+# plan; the $140 plan carries up to five seats. Lowering a plan's seat count
+# never removes anyone: an org already over it keeps its members and cannot
+# add more (apps.billing.services.org_entitlements.seat_available).
+PLAN_LIMITS[Plan.PROMPTS_100] = {
+    **_PROMPT_PLAN, "price_monthly": 80, "tracked_prompts": 100, "team_members": 1,
+}
+PLAN_LIMITS[Plan.PROMPTS_200] = {
+    **_PROMPT_PLAN, "price_monthly": 140, "tracked_prompts": 200, "team_members": 5,
+}
+
+# What each plan is called on the pricing window, the billing page and in
+# messages. One place, so renaming a plan is a one-line change.
+PLAN_NAMES = {
+    Plan.FREE: "Free",
+    Plan.PRO: "Pro",
+    Plan.BUSINESS: "Business",
+    Plan.PROMPTS_100: "100 prompts",
+    Plan.PROMPTS_200: "200 prompts",
 }
 
 # Legacy aliases — keep resolving so existing Subscription/User rows
@@ -135,10 +164,8 @@ PLAN_LIMITS[Plan.ENTERPRISE] = PLAN_LIMITS[Plan.BUSINESS]
 PLAN_LIMITS[Plan.SCALE] = PLAN_LIMITS[Plan.BUSINESS]
 
 
-# The RBAC feature lists and the integrations registry still key their
-# tier tables on the historical starter/growth/scale names. This maps
-# ANY plan value (live or legacy) onto those table keys so a plan="pro"
-# or plan="business" user resolves entitlements correctly.
+# Fallback for plan values that are not PLAN_LIMITS keys themselves
+# (e.g. "team"); see legacy_plan_key().
 LEGACY_TIER_KEY = {
     "pro": "growth",
     "business": "scale",
@@ -150,11 +177,6 @@ LEGACY_TIER_KEY = {
     "growth": "growth",
     "scale": "scale",
 }
-
-
-def legacy_tier_key(plan: str) -> str:
-    """Map a plan value onto the starter/growth/scale tier-table keys."""
-    return LEGACY_TIER_KEY.get(plan, "growth")
 
 
 def max_prompts_for_user(user) -> int:
@@ -253,48 +275,6 @@ FREEMAIL_DOMAINS = frozenset({
     "zoho.com", "fastmail.com", "hey.com",
     "mail.ru", "yandex.com", "yandex.ru", "qq.com", "naver.com", "163.com",
 })
-
-
-class AuditStatus(models.TextChoices):
-    PENDING = "pending", "Pending"
-    RUNNING = "running", "Running"
-    COMPLETED = "completed", "Completed"
-    FAILED = "failed", "Failed"
-
-
-class IssueSeverity(models.TextChoices):
-    CRITICAL = "critical", "Critical"
-    WARNING = "warning", "Warning"
-    INFO = "info", "Info"
-
-
-class LeadStatus(models.TextChoices):
-    NEW = "new", "New"
-    CONTACTED = "contacted", "Contacted"
-    QUALIFIED = "qualified", "Qualified"
-    CUSTOMER = "customer", "Customer"
-    LOST = "lost", "Lost"
-
-
-class ContentType(models.TextChoices):
-    BLOG = "blog", "Blog Post"
-    SOCIAL = "social", "Social Media"
-    EMAIL = "email", "Email"
-    VIDEO = "video", "Video"
-
-
-class ActionStatus(models.TextChoices):
-    TODO = "todo", "To Do"
-    IN_PROGRESS = "in_progress", "In Progress"
-    DONE = "done", "Done"
-    SKIPPED = "skipped", "Skipped"
-
-
-class ThreatLevel(models.TextChoices):
-    LOW = "low", "Low"
-    MEDIUM = "medium", "Medium"
-    HIGH = "high", "High"
-    CRITICAL = "critical", "Critical"
 
 
 class SubscriptionStatus(models.TextChoices):

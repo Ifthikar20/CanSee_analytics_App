@@ -140,9 +140,14 @@ def prune_llm_results(dry_run: bool = False) -> dict:
     Gemini answers are Grounded Results and their terms cap storage at thirty
     days. effective_llm_result_retention_days() resolves that, so the cap and
     the flag cannot drift apart.
+
+    Ask AI answers are LLM answers too: their runs follow the general window
+    (the answers go with them) and their Gemini answers the Gemini window,
+    counted from when the run was asked.
     """
     from apps.brand_vault.models import SafetyAlert
     from apps.llm_ranking.models import LLMRankingResult
+    from apps.prompt_box.models import PromptBoxAnswer, PromptBoxRun
     from core.utils.retention import (
         GEMINI_PROVIDER,
         effective_llm_result_retention_days,
@@ -167,6 +172,19 @@ def prune_llm_results(dry_run: bool = False) -> dict:
             created_at__lt=now - timedelta(days=gemini_days),
         ),
         label="LLMRankingResult(gemini)",
+        dry_run=dry_run,
+    )
+    results["prompt_box_runs"] = _delete_in_batches(
+        PromptBoxRun.objects.filter(created_at__lt=now - timedelta(days=general_days)),
+        label="PromptBoxRun",
+        dry_run=dry_run,
+    )
+    results["prompt_box_answers_gemini"] = _delete_in_batches(
+        PromptBoxAnswer.objects.filter(
+            provider=GEMINI_PROVIDER,
+            run__created_at__lt=now - timedelta(days=gemini_days),
+        ),
+        label="PromptBoxAnswer(gemini)",
         dry_run=dry_run,
     )
     results["safety_alerts"] = _delete_in_batches(

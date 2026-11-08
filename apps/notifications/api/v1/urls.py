@@ -15,6 +15,11 @@ urlpatterns = [
     # Integration connections (Slack / Discord)
     path("integrations/", views.IntegrationConnectionListView.as_view(), name="integration-list"),
     path("integrations/<uuid:pk>/", views.IntegrationConnectionDetailView.as_view(), name="integration-detail"),
+    path(
+        "integrations/<uuid:pk>/link-code/",
+        views.IntegrationLinkCodeView.as_view(),
+        name="integration-link-code",
+    ),
 
     # Inbound chat-platform webhooks (signature-verified, unauthenticated)
     path("discord/interactions/", chat_webhooks.discord_interactions, name="discord-interactions"),

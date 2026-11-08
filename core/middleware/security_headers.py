@@ -26,7 +26,11 @@ class SecurityHeadersMiddleware:
             "object-src 'none'; "
             "base-uri 'self';"
         )
-        response["Cache-Control"] = "no-store, no-cache, must-revalidate, private"
+        cache_control = "no-store, no-cache, must-revalidate, private"
+        if response.get("Content-Type", "").startswith("text/event-stream"):
+            # Proxies must not buffer, compress or rewrite an event stream.
+            cache_control += ", no-transform"
+        response["Cache-Control"] = cache_control
         response["Pragma"] = "no-cache"
 
         return response

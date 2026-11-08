@@ -4,10 +4,10 @@ Deep domain scanner for LLM Ranking audit setup.
 Fetches a domain's homepage and performs deep content analysis:
   - Business name (from <title> or og:site_name)
   - Description (from meta description or og:description)
-  - Industry hints (from meta keywords, content analysis)
+  - Industry hints (from meta keywords, whole-word heading/body matches;
+    empty when nothing matches)
   - Products/services extracted from headings, features, nav
   - Key phrases and selling points from body content
-  - Auto-generated buyer-intent topics from the real page content
 """
 
 import logging
@@ -40,6 +40,8 @@ def _friendly_fetch_error(detail: str) -> str:
 
 SCAN_TIMEOUT = 12  # seconds
 MAX_BODY_SIZE = 800_000  # 800KB limit
+# Bound on the visible-text excerpt returned as ``page_text``.
+PAGE_TEXT_LIMIT = 6000
 
 # Common stop-words to filter out of content extraction
 STOP_WORDS = frozenset([
@@ -344,106 +346,35 @@ def _build_content_summary(
     return "\n".join(parts)
 
 
-def _generate_topics_from_content(
-    name: str,
-    description: str,
-    industry: str,
-    analysis: dict,
-) -> list[str]:
+def _build_page_text(parser: DeepExtractor, limit: int = PAGE_TEXT_LIMIT) -> str:
+    """Visible page text, best signal first, bounded to ``limit`` chars.
+
+    Title, meta/og description, headings, then body text in document
+    order. Hidden elements, scripts and styles were already dropped by
+    the parser. Repeated chunks (a heading is also body text) appear once.
     """
-    Generate accurate buyer-intent search topics from the
-    actual extracted page content — not generic templates.
-    """
-    topics = []
-    seen = set()
+    lines: list[str] = []
+    seen: set[str] = set()
 
-    def add(t):
-        key = t.lower().strip()
-        if key and key not in seen and len(key) > 10:
-            seen.add(key)
-            topics.append(t)
+    def add(text: str, label: str = "") -> None:
+        clean = re.sub(r"\s+", " ", text or "").strip()
+        key = clean.lower()
+        if not clean or key in seen:
+            return
+        seen.add(key)
+        lines.append(f"{label}{clean}")
 
-    # Extract real nouns/phrases from the content
-    all_content = []
-    all_content.extend(analysis.get("selling_points", []))
-    all_content.extend(analysis.get("products", []))
-    all_content.extend(analysis.get("features", []))
-
-    # Find the core terms (what this business actually does)
-    core_terms = set()
-    for phrase in all_content:
-        words = phrase.lower().split()
-        for i, w in enumerate(words):
-            if w in FEATURE_SIGNALS and i > 0:
-                # Take the word before a signal word (e.g. "visitor tracking")
-                prev = words[i - 1]
-                if prev not in STOP_WORDS and len(prev) > 2:
-                    core_terms.add(f"{prev} {w}")
-            if len(w) > 4 and w not in STOP_WORDS and w not in FEATURE_SIGNALS:
-                core_terms.add(w)
-
-    # Use industry if available, otherwise infer from core terms
-    ind = industry or "software"
-    core_list = list(core_terms)[:6]
-
-    # Create specific buyer-intent queries from the actual content
-    if description:
-        desc_lower = description.lower()
-        # Look for "X for Y" patterns (e.g. "analytics platform for B2B")
-        for_matches = re.finditer(
-            r"\b([a-z][\w\s]{4,30}?)\s+for\s+([a-z][\w\s]{3,25}?)(?:\.|,|$)",
-            desc_lower,
-        )
-        for m in for_matches:
-            what = re.sub(
-                r"^(and|the|a|an|our|we|is|are|using|with|into|that|which)\s+",
-                "", m.group(1).strip(),
-            )
-            who = m.group(2).strip().rstrip(".,")
-            if len(what) > 4 and len(who) > 3 and len(what) < 35:
-                add(f"best {what} for {who}")
-                add(f"top {what} tools for {who}")
-
-    # Generate topics from selling points (the most accurate source)
-    for sp in analysis.get("selling_points", [])[:3]:
-        sp_clean = sp.strip().rstrip(".")
-        if len(sp_clean) > 10 and len(sp_clean) < 60:
-            # Remove leading verbs like "Identify", "Turn", "See"
-            sp_lower = re.sub(
-                r"^(identify|turn|see|get|find|track|monitor|manage|build|create|use|discover)\s+",
-                "", sp_clean.lower(),
-            )
-            add(f"best tools for {sp_lower}")
-
-    # Generate from products/services
-    for prod in analysis.get("products", [])[:4]:
-        prod_clean = prod.strip().rstrip(".")
-        if len(prod_clean) > 4 and len(prod_clean) < 50:
-            add(f"best {prod_clean.lower()} software")
-            add(f"top {prod_clean.lower()} tools compared")
-
-    # Generate from features
-    for feat in analysis.get("features", [])[:4]:
-        feat_clean = feat.strip().rstrip(".")
-        if len(feat_clean) > 6 and len(feat_clean) < 50:
-            add(f"best {feat_clean.lower()} tools")
-
-    # Core term queries
-    for term in core_list[:4]:
-        add(f"best {term} tools for businesses")
-        add(f"top {term} platforms")
-
-    # Industry-level queries
-    add(f"best {ind} tools for small businesses")
-    add(f"top {ind} platforms compared")
-    add(f"most recommended {ind} solutions")
-
-    # Name-specific
-    if name and len(name) > 2:
-        add(f"{name} alternatives and competitors")
-        add(f"is {name} the best {ind} tool")
-
-    return topics[:12]
+    add(parser.title, "Title: ")
+    add(parser.og_title, "Title: ")
+    add(parser.meta_description, "Description: ")
+    add(parser.og_description, "Description: ")
+    for heading in parser.h1_texts + parser.h2_texts + parser.h3_texts:
+        add(heading, "Heading: ")
+    for chunk in parser.body_text_chunks:
+        add(chunk)
+        if sum(len(line) + 1 for line in lines) >= limit:
+            break
+    return "\n".join(lines)[:limit]
 
 
 def scan_domain(url: str) -> dict:
@@ -461,7 +392,7 @@ def scan_domain(url: str) -> dict:
             "products": [str],         # extracted product/service names
             "features": [str],         # extracted features
             "selling_points": [str],   # key value propositions
-            "topics": [str],           # auto-generated buyer-intent topics
+            "page_text": str,          # visible text excerpt, bounded
             "error": str | None,
         }
     """
@@ -483,7 +414,7 @@ def scan_domain(url: str) -> dict:
         "products": [],
         "features": [],
         "selling_points": [],
-        "topics": [],
+        "page_text": "",
         "error": None,
     }
 
@@ -565,11 +496,6 @@ def scan_domain(url: str) -> dict:
             parser, analysis, name, description
         )
 
-        # Generate topics from actual page content
-        topics = _generate_topics_from_content(
-            name, description, industry, analysis
-        )
-
         result["success"] = True
         result["business_name"] = name[:200]
         result["description"] = description
@@ -578,7 +504,7 @@ def scan_domain(url: str) -> dict:
         result["products"] = analysis["products"]
         result["features"] = analysis["features"]
         result["selling_points"] = analysis["selling_points"]
-        result["topics"] = topics
+        result["page_text"] = _build_page_text(parser)
 
     except requests.exceptions.Timeout:
         result["error"] = "Domain took too long to respond."
@@ -599,7 +525,11 @@ def _extract_industry_from_content(
     h1_texts: list[str],
     h2_texts: list[str],
 ) -> str:
-    """Try to infer industry from meta keywords, headings, and body text."""
+    """Infer an industry from meta keywords, headings, and body text.
+
+    Heading and body matches are whole-word. Returns "" when nothing
+    matches: an unknown industry stays unknown.
+    """
     # Use meta keywords first
     if keywords:
         kw_list = [k.strip() for k in keywords.split(",") if k.strip()]
@@ -639,13 +569,18 @@ def _extract_industry_from_content(
         ("saas", "SaaS"), ("software", "Software"),
     ]
     for keyword, industry in industry_keywords:
-        if keyword in all_headings:
+        if _has_word(keyword, all_headings):
             return industry
 
     # Fallback: check body text
     text_lower = body_text[:2000].lower() if body_text else ""
     for keyword, industry in industry_keywords:
-        if keyword in text_lower:
+        if _has_word(keyword, text_lower):
             return industry
 
-    return "Software"
+    return ""
+
+
+def _has_word(phrase: str, text: str) -> bool:
+    """True when ``phrase`` occurs in ``text`` as whole words."""
+    return re.search(rf"(?<![a-z0-9]){re.escape(phrase)}(?![a-z0-9])", text) is not None

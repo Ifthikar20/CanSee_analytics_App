@@ -58,17 +58,6 @@ def build_for_user(user, website=None) -> dict | None:
     }
 
 
-def build_month12_for_website(user, website) -> dict:
-    """Return a 12-month visibility series scoped to a single website.
-
-    Used by the dashboard's Visibility Overview card. Unlike ``build_for_user``,
-    this always returns a series — empty buckets are zero, not None — so the
-    chart renders even when only a few months have data.
-    """
-    now = timezone.now()
-    return _month12_series(user, now, website=website)
-
-
 TOP_COMPETITORS_LIMIT = 5
 
 
@@ -84,8 +73,8 @@ def build_overview_for_website(user, website) -> dict:
     Delta formula: mean of the last three months vs the prior three months,
     expressed as a percentage change of the prior window. Falls back to a
     first-vs-last calculation when the series has fewer than six populated
-    points. ``has_data`` is False when every bucket is zero so the card can
-    show its sample-data badge.
+    points. ``has_data`` is False when no month was measured; current
+    values and deltas are None when there is nothing to compute them from.
 
     Competitor selection: the top ``TOP_COMPETITORS_LIMIT`` competitors by
     total mention count over the full 12-month window. Picking the set up
@@ -150,7 +139,7 @@ def build_overview_for_website(user, website) -> dict:
         values = [c["series"][i] for c in competitors if c["series"][i] is not None]
         competitor_avg.append(round(sum(values) / len(values), 1) if values else None)
 
-    has_data = any(v for v in brand if v) or any(v for v in competitor_avg if v)
+    has_data = any(measured_mask)
 
     return {
         "labels": labels,
@@ -168,36 +157,36 @@ def build_overview_for_website(user, website) -> dict:
     }
 
 
-def _current(series: list[float | None]) -> float:
-    """Most recent measured value. Unmeasured buckets (None) are skipped."""
-    if not series:
-        return 0.0
-    for value in reversed(series):
+def _current(series: list[float | None]) -> float | None:
+    """Most recent measured value, or None when nothing was measured."""
+    for value in reversed(series or []):
         if value is not None:
             return round(value, 1)
-    return 0.0
+    return None
 
 
-def _trend_delta(series: list[float | None]) -> float:
+def _trend_delta(series: list[float | None]) -> float | None:
     """Percent change of the last 3 measured buckets vs the 3 before them.
 
-    Operates on measured buckets only. With fewer than two measured points
-    there is no trend to report, so it returns 0.0 and the UI hides the
-    badge rather than implying movement that was never observed.
+    Operates on measured buckets only. None when there is no trend to
+    report: fewer than two measured points, or a zero baseline that a
+    percent change cannot be taken from.
     """
     points = [v for v in (series or []) if v is not None]
     if len(points) < 2:
-        return 0.0
+        return None
     if len(points) >= 6:
         tail = points[-3:]
         prev = points[-6:-3]
         tail_avg = sum(tail) / len(tail)
         prev_avg = sum(prev) / len(prev)
         if prev_avg == 0:
-            return 0.0
+            return None
         return round((tail_avg - prev_avg) / prev_avg * 100, 1)
-    first = points[0] or 1
+    first = points[0]
     last = points[-1]
+    if first == 0:
+        return None
     return round((last - first) / abs(first) * 100, 1)
 
 
@@ -276,25 +265,31 @@ def _series_for_ranges(
 
 
 def _brand_rate(audit_ids: list) -> float | None:
-    """Average mention_rate across this bucket's audits, in percent.
+    """Share of answered AI queries in this bucket that mention the brand,
+    in percent.
 
-    Returns ``None`` — not 0.0 — when the bucket contains no audits. A
+    Computed from the result rows, like ``_competitor_rate``, so per-prompt
+    scans count by their answers rather than by a stored audit score.
+    Returns ``None`` — not 0.0 — when the bucket has no answered query. A
     month you never measured is a gap in the series, not a month where
     the brand scored zero; charting it as zero states something false.
     """
     if not audit_ids:
         return None
-    audits = LLMRankingAudit.objects.filter(id__in=audit_ids)
-    rates = [a.mention_rate for a in audits if a.mention_rate is not None]
-    if not rates:
+    answered = LLMRankingResult.objects.filter(
+        audit_id__in=audit_ids, query_succeeded=True,
+    )
+    total = answered.count()
+    if total == 0:
         return None
-    return round(sum(rates) / len(rates), 1)
+    return round(100.0 * answered.filter(is_mentioned=True).count() / total, 1)
 
 
 def _competitor_rate(audit_ids: list) -> float | None:
     """Share of successful AI answers in this bucket that mention any competitor.
 
-    ``None`` for unmeasured buckets, for the same reason as ``_brand_rate``.
+    ``None`` for unmeasured buckets and for buckets with no answered query,
+    for the same reason as ``_brand_rate``.
     """
     if not audit_ids:
         return None
@@ -303,7 +298,7 @@ def _competitor_rate(audit_ids: list) -> float | None:
     )
     total = succeeded.count()
     if total == 0:
-        return 0.0
+        return None
     with_competitors = sum(
         1 for row in succeeded.only("competitors_mentioned")
         if _has_competitor(row.competitors_mentioned)

@@ -251,7 +251,7 @@ class GscSelectPropertyView(TenantScopedAPIView):
 
 class GscDisconnectView(TenantScopedAPIView):
     def delete(self, request, website_id):
-        website = self.get_website(website_id)
+        website = self.get_website(website_id, min_role="admin")
         integration = _get_integration(website)
         if integration is not None:
             oauth_service.disconnect(integration)

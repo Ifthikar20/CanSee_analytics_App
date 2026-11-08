@@ -20,19 +20,44 @@ ASK_FACT_BLOCK_MORE_LINE = "...more in the dashboard."
 
 CHAT_COMMANDS = ("report", "growth", "security", "usage", "ask", "scan", "help")
 
+# Replies when the ask command cannot produce an AI answer. Said plainly,
+# never dressed up as an answer.
+ASK_NOT_CONFIGURED_REPLY = "Cansee couldn't answer right now: AI isn't available."
+ASK_FAILED_REPLY = (
+    "Cansee couldn't answer right now: the AI request failed. "
+    "Try again in a moment."
+)
+
 
 @shared_task(name="apps.notifications.tasks.send_weekly_reports")
 def send_weekly_reports():
-    """Send weekly summary reports to all users."""
+    """Email the report digest to users who keep the weekly report on.
+
+    The body is the same deterministic digest the chat ``report`` command
+    sends. Users without a website have nothing to report and get no mail.
+    """
+    from django.utils.html import escape
+
     from apps.accounts.models import User
     from apps.notifications.services.email_service import EmailService
+    from apps.websites.models import Website
 
-    for user in User.objects.filter(is_active=True):
+    users = (
+        User.objects.filter(is_active=True)
+        .exclude(notification_preferences__weekly_report=False)
+        .filter(id__in=Website.objects.values("user_id"))
+    )
+    for user in users:
         try:
+            body = _format_report_text(_build_report_data(user))
+            html = "".join(
+                "<p>" + escape(block).replace("\n", "<br>") + "</p>"
+                for block in body.split("\n\n")
+            )
             EmailService.send_email(
                 to=user.email,
                 subject="Your Cansee Weekly Report",
-                html_content=f"<p>Hi {user.first_name}, here is your weekly growth summary.</p>",
+                html_content=html,
             )
         except Exception as e:
             logger.error(f"Weekly report failed for user {user.id}: {e}")
@@ -105,19 +130,25 @@ def _build_report_data(user) -> dict:
     Sections that have no data are left empty/flagged so the renderers can
     say so honestly instead of printing fake zeros.
     """
-    from apps.websites.models import Website
+    from django.utils import timezone
 
-    websites = list(Website.objects.filter(user=user).order_by("created_at")[:3])
+    from apps.websites.services.website_service import WebsiteService
+
+    websites = list(WebsiteService.created_by_qs(user).order_by("created_at")[:3])
     data = {
         "visitors_24h": 0,
         "pageviews_24h": 0,
-        "visitors_change": 0,
+        # Percent change vs the previous 24h across all reported websites;
+        # None when the previous 24h had no visitors to compare against.
+        "visitors_change": None,
         "top_page": None,
         "has_analytics": False,
         "geo": [],
         "security": {"open_total": 0, "high": 0, "medium": 0, "low": 0, "top_action": ""},
     }
 
+    now = timezone.now()
+    visitors_prev = 0
     for website in websites:
         try:
             # Analytics overview
@@ -125,13 +156,17 @@ def _build_report_data(user) -> dict:
             overview = AnalyticsService.get_overview(
                 website_id=str(website.id), period="24h"
             )
+            previous = AnalyticsService.get_overview(
+                website_id=str(website.id), period="custom",
+                start_date=(now - timedelta(hours=48)).isoformat(),
+                end_date=(now - timedelta(hours=24)).isoformat(),
+            )
             if isinstance(overview, dict):
                 data["has_analytics"] = True
-                # get_overview's real keys (the dashboard reads the same):
-                # total_visitors / visitor_growth_pct.
-                data["visitors_24h"] += overview.get("total_visitors", 0)
-                data["pageviews_24h"] += overview.get("total_pageviews", 0)
-                data["visitors_change"] = overview.get("visitor_growth_pct", 0)
+                data["visitors_24h"] += overview.get("total_visitors", 0) or 0
+                data["pageviews_24h"] += overview.get("total_pageviews", 0) or 0
+                if isinstance(previous, dict):
+                    visitors_prev += previous.get("total_visitors", 0) or 0
                 if not data["top_page"]:
                     top_pages = AnalyticsService.get_top_pages(
                         website_id=str(website.id), period="24h"
@@ -153,11 +188,16 @@ def _build_report_data(user) -> dict:
             if geo.get("has_data"):
                 data["geo"].append({
                     "website": website.name,
-                    "visibility_pct": geo.get("brand_current", 0.0),
-                    "delta_pct": geo.get("brand_delta_pct", 0.0),
+                    "visibility_pct": geo.get("brand_current"),
+                    "delta_pct": geo.get("brand_delta_pct"),
                 })
         except Exception:
             pass
+
+    if visitors_prev:
+        data["visitors_change"] = round(
+            (data["visitors_24h"] - visitors_prev) / visitors_prev * 100, 1,
+        )
 
     try:
         data["security"] = _security_overview(user)
@@ -165,6 +205,14 @@ def _build_report_data(user) -> dict:
         pass
 
     return data
+
+
+def _visibility_text(value) -> str:
+    return "not measured" if value is None else f"{value}%"
+
+
+def _trend_text(value) -> str:
+    return "no trend yet" if value is None else f"{value:+.1f}% trend"
 
 
 def _security_overview(user, website=None) -> dict:
@@ -178,9 +226,10 @@ def _security_overview(user, website=None) -> dict:
         DETECTOR_INDEX,
         ISSUE_FALLBACK,
     )
+    from apps.websites.services.website_service import WebsiteService
 
     open_alerts = SafetyAlert.objects.filter(
-        website__user=user, status=SafetyAlert.STATUS_OPEN,
+        website__in=WebsiteService.created_by_qs(user), status=SafetyAlert.STATUS_OPEN,
     ).only("severity", "detector_code", "issue")
     if website is not None:
         open_alerts = open_alerts.filter(website=website)
@@ -212,10 +261,13 @@ def _security_overview(user, website=None) -> dict:
 def _report_section_lines(data: dict) -> dict:
     """Shared plain-text section lines for the report renderers."""
     if data.get("has_analytics"):
-        change = data["visitors_change"]
-        change_str = f"+{change}%" if change >= 0 else f"{change}%"
+        change = data.get("visitors_change")
+        change_str = (
+            "no visitors the day before to compare" if change is None
+            else f"{change:+}% from yesterday"
+        )
         analytics = (
-            f"{data['visitors_24h']:,} visitors ({change_str} from yesterday), "
+            f"{data['visitors_24h']:,} visitors ({change_str}), "
             f"{data['pageviews_24h']:,} pageviews"
         )
         if data.get("top_page"):
@@ -225,8 +277,8 @@ def _report_section_lines(data: dict) -> dict:
 
     if data.get("geo"):
         geo_lines = [
-            f"{row['website']}: {row['visibility_pct']}% AI visibility "
-            f"({row['delta_pct']:+.1f}% trend)"
+            f"{row['website']}: {_visibility_text(row['visibility_pct'])} AI visibility "
+            f"({_trend_text(row['delta_pct'])})"
             for row in data["geo"]
         ]
         geo = "\n".join(geo_lines)
@@ -256,10 +308,10 @@ def _dashboard_url() -> str:
 
 
 def _format_report_text(data: dict) -> str:
-    """Plain-text digest body used for chat-command replies."""
+    """Plain-text digest body used for chat-command replies and the weekly email."""
     sections = _report_section_lines(data)
     return (
-        f"Traffic: {sections['analytics']}\n\n"
+        f"Traffic (last 24h): {sections['analytics']}\n\n"
         f"AI visibility:\n{sections['geo']}\n\n"
         f"Brand security: {sections['security']}\n\n"
         f"View the full dashboard at {_dashboard_url()}"
@@ -284,10 +336,14 @@ def _report_facts(data: dict) -> str:
     lines = []
 
     if data.get("has_analytics"):
-        change = data.get("visitors_change", 0)
+        change = data.get("visitors_change")
+        change_str = (
+            "no visitors the day before to compare" if change is None
+            else f"{change:+}% vs the day before"
+        )
         line = (
             f"Traffic (last 24h): {data.get('visitors_24h', 0):,} visitors "
-            f"({'+' if change >= 0 else ''}{change}% vs the day before), "
+            f"({change_str}), "
             f"{data.get('pageviews_24h', 0):,} pageviews."
         )
         if data.get("top_page"):
@@ -298,9 +354,12 @@ def _report_facts(data: dict) -> str:
 
     if data.get("geo"):
         for row in data["geo"]:
+            if row["visibility_pct"] is None:
+                lines.append(f"AI visibility for {row['website']}: not measured yet.")
+                continue
             lines.append(
-                f"AI visibility for {row['website']}: {row['visibility_pct']}% "
-                f"of AI answers mention the brand (trend {row['delta_pct']:+.1f}%)."
+                f"AI visibility for {row['website']}: {row['visibility_pct']}% of AI "
+                f"answers mention the brand ({_trend_text(row['delta_pct'])})."
             )
     else:
         lines.append("AI visibility: no completed visibility scans yet.")
@@ -575,6 +634,7 @@ def _security_command_text(user) -> str:
         DETECTOR_INDEX,
         ISSUE_FALLBACK,
     )
+    from apps.websites.services.website_service import WebsiteService
 
     overview = _security_overview(user)
     if not overview["open_total"]:
@@ -587,7 +647,7 @@ def _security_command_text(user) -> str:
     rank = {"high": 0, "medium": 1, "low": 2}
     alerts = sorted(
         SafetyAlert.objects.filter(
-            website__user=user, status=SafetyAlert.STATUS_OPEN,
+            website__in=WebsiteService.created_by_qs(user), status=SafetyAlert.STATUS_OPEN,
         ).select_related("website"),
         key=lambda a: (rank.get(a.severity, 3), -a.last_seen_at.timestamp()),
     )[:5]
@@ -700,10 +760,10 @@ def _growth_command_text(user) -> str:
     """
     from apps.llm_ranking.services.overview_stats import build_overview_for_user
     from apps.llm_ranking.services.visibility_series import build_overview_for_website
-    from apps.websites.models import Website
+    from apps.websites.services.website_service import WebsiteService
 
     site_rows = []
-    for website in Website.objects.filter(user=user).order_by("created_at")[:5]:
+    for website in WebsiteService.created_by_qs(user).order_by("created_at")[:5]:
         try:
             overview = build_overview_for_website(user, website)
         except Exception:
@@ -712,10 +772,10 @@ def _growth_command_text(user) -> str:
             continue
         site_rows.append({
             "name": website.name,
-            "current": overview.get("brand_current", 0.0),
-            "delta": overview.get("brand_delta_pct", 0.0),
-            "competitor_current": overview.get("competitor_current", 0.0),
-            "competitor_delta": overview.get("competitor_delta_pct", 0.0),
+            "current": overview.get("brand_current"),
+            "delta": overview.get("brand_delta_pct"),
+            "competitor_current": overview.get("competitor_current"),
+            "competitor_delta": overview.get("competitor_delta_pct"),
         })
 
     prompts = []
@@ -733,15 +793,18 @@ def _growth_command_text(user) -> str:
             "prompts - movers will show up here once it completes."
         )
 
-    up = sorted((r for r in site_rows if r["delta"] > 0), key=lambda r: -r["delta"])
-    down = sorted((r for r in site_rows if r["delta"] < 0), key=lambda r: r["delta"])
-    flat = [r for r in site_rows if r["delta"] == 0]
+    with_trend = [r for r in site_rows if r["delta"] is not None]
+    up = sorted((r for r in with_trend if r["delta"] > 0), key=lambda r: -r["delta"])
+    down = sorted((r for r in with_trend if r["delta"] < 0), key=lambda r: r["delta"])
+    flat = [r for r in with_trend if r["delta"] == 0]
+    no_trend = [r for r in site_rows if r["delta"] is None]
 
     def _site_line(row: dict) -> str:
         return (
-            f"- {row['name']}: {row['current']}% AI visibility "
-            f"({row['delta']:+.1f}% trend; competitor avg "
-            f"{row['competitor_current']}%, {row['competitor_delta']:+.1f}%)"
+            f"- {row['name']}: {_visibility_text(row['current'])} AI visibility "
+            f"({_trend_text(row['delta'])}; competitor avg "
+            f"{_visibility_text(row['competitor_current'])}, "
+            f"{_trend_text(row['competitor_delta'])})"
         )
 
     blocks: list[str] = []
@@ -751,6 +814,11 @@ def _growth_command_text(user) -> str:
         blocks.append("Slipping:\n" + "\n".join(_site_line(r) for r in down))
     if flat:
         blocks.append("Holding steady:\n" + "\n".join(_site_line(r) for r in flat))
+    if no_trend:
+        blocks.append(
+            "Not enough runs for a trend yet:\n"
+            + "\n".join(_site_line(r) for r in no_trend)
+        )
 
     # The overview builder returns prompts weakest-first; pull both ends.
     strongest, weakest = _prompt_extremes(prompts, 3)
@@ -786,14 +854,36 @@ def _growth_command_text(user) -> str:
     return "\n\n".join(blocks)
 
 
-def _resolve_website(user):
-    from apps.websites.models import Website
+# Reply when every project the user created is one their current org role
+# can only view: chat must refuse what the app refuses with a 403.
+VIEW_ONLY_COMMAND_REPLY = (
+    "Your organization role can view this project but not change it, so "
+    "Cansee can't run scans or answer questions for it from chat. Ask an "
+    "organization admin for member access."
+)
 
-    return (
-        Website.objects.filter(user=user, is_active=True)
-        .order_by("created_at")
-        .first()
+
+def _resolve_website(user, *, min_role: str | None = None):
+    """The user's first active created website they can still reach.
+
+    With ``min_role``, only a website where their current role meets it
+    (scan and ask create audits and spend engine runs, so they need
+    "member", as in the app); the read-only digests pass none.
+    """
+    from apps.websites.services.website_service import WebsiteService
+
+    qs = (
+        WebsiteService.created_by_qs_with_role(user, min_role)
+        if min_role else WebsiteService.created_by_qs(user)
     )
+    return qs.filter(is_active=True).order_by("created_at").first()
+
+
+def _no_writable_website_reply(user) -> str:
+    """Why a write command found no project: none at all, or view-only."""
+    if _resolve_website(user) is not None:
+        return VIEW_ONLY_COMMAND_REPLY
+    return "No active website found on your account. Add a website in Cansee first."
 
 
 # ── Live fact pack for the ask command ────────────────────────────────────────
@@ -816,14 +906,14 @@ def _traffic_fact_lines(user, website=None) -> list[str]:
     from django.utils import timezone
 
     from apps.analytics.services.analytics_service import AnalyticsService
-    from apps.websites.models import Website
+    from apps.websites.services.website_service import WebsiteService
 
     now = timezone.now()
     lines = []
     if website is not None:
         targets = [website]
     else:
-        targets = Website.objects.filter(user=user).order_by("created_at")[:3]
+        targets = WebsiteService.created_by_qs(user).order_by("created_at")[:3]
     for website in targets:
         try:
             today = AnalyticsService.get_overview(
@@ -858,13 +948,13 @@ def _traffic_fact_lines(user, website=None) -> list[str]:
 
 def _visibility_fact_lines(user, website=None) -> list[str]:
     from apps.llm_ranking.services.visibility_series import build_overview_for_website
-    from apps.websites.models import Website
+    from apps.websites.services.website_service import WebsiteService
 
     lines = []
     if website is not None:
         targets = [website]
     else:
-        targets = Website.objects.filter(user=user).order_by("created_at")[:3]
+        targets = WebsiteService.created_by_qs(user).order_by("created_at")[:3]
     for website in targets:
         try:
             overview = build_overview_for_website(user, website)
@@ -872,11 +962,14 @@ def _visibility_fact_lines(user, website=None) -> list[str]:
             continue
         if not overview.get("has_data"):
             continue
+        current = overview.get("brand_current")
+        if current is None:
+            lines.append(f"- AI visibility for {website.name}: not measured yet.")
+            continue
         lines.append(
-            f"- AI visibility for {website.name}: "
-            f"{overview.get('brand_current', 0.0)}% of AI answers mention the "
-            f"brand (trend {overview.get('brand_delta_pct', 0.0):+.1f}%; "
-            f"competitor avg {overview.get('competitor_current', 0.0)}%)."
+            f"- AI visibility for {website.name}: {current}% of AI answers "
+            f"mention the brand ({_trend_text(overview.get('brand_delta_pct'))}; "
+            f"competitor avg {_visibility_text(overview.get('competitor_current'))})."
         )
     if not lines:
         lines.append(
@@ -1098,9 +1191,9 @@ def _answer_question(connection, question: str, thread_ref: str = "") -> str:
     if not question:
         return "Ask a question after the command, e.g.: ask How is my AI visibility trending?"
 
-    website = _resolve_website(user)
+    website = _resolve_website(user, min_role="member")
     if website is None:
-        return "No active website found on your account. Add a website in Cansee first."
+        return _no_writable_website_reply(user)
 
     # The answer is grounded in a deterministic fact pack so questions
     # about live metrics and account content reflect real rows.
@@ -1110,10 +1203,7 @@ def _answer_question(connection, question: str, thread_ref: str = "") -> str:
 
     provider = get_provider("claude") or get_synthesis_provider()
     if provider is None:
-        return (
-            "No AI provider is configured, so I can't answer questions yet. "
-            "Add an AI provider key in Cansee settings."
-        )
+        return ASK_NOT_CONFIGURED_REPLY
 
     context = ""
     try:
@@ -1129,7 +1219,7 @@ def _answer_question(connection, question: str, thread_ref: str = "") -> str:
     system_prompt = (
         "You are Cansee, a growth and AI-visibility assistant. Answer "
         "questions about the user's website traffic, AI search visibility, "
-        "leads, and brand security. Be concise, factual, and plain-text. "
+        "and brand security. Be concise, factual, and plain-text. "
         "Answer metric questions from the live account facts and retrieved "
         "context in the prompt. The facts also include the account's saved "
         "prompts (listed most recent first - 'my most recent prompt' means "
@@ -1152,14 +1242,20 @@ def _answer_question(connection, question: str, thread_ref: str = "") -> str:
         role="chat_command", module="notifications",
     )
     reply = (getattr(result, "text", "") or "").strip()
-    return reply or "I don't have an answer for that yet."
+    if not getattr(result, "succeeded", False) or not reply:
+        logger.warning(
+            "Chat ask failed for connection %s: %s",
+            connection.id, (getattr(result, "error", "") or "empty reply")[:200],
+        )
+        return ASK_FAILED_REPLY
+    return reply
 
 
 def _queue_scan_command(user) -> str:
     """Queue an AI visibility audit over the user's saved prompts."""
-    website = _resolve_website(user)
+    website = _resolve_website(user, min_role="member")
     if website is None:
-        return "No active website found on your account. Add a website in Cansee first."
+        return _no_writable_website_reply(user)
 
     from apps.llm_ranking.services.audit_factory import create_audit
     from apps.llm_ranking.services.audit_runner import (
@@ -1176,12 +1272,15 @@ def _queue_scan_command(user) -> str:
             "the Prompts page first, then run scan again."
         )
 
+    from apps.llm_ranking.services.audit_factory import NoLLMProviderConfigured
     from core.exceptions import CanseeException
 
     try:
         audit = create_audit(
             website=website, user=user, prompts=prompts, prompt_source="library",
         )
+    except NoLLMProviderConfigured:
+        return "Cansee couldn't start a scan: AI engines aren't available yet."
     except CanseeException as exc:
         # Chat surfaces render text, not HTTP errors — relay the message
         # (e.g. the monthly prompt allowance being used up) as a reply.

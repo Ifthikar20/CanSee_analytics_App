@@ -1,4 +1,4 @@
-"""AI-powered analytics insights — anomaly detection, NL summaries, action suggestions."""
+"""Rule-based analytics insights: anomaly detection and suggested actions."""
 import logging
 from datetime import timedelta
 
@@ -14,10 +14,7 @@ logger = logging.getLogger("apps")
 class AIInsightsService:
     @staticmethod
     def generate_insights(*, website_id: str, period: str = "7d") -> list:
-        """
-        Generate a list of AI-powered insight cards.
-        Uses rule-based analysis against real data patterns.
-        """
+        """Generate insight cards from rule-based checks on the site's own data."""
         insights = []
 
         # 1. Anomaly detection — compare recent period to baseline
@@ -83,7 +80,7 @@ class AIInsightsService:
                     "icon": "trend-down",
                     "title": "Traffic Drop Detected",
                     "description": f"Today's pageviews ({today_pv}) are only {round(ratio * 100)}% of your 7-day average ({round(avg_pv)}). Check for issues.",
-                    "action": "Run a site audit to check for technical issues",
+                    "action": "Check that the site is up and the tracking pixel is still installed",
                     "metric": f"-{round((1 - ratio) * 100)}%",
                 })
 
@@ -152,7 +149,7 @@ class AIInsightsService:
                     "icon": "search",
                     "title": "No Organic Search Traffic",
                     "description": "You're not getting any traffic from search engines. SEO optimization could unlock a major growth channel.",
-                    "action": "Run an SEO audit and start optimizing your content",
+                    "action": "Check where your pages rank on Google for the prompts you track",
                     "metric": "0%",
                 })
 
@@ -248,7 +245,7 @@ class AIInsightsService:
                     "icon": "click",
                     "title": "Low Click Engagement",
                     "description": f"Visitors average only {clicks_per_view} clicks per pageview. Consider adding more interactive elements and clearer CTAs.",
-                    "action": "Review your heatmap data to see where visitors are (or aren't) clicking",
+                    "action": "Add clearer calls to action on your most-viewed pages",
                     "metric": f"{clicks_per_view}/view",
                 })
 

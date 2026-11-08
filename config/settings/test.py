@@ -58,11 +58,14 @@ CLAIM_VERIFICATION_ENABLED = False
 INTELLIGENCE_SERVICE_URL = ""
 SOURCES_SERVICE_URL = ""
 
-# Brand Research discovery must never leave the process. SERPAPI_KEY comes
+# Brand Research discovery must never leave the process. SERPAPI_KEY and
+# SCRAPERAPI_KEY come
 # from .env on a developer machine, and the Reddit community lane has no key
 # to blank -- without both of these the scan pipeline tests make real
 # outbound calls. Tests covering these lanes mock the clients directly.
 SERPAPI_KEY = ""
+SCRAPERAPI_KEY = ""
+SERP_PROVIDER = ""
 BRAND_RESEARCH_COMMUNITY_ENABLED = False
 # SMS must never leave the process in tests: a real send costs money and
 # texts a real handset. Tests that cover the channel enable it explicitly
@@ -106,3 +109,21 @@ RAG_CHROMA_URL = ""
 # Deterministic free-plan allowance regardless of the developer's .env
 # (local dev raises it so the $1 default doesn't stall testing).
 AI_FREE_MONTHLY_CAP_USD = 1.0
+
+# The agent runs turns inline in the suite, against the fake Anthropic
+# client installed by apps/agent/tests (never the real API).
+AGENT_ENABLED = True
+AGENT_PROCESS = True
+AGENT_RUN_MODE = "inline"
+
+# Country checks run before the create request returns, in the request's
+# thread, so tests see every cell settled.
+COUNTRY_CHECK_RUN_MODE = "inline"
+
+# Insights runs, likewise.
+INSIGHTS_RUN_MODE = "inline"
+
+# Ask AI and Autopilot runs, likewise (with "auto", eager Celery would start
+# daemon threads).
+PROMPT_BOX_RUN_MODE = "inline"
+AUTOPILOT_RUN_MODE = "inline"

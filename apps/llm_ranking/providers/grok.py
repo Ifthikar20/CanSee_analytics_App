@@ -43,7 +43,7 @@ class GrokProvider(LLMProvider):
 
         resp = client.chat.completions.create(
             model=self.model,
-            max_tokens=1024,
+            max_tokens=4096,
             messages=[
                 {"role": "system", "content": sys_prompt},
                 {"role": "user", "content": prompt},
@@ -55,12 +55,16 @@ class GrokProvider(LLMProvider):
             text=resp.choices[0].message.content.strip(),
             input_tokens=getattr(usage, "prompt_tokens", 0) if usage else 0,
             output_tokens=getattr(usage, "completion_tokens", 0) if usage else 0,
+            # No search tool was offered, so the answer ran no search.
+            search_queries=[],
+            web_searches=0,
         )
 
     def _web_search_call(self, client, prompt, sys_prompt):
         """Responses API with the web_search tool. None -> fall back to chat."""
         from apps.llm_ranking.providers.openai_compat import (
             extract_responses_citations,
+            extract_search_queries,
         )
 
         try:
@@ -72,12 +76,18 @@ class GrokProvider(LLMProvider):
                 max_output_tokens=1024,
             )
             usage = getattr(resp, "usage", None)
+            # xAI's web_search_call items are not verified against its docs,
+            # so searches are recorded only when they appear: a response
+            # without them is "not reported", not "searched nothing".
+            queries, searches = extract_search_queries(resp)
             return ProviderResult(
                 succeeded=True,
                 text=(getattr(resp, "output_text", "") or "").strip(),
                 input_tokens=getattr(usage, "input_tokens", 0) if usage else 0,
                 output_tokens=getattr(usage, "output_tokens", 0) if usage else 0,
                 citations=extract_responses_citations(resp),
+                search_queries=queries if searches else None,
+                web_searches=searches if searches else None,
             )
         except Exception:
             return None

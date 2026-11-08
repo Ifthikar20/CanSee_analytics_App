@@ -9,14 +9,20 @@ Effectiveness rolls four normalised axes into a 0-1 weighted overall:
 
 Overall = 0.40*v + 0.30*c + 0.20*cl + 0.10*b
 
-A prompt needs ``MIN_RUNS_STABLE`` (3) result rows before its score is
-considered stable; below that we still compute the components but flag
-``stable=False`` so the UI can show an "Untested" badge.
+A prompt needs ``MIN_RUNS_STABLE`` (3) answered result rows before its
+score is considered stable; below that we still compute the components
+but flag ``stable=False`` so the UI can show an "Untested" badge. Failed
+calls are not runs.
 
 Result rows are matched to a Prompt via the
 ``LLMRankingResult.source_prompt`` foreign key. Older rows that predate
 the FK are simply ignored — they would require unreliable text matching
 across filled template variants.
+
+Scores are per website. Prompt rows are shared by every tenant that
+tracks the same text, and ``is_mentioned`` refers to whichever brand ran
+the audit, so a score is only meaningful for one website's own results.
+They are stored on that website's BrandPrompt row.
 """
 from __future__ import annotations
 
@@ -53,7 +59,16 @@ def _avg_citations_per_run(results) -> float:
     return total / max(len(results), 1)
 
 
-def _avg_claims_per_run(prompt) -> float:
+def _results_for(prompt, website):
+    from apps.llm_ranking.models import LLMRankingResult
+
+    qs = LLMRankingResult.objects.filter(source_prompt=prompt)
+    if website is not None:
+        qs = qs.filter(audit__website=website)
+    return qs
+
+
+def _avg_claims_per_run(prompt, website=None) -> float:
     """Supported brand claims per analyzed response, from the brand
     alignment detail.
 
@@ -65,11 +80,8 @@ def _avg_claims_per_run(prompt) -> float:
     effectiveness scores only ever improve).
     """
     try:
-        from apps.llm_ranking.models import LLMRankingResult
-
         rows = (
-            LLMRankingResult.objects
-            .filter(source_prompt=prompt)
+            _results_for(prompt, website)
             .exclude(alignment_version="")
             .values_list("alignment_detail", flat=True)
         )
@@ -84,15 +96,17 @@ def _avg_claims_per_run(prompt) -> float:
         return 0.0
 
 
-def compute_effectiveness(prompt) -> dict:
-    """Return the score envelope for ``prompt``.
+def compute_effectiveness(prompt, website=None) -> dict:
+    """Return the score envelope for ``prompt`` on ``website``.
 
-    Always safe to call — never raises. Returns ``stable=False`` when
-    fewer than :data:`MIN_RUNS_STABLE` runs have used this prompt.
+    Pass ``website`` for anything shown to a tenant: only that website's
+    audit results count. Always safe to call — never raises. Returns
+    ``stable=False`` when fewer than :data:`MIN_RUNS_STABLE` runs have used
+    this prompt.
     """
-    from apps.llm_ranking.models import LLMRankingResult
-
-    qs = LLMRankingResult.objects.filter(source_prompt=prompt)
+    # Only answered queries are runs: a failed call says nothing about
+    # whether the prompt surfaces the brand.
+    qs = _results_for(prompt, website).filter(query_succeeded=True)
     total_runs = qs.count()
     if total_runs == 0:
         return {
@@ -112,7 +126,7 @@ def compute_effectiveness(prompt) -> dict:
 
     results = list(qs.only("citations", "provider", "is_mentioned"))
     citation_yield = _clamp(_avg_citations_per_run(results) / 3.0)
-    claim_yield = _clamp(_avg_claims_per_run(prompt) / 5.0)
+    claim_yield = _clamp(_avg_claims_per_run(prompt, website) / 5.0)
 
     distinct_providers = (
         qs.filter(is_mentioned=True).values("provider").distinct().count()
@@ -134,17 +148,17 @@ def compute_effectiveness(prompt) -> dict:
     }
 
 
-def refresh_prompt(prompt) -> dict:
-    """Compute and persist the score for one prompt. Returns the envelope."""
-    envelope = compute_effectiveness(prompt)
-    prompt.effectiveness_score = envelope["overall"]
-    prompt.effectiveness_components = {
+def refresh_brand_prompt(brand_prompt) -> dict:
+    """Compute and store one website's score for one prompt."""
+    envelope = compute_effectiveness(brand_prompt.prompt, website=brand_prompt.website)
+    brand_prompt.effectiveness_score = envelope["overall"]
+    brand_prompt.effectiveness_components = {
         **envelope["components"],
         "stable": envelope["stable"],
         "runs": envelope["runs"],
     }
-    prompt.runs_count = envelope["runs"]
-    prompt.save(update_fields=[
+    brand_prompt.runs_count = envelope["runs"]
+    brand_prompt.save(update_fields=[
         "effectiveness_score",
         "effectiveness_components",
         "runs_count",
@@ -153,19 +167,23 @@ def refresh_prompt(prompt) -> dict:
     return envelope
 
 
-def refresh_all_effectiveness_scores(prompts: Iterable | None = None) -> int:
-    """Iterate active prompts (or the supplied iterable) and refresh scores.
+def refresh_all_effectiveness_scores(brand_prompts: Iterable | None = None) -> int:
+    """Refresh the per-website score of every tracked prompt (or the
+    supplied BrandPrompt rows). Archived prompts are skipped.
 
-    Returns the number of prompts updated.
+    Returns the number of rows updated.
     """
-    from apps.prompt_library.models import Prompt
+    from apps.prompt_library.models import BrandPrompt
 
-    qs = prompts if prompts is not None else Prompt.objects.filter(is_active=True)
+    qs = (
+        brand_prompts if brand_prompts is not None
+        else BrandPrompt.objects.filter(is_archived=False).select_related("prompt", "website")
+    )
     count = 0
-    for prompt in qs:
+    for brand_prompt in qs:
         try:
-            refresh_prompt(prompt)
+            refresh_brand_prompt(brand_prompt)
             count += 1
         except Exception as exc:  # pragma: no cover
-            logger.warning("refresh_prompt failed for %s: %s", prompt.id, exc)
+            logger.warning("refresh_brand_prompt failed for %s: %s", brand_prompt.id, exc)
     return count

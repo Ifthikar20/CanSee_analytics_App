@@ -26,7 +26,7 @@ class PromptAdmin(admin.ModelAdmin):
         "intent_bucket",
         "style",
         "source",
-        "demand_score",
+        "source_score",
         "effectiveness_score",
         "runs_count",
         "last_used_at",
@@ -46,6 +46,10 @@ class PromptAdmin(admin.ModelAdmin):
     def text_short(self, obj):
         body = obj.template_text or obj.text or ""
         return body[:80]
+
+    @admin.display(description="Source score", ordering="demand_score")
+    def source_score(self, obj):
+        return obj.demand_score
 
 
 @admin.register(PromptVariation)

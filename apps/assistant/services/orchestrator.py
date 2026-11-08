@@ -5,6 +5,10 @@ Grounds every answer in (1) the deterministic per-tenant fact block and
 one metered, spend-walled LLM call. Tenant scope is carried by the
 (user, website) pair the caller resolved through TenantScopedAPIView —
 this module never reads an identifier off the request body.
+
+When no answer can be produced, :func:`answer` raises
+:class:`AssistantUnavailable` instead of returning placeholder text, so
+callers never store or send a non-answer as if it were one.
 """
 from __future__ import annotations
 
@@ -23,8 +27,7 @@ _SYSTEM_PROMPT = (
     "analytics, AI-search visibility across ChatGPT/Claude/Gemini/"
     "Perplexity, per-prompt performance, the saved prompt library, Google "
     "Search Console queries, brand-security findings, citations and source "
-    "influence, audit history, content briefs, agent insights, the "
-    "knowledge base, and AI usage.\n\n"
+    "influence, audit history, the knowledge base, and AI usage.\n\n"
     "Rules:\n"
     "- Answer from the LIVE ACCOUNT FACTS and the retrieved KNOWLEDGE BASE "
     "context in the prompt. These are the user's real data.\n"
@@ -53,6 +56,37 @@ _SYSTEM_PROMPT = (
 )
 
 
+class AssistantUnavailable(Exception):
+    """The assistant could not produce an answer; nothing should be saved.
+
+    ``code`` is ``assistant_not_configured`` (no AI provider key) or
+    ``assistant_failed`` (the provider call failed or returned no text).
+    ``message`` is plain language suitable for the user.
+    """
+
+    NOT_CONFIGURED = "assistant_not_configured"
+    FAILED = "assistant_failed"
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+NOT_CONFIGURED_MESSAGE = "Ask Cansee isn't available yet: no AI provider is configured."
+
+
+def get_assistant_provider():
+    """The provider that answers questions, or None when no key is set.
+
+    Claude is preferred; the synthesis chain can substitute another
+    configured provider.
+    """
+    from apps.llm_ranking.providers import get_provider, get_synthesis_provider
+
+    return get_provider("claude") or get_synthesis_provider()
+
+
 def _format_history(history) -> str:
     if not history:
         return ""
@@ -70,52 +104,60 @@ def _format_history(history) -> str:
     return block[-_MAX_HISTORY_CHARS:]
 
 
+def _failure_message(error: str) -> str:
+    if (error or "").startswith("monthly_ai_allowance_exceeded"):
+        return (
+            "Ask Cansee can't answer right now: this account has used its "
+            "monthly AI allowance."
+        )
+    return "Ask Cansee couldn't get an answer from the AI provider. Please try again."
+
+
 def answer(*, user, website, question, history=None) -> dict:
-    """Answer a free-form question for one (user, website). Returns
-    {"answer": str, "grounded": bool}. Never raises for expected failure
-    modes (no provider, empty model reply)."""
+    """Answer a free-form question for one (user, website).
+
+    Returns ``{"answer", "grounded", "provider", "model", "knowledge_status"}``.
+    ``grounded`` is True only when the prompt carried real tenant data:
+    a product section with actual figures or rows, or retrieved
+    knowledge-base passages. "No data yet" statements do not count.
+    ``knowledge_status`` is "used", "no_match", "retrieval_failed", or the
+    retriever's reason code (e.g. "embeddings_not_configured").
+
+    Raises :class:`AssistantUnavailable` when no provider is configured or
+    the provider call yields no answer, and ``ValueError`` for an empty
+    question.
+    """
     question = (question or "").strip()
     if not question:
-        return {
-            "answer": "Ask me anything about your traffic, AI visibility, "
-                      "brand security, or saved prompts.",
-            "grounded": False,
-            "provider": "",
-            "model": "",
-        }
+        raise ValueError("question is required")
+
+    provider = get_assistant_provider()
+    if provider is None:
+        raise AssistantUnavailable(AssistantUnavailable.NOT_CONFIGURED, NOT_CONFIGURED_MESSAGE)
 
     from apps.assistant.services.context_builder import build_fact_block
 
     # The question drives which product areas get loaded (prompt metrics,
-    # Search Console, citations, audits, content, agents...).
+    # Search Console, citations, audits, the knowledge base...).
     facts = build_fact_block(user, website, question=question)
 
     context = ""
     try:
-        from apps.rag.services.retriever import retrieve_context_block
+        from apps.rag.services.retriever import format_context_block, retrieve
 
-        context = retrieve_context_block(
-            user=user, website=website, query=question,
-            top_k=5, max_chars=3000,
-        ) or ""
+        hits = retrieve(user=user, website=website, query=question, top_k=5)
+        context = format_context_block(hits, max_chars=3000)
+        if context:
+            knowledge_status = "used"
+        else:
+            knowledge_status = hits.reason or "no_match"
     except Exception:
-        context = ""
-
-    from apps.llm_ranking.providers import get_provider, get_synthesis_provider
-
-    provider = get_provider("claude") or get_synthesis_provider()
-    if provider is None:
-        return {
-            "answer": "No AI provider is configured yet, so I can't answer "
-                      "questions. Add an AI provider key in Settings.",
-            "grounded": False,
-            "provider": "",
-            "model": "",
-        }
+        logger.warning("assistant retrieval failed for website %s", website.id, exc_info=True)
+        knowledge_status = "retrieval_failed"
 
     convo = _format_history(history)
     prompt = (
-        (f"{facts}\n\n" if facts else "")
+        (f"{facts.text}\n\n" if facts.text else "")
         + (f"{context}\n\n" if context else "")
         + (f"{convo}\n\n" if convo else "")
         + f"User question: {question}\n\n"
@@ -128,20 +170,26 @@ def answer(*, user, website, question, history=None) -> dict:
         audit_id=f"assistant:{website.id}",
         role="assistant_chat", module="assistant",
     )
+    if not getattr(result, "succeeded", False):
+        error = getattr(result, "error", "") or ""
+        logger.warning("assistant provider call failed for website %s: %s", website.id, error)
+        raise AssistantUnavailable(AssistantUnavailable.FAILED, _failure_message(error))
     text = (getattr(result, "text", "") or "").strip()
     if not text:
-        text = ("I couldn't generate an answer just now. Please try again in "
-                "a moment.")
+        raise AssistantUnavailable(
+            AssistantUnavailable.FAILED,
+            "Ask Cansee couldn't get an answer from the AI provider. Please try again.",
+        )
+
     return {
         "answer": text,
-        # True when the model was handed this tenant's own data -- the fact
-        # block, retrieved context, or both. It says the answer was written
-        # WITH those numbers in front of it; it does not verify that the
-        # answer used them correctly. The UI wording has to match that.
-        "grounded": bool(facts or context),
+        # It says the answer was written WITH this tenant's data in front
+        # of it; it does not verify that the answer used it correctly.
+        "grounded": facts.grounded or bool(context),
         # Which model actually answered. `get_provider("claude")` is the
         # preference but the synthesis fallback can substitute another, so
         # this is read off the provider that ran rather than assumed.
         "provider": getattr(provider, "name", "") or "",
         "model": getattr(provider, "model", "") or "",
+        "knowledge_status": knowledge_status,
     }

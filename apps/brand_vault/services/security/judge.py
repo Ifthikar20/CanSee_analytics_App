@@ -1,26 +1,34 @@
-"""Shared LLM judge for Brand Security findings.
+"""LLM judge for Brand Security findings.
 
-Each agent has its own domain-specific ``judge()`` on its class -- most call
-:func:`judge_finding` here with an agent-specific ``question`` string. The
-judge returns a strict-JSON ``{issue, severity, sentiment_score, detail}``
-verdict.
+The response auditor escalates nuanced detector findings here with the
+detector's own ``question`` string. The judge returns a strict-JSON
+``{issue, severity, sentiment_score, detail}`` verdict.
 
-Uses Claude Haiku for cheap batched calls. Falls back to a no-op verdict
-when ``ANTHROPIC_API_KEY`` isn't set so agents can still run in local dev
-against mocked findings.
+Uses Claude Haiku for cheap calls. Without ``ANTHROPIC_API_KEY``, or when
+the call fails, it returns the empty verdict (``issue == "none"`` and no
+detail), which callers treat as "no judgement" rather than as a verdict.
 """
 from __future__ import annotations
 
 import json
 import logging
 import re
+from dataclasses import dataclass
 
 from apps.brand_vault.models import SafetyAlert
 from core.llm import ClaudeUtility
 
-from .base import Verdict
-
 logger = logging.getLogger("apps")
+
+
+@dataclass
+class Verdict:
+    """Judge output for a finding. ``issue == "none"`` drops the finding."""
+
+    issue: str = "none"
+    severity: str = "none"  # high | medium | low | none
+    sentiment_score: float | None = None
+    detail: str = ""
 
 # Maximum characters of brand ground-truth to include in a single judge
 # prompt. Enough for ~5 medium-sized chunks, well under the model's
@@ -48,9 +56,9 @@ def judge_finding(
 ) -> Verdict:
     """Ask Claude Haiku to adjudicate one finding. Returns a ``Verdict``.
 
-    ``question`` is agent-specific (e.g. "Is this LLM answer factually
+    ``question`` is detector-specific (e.g. "Is this LLM answer factually
     wrong about the brand?"). ``allowed_issues`` narrows the JSON contract
-    so each agent only gets back issue classes it can raise.
+    so the caller only gets back issue classes it can raise.
 
     ``ground_truth`` is an optional list of retrieval hits from the
     client's own RAG knowledge base (dicts with at least ``text`` and

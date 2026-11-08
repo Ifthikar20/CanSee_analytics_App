@@ -7,7 +7,10 @@ class BurstRateThrottle(SimpleRateThrottle):
     def get_cache_key(self, request, view):
         if request.user.is_authenticated:
             return self.cache_format % {"scope": self.scope, "ident": request.user.pk}
-        return self.get_ident(request)
+        # Scoped like the authenticated key: a bare IP would make the burst
+        # and sustained throttles share one history, so the hourly limit
+        # never applied to anonymous callers.
+        return self.cache_format % {"scope": self.scope, "ident": self.get_ident(request)}
 
 
 class SustainedRateThrottle(SimpleRateThrottle):
@@ -16,7 +19,10 @@ class SustainedRateThrottle(SimpleRateThrottle):
     def get_cache_key(self, request, view):
         if request.user.is_authenticated:
             return self.cache_format % {"scope": self.scope, "ident": request.user.pk}
-        return self.get_ident(request)
+        # Scoped like the authenticated key: a bare IP would make the burst
+        # and sustained throttles share one history, so the hourly limit
+        # never applied to anonymous callers.
+        return self.cache_format % {"scope": self.scope, "ident": self.get_ident(request)}
 
 
 class AuthRateThrottle(SimpleRateThrottle):

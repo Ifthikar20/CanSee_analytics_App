@@ -208,6 +208,7 @@ class HaikuExtractionService:
           is_mentioned, mention_rank, sentiment, mention_context,
           is_linked, competitors_mentioned, primary_recommendation,
           citations, confidence_score, extraction_model, extraction_version
+        ``confidence_score`` is None: the extractor does not compute one.
         """
         if not response_text or not brand_name:
             return cls._empty_result()
@@ -225,7 +226,7 @@ class HaikuExtractionService:
             )
             parsed = _parse_json_object(raw_text)
             result = _normalise(parsed)
-            result["confidence_score"] = 92.0 if result["is_mentioned"] else 95.0
+            result["confidence_score"] = None
             result["extraction_model"] = cls.MODEL
             result["extraction_version"] = cls.VERSION
             return result
@@ -248,7 +249,7 @@ class HaikuExtractionService:
             "competitors_mentioned": [],
             "primary_recommendation": "",
             "citations": [],
-            "confidence_score": 0.0,
+            "confidence_score": None,
             "extraction_model": "",
             "extraction_version": "",
         }

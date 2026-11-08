@@ -149,9 +149,19 @@ def list_zones(api_token: str, *, stats: dict | None = None) -> list[dict]:
 
 
 def _post_graphql(
-    api_token: str, query: str, variables: dict, *, stats: dict | None = None
+    api_token: str,
+    query: str,
+    variables: dict,
+    *,
+    stats: dict | None = None,
+    errors: list | None = None,
 ) -> dict | None:
-    """The one GraphQL seam. Returns the "data" dict or None (logged)."""
+    """The one GraphQL seam. Returns the "data" dict or None (logged).
+
+    ``errors``, when given, receives the GraphQL error messages of a
+    response that carried any (a failed request adds nothing), so a caller
+    can tell "the plan refused this query" from "Cloudflare was down".
+    """
     if not _breaker.allow():
         _bump(stats, "breaker_blocks")
         return None
@@ -179,6 +189,10 @@ def _post_graphql(
     if data.get("errors"):
         _bump(stats, "errors")
         logger.warning("Cloudflare GraphQL errors: %s", str(data["errors"])[:500])
+        if errors is not None:
+            for error in data["errors"]:
+                message = error.get("message") if isinstance(error, dict) else error
+                errors.append(str(message or ""))
         return None
     return data.get("data")
 

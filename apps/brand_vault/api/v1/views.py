@@ -19,19 +19,8 @@ from apps.brand_vault.api.v1.serializers import (
     BrandFactSerializer,
     FactImportItemSerializer,
     FactRevisionSerializer,
-    SafetyAlertSerializer,
-    SafetyPromptCreateSerializer,
-    SafetyPromptSerializer,
-    ToneSampleSerializer,
 )
-from apps.brand_vault.models import (
-    BrandFact,
-    FactRevision,
-    FactStatus,
-    SafetyAlert,
-    SafetyPrompt,
-    ToneSample,
-)
+from apps.brand_vault.models import BrandFact, FactRevision, FactStatus
 from apps.brand_vault.services import fact_versioning
 from apps.brand_vault.services.embeddings import embed_text
 from apps.brand_vault.services.fact_versioning import record_creation
@@ -89,14 +78,14 @@ class WebsiteFactsView(TenantScopedListAPIView):
         return self.paginated_response(qs, BrandFactSerializer)
 
 
-def _get_fact_for_user(user, fact_id) -> BrandFact:
+def _get_fact_for_user(user, fact_id, *, min_role: str = "member") -> BrandFact:
     from apps.websites.services.website_service import WebsiteService
 
     try:
         fact = BrandFact.objects.select_related("website").get(id=fact_id)
     except BrandFact.DoesNotExist as exc:
         raise ResourceNotFound("BrandFact not found.") from exc
-    WebsiteService.get_for_user(user=user, website_id=fact.website_id)
+    WebsiteService.get_for_user(user=user, website_id=fact.website_id, min_role=min_role)
     return fact
 
 
@@ -104,7 +93,7 @@ class FactDetailView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request, fact_id):
-        fact = _get_fact_for_user(request.user, fact_id)
+        fact = _get_fact_for_user(request.user, fact_id, min_role="viewer")
         return Response(BrandFactDetailSerializer(fact).data)
 
 
@@ -190,11 +179,14 @@ def _import_one(website, item: dict, *, actor_user=None) -> str:
         extracted_by="manual",
         status=FactStatus.APPROVED,
     )
-    try:
-        fact.embedding = embed_text(f"{subject} {predicate} {obj}")
+    # No vector when embeddings are unavailable; refresh_fact_embeddings
+    # fills it in later.
+    vector, _model = embed_text(
+        f"{subject} {predicate} {obj}", user=actor_user, website=website,
+    )
+    if vector:
+        fact.embedding = vector
         fact.save(update_fields=["embedding", "updated_at"])
-    except Exception:
-        pass
     record_creation(fact, actor_user=actor_user)
     return "created"
 
@@ -279,15 +271,6 @@ class WebsiteFactsImportCSVView(TenantScopedAPIView):
             else:
                 skipped += 1
         return Response({"created": created, "skipped": skipped, "errors": errors})
-
-
-class WebsiteToneSamplesView(TenantScopedListAPIView):
-    """List ToneSample rows for a website (Phase 4 voice-guard input)."""
-
-    def get(self, request, website_id):
-        website = self.get_website(website_id)
-        qs = ToneSample.objects.filter(website=website).order_by("-created_at")
-        return self.paginated_response(qs, ToneSampleSerializer)
 
 
 class WebsiteStatsView(TenantScopedAPIView):
@@ -385,48 +368,29 @@ class WebsiteBulkFactActionView(TenantScopedAPIView):
 
 class FactUsageView(APIView):
     """
-    Where has this fact actually been cited?
+    Activity around one fact.
 
-    We don't have a denormalised "uses" table yet, so this view
-    answers conservatively by counting:
-      - LLMRanking audits on the fact's website that completed after
-        the fact's version_from (a heuristic — the fact was available
-        as grounding when the audit ran).
-      - ContentStudio drafts on the same website created after
-        version_from.
-    Plus the fact's own revision count, which is exact.
+    ``audit_count`` counts audits on the fact's website that completed
+    after the fact's version_from: the fact was on record when they ran.
+    Nothing records whether an individual answer used it, so this is
+    not a citation count. ``revision_count`` is exact.
     """
 
     permission_classes = [IsAuthenticated]
 
     def get(self, request, fact_id):
-        fact = _get_fact_for_user(request.user, fact_id)
-        audit_count = 0
-        draft_count = 0
-        try:
-            from apps.llm_ranking.models import LLMRankingAudit
-            audit_count = LLMRankingAudit.objects.filter(
-                website_id=fact.website_id,
-                status="completed",
-                completed_at__gte=fact.version_from,
-            ).count()
-        except Exception:
-            pass
-        try:
-            from apps.content_studio.models import ContentDraft
-            draft_count = ContentDraft.objects.filter(
-                website_id=fact.website_id,
-                created_at__gte=fact.version_from,
-            ).count()
-        except Exception:
-            pass
+        from apps.llm_ranking.models import LLMRankingAudit
 
-        revisions = fact.revisions.count()
+        fact = _get_fact_for_user(request.user, fact_id, min_role="viewer")
+        audit_count = LLMRankingAudit.objects.filter(
+            website_id=fact.website_id,
+            status=LLMRankingAudit.STATUS_COMPLETED,
+            completed_at__gte=fact.version_from,
+        ).count()
         return Response({
             "fact_id": str(fact.id),
             "audit_count": audit_count,
-            "draft_count": draft_count,
-            "revision_count": revisions,
+            "revision_count": fact.revisions.count(),
             "since": fact.version_from.isoformat() if fact.version_from else None,
         })
 
@@ -547,31 +511,6 @@ class WebsiteExtractStatusView(TenantScopedAPIView):
             "recent_facts": recent,
             "last_extracted_at": last.isoformat() if last else None,
         })
-
-
-class WebsiteToneSampleCreateView(TenantScopedAPIView):
-    """Manually attach a tone-of-voice sample for this website."""
-
-    parser_classes = [JSONParser]
-
-    def post(self, request, website_id):
-        website = self.get_website(website_id)
-        text = (request.data.get("text") or "").strip()
-        if not text:
-            return Response({"detail": "text is required."},
-                            status=status.HTTP_400_BAD_REQUEST)
-        if len(text) > 4000:
-            return Response({"detail": "Each sample must be 4000 chars or fewer."},
-                            status=status.HTTP_400_BAD_REQUEST)
-        import hashlib
-        text_hash = hashlib.sha1(text.encode("utf-8")).hexdigest()  # noqa: S324
-        sample, _ = ToneSample.objects.get_or_create(
-            website=website,
-            text_hash=text_hash,
-            defaults={"text": text, "word_count": len(text.split())},
-        )
-        return Response(ToneSampleSerializer(sample).data,
-                        status=status.HTTP_201_CREATED)
 
 
 class WebsiteFactCheckView(TenantScopedAPIView):
@@ -847,175 +786,4 @@ class WebsiteBacklinksView(TenantScopedAPIView):
             "items": items[:50],
             "total_mentions": sum(e["mention_count"] for e in items),
             "unique_domains": len(items),
-        })
-
-
-class ToneSampleDeleteView(APIView):
-    """Remove one tone sample. Scoped to the user's own websites."""
-
-    permission_classes = [IsAuthenticated]
-
-    def delete(self, request, sample_id):
-        from apps.websites.services.website_service import WebsiteService
-        try:
-            sample = ToneSample.objects.select_related("website").get(id=sample_id)
-        except ToneSample.DoesNotExist as exc:
-            raise ResourceNotFound("ToneSample not found.") from exc
-        WebsiteService.get_for_user(user=request.user, website_id=sample.website_id)
-        sample.delete()
-        return Response(status=status.HTTP_204_NO_CONTENT)
-
-
-# ── AI Brand Safety ────────────────────────────────────────────────────────
-
-
-def _annotate_prompt_hits(prompts_qs, window_days: int = 30):
-    """Attach a count of recent, non-dismissed alerts to each SafetyPrompt."""
-    import datetime as _dt
-
-    from django.db.models import Count, Q
-
-    cutoff = timezone.now() - _dt.timedelta(days=window_days)
-    return prompts_qs.annotate(
-        hits=Count(
-            "alerts",
-            filter=Q(alerts__detected_at__gte=cutoff)
-                   & ~Q(alerts__status=SafetyAlert.STATUS_DISMISSED),
-        ),
-    )
-
-
-class WebsiteSafetyPromptsView(TenantScopedListAPIView):
-    """List or create custom safety-monitoring prompts for a website."""
-
-    def get(self, request, website_id):
-        website = self.get_website(website_id)
-        qs = _annotate_prompt_hits(
-            SafetyPrompt.objects.filter(website=website),
-        ).order_by("-created_at")
-        return self.paginated_response(qs, SafetyPromptSerializer)
-
-    def post(self, request, website_id):
-        website = self.get_website(website_id)
-        ser = SafetyPromptCreateSerializer(data=request.data)
-        ser.is_valid(raise_exception=True)
-        text = ser.validated_data["text"].strip()
-        prompt, created = SafetyPrompt.objects.get_or_create(
-            website=website, text=text,
-            defaults={"created_by": request.user},
-        )
-        prompt = _annotate_prompt_hits(
-            SafetyPrompt.objects.filter(pk=prompt.pk),
-        ).first()
-        return Response(
-            SafetyPromptSerializer(prompt).data,
-            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
-        )
-
-
-class SafetyPromptDetailView(TenantScopedAPIView):
-    """Delete a safety prompt. Ownership is enforced via the parent website."""
-
-    def delete(self, request, prompt_id):
-        try:
-            prompt = SafetyPrompt.objects.select_related("website").get(id=prompt_id)
-        except SafetyPrompt.DoesNotExist as exc:
-            raise ResourceNotFound("SafetyPrompt not found.") from exc
-        self.get_website(prompt.website_id)
-        prompt.delete()
-        return Response(status=status.HTTP_204_NO_CONTENT)
-
-
-class WebsiteSafetyAlertsView(TenantScopedListAPIView):
-    """List safety alerts for a website with optional status/severity filters."""
-
-    def get(self, request, website_id):
-        website = self.get_website(website_id)
-        qs = SafetyAlert.objects.filter(website=website)
-
-        status_filter = request.query_params.get("status")
-        if status_filter:
-            qs = qs.filter(status=status_filter)
-
-        severity = request.query_params.get("severity")
-        if severity:
-            qs = qs.filter(severity=severity)
-
-        # Scope to the findings raised from one audit response, or from every
-        # response for a given library prompt. This is what lets the prompt
-        # detail page show "this answer produced these findings" instead of
-        # sending the reader to a global alert list to hunt for them.
-        result_id = request.query_params.get("result")
-        if result_id:
-            qs = qs.filter(result_id=result_id)
-
-        source_prompt = request.query_params.get("source_prompt")
-        if source_prompt:
-            qs = qs.filter(result__source_prompt_id=source_prompt)
-
-        qs = qs.order_by("-detected_at")
-        return self.paginated_response(qs, SafetyAlertSerializer)
-
-
-class SafetyAlertResolveView(TenantScopedAPIView):
-    """Mark a safety alert as resolved or dismissed."""
-
-    def post(self, request, alert_id):
-        try:
-            alert = SafetyAlert.objects.select_related("website").get(id=alert_id)
-        except SafetyAlert.DoesNotExist as exc:
-            raise ResourceNotFound("SafetyAlert not found.") from exc
-        self.get_website(alert.website_id)
-
-        action = (request.data.get("action") or "resolve").lower()
-        if action == "dismiss":
-            alert.status = SafetyAlert.STATUS_DISMISSED
-        else:
-            alert.status = SafetyAlert.STATUS_RESOLVED
-        alert.resolved_at = timezone.now()
-        alert.resolved_by = request.user
-        alert.save(update_fields=["status", "resolved_at", "resolved_by", "updated_at"])
-        return Response(SafetyAlertSerializer(alert).data)
-
-
-class WebsiteSafetyMetricsView(TenantScopedAPIView):
-    """Summary tiles for the AI Brand Safety panel.
-
-    Returns reputation health (derived from open-alert severity), hallucination
-    + harmful-mention counts, and the number of active monitored prompts.
-    """
-
-    SEVERITY_WEIGHTS = {
-        SafetyAlert.SEVERITY_HIGH: 12,
-        SafetyAlert.SEVERITY_MEDIUM: 5,
-        SafetyAlert.SEVERITY_LOW: 1,
-    }
-
-    def get(self, request, website_id):
-        website = self.get_website(website_id)
-        open_alerts = SafetyAlert.objects.filter(
-            website=website, status=SafetyAlert.STATUS_OPEN,
-        )
-        penalty = sum(
-            self.SEVERITY_WEIGHTS.get(a.severity, 0) for a in open_alerts
-        )
-        health = max(0, min(100, 100 - penalty))
-
-        hallucinations = open_alerts.filter(
-            issue=SafetyAlert.ISSUE_HALLUCINATION,
-        ).count()
-        harmful = open_alerts.filter(
-            issue__in=(SafetyAlert.ISSUE_HARMFUL, SafetyAlert.ISSUE_NEGATIVE),
-        ).count()
-
-        monitored = SafetyPrompt.objects.filter(
-            website=website, status=SafetyPrompt.STATUS_ACTIVE,
-        ).count()
-
-        return Response({
-            "reputation_health": health,
-            "hallucinations": hallucinations,
-            "harmful_mentions": harmful,
-            "prompts_monitored": monitored,
-            "open_alerts": open_alerts.count(),
         })

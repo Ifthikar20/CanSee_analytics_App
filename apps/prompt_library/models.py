@@ -51,10 +51,48 @@ class Industry(TimestampMixin):
         return self.name
 
 
+#: Sources whose text is public demand data (mined from public sites or
+#: search APIs). Only these become catalog rows on their own; everything a
+#: tenant types, generates from their own material or imports from their
+#: Search Console stays private to them.
+CATALOG_SOURCES = frozenset({"reddit", "quora", "serpapi", "dataforseo"})
+
+
+class PromptQuerySet(models.QuerySet):
+    def catalog(self):
+        """Rows every user may browse: the shared, curated library."""
+        return self.filter(is_catalog=True)
+
+    def visible_to_website(self, website):
+        """Catalog rows plus the website's own private rows (ones it owns
+        or already tracks). Never another tenant's private prompts."""
+        return self.filter(
+            models.Q(is_catalog=True)
+            | models.Q(owner_website=website)
+            | models.Q(id__in=BrandPrompt.objects.filter(website=website).values("prompt_id"))
+        )
+
+    def visible_to_user(self, user):
+        """Catalog rows plus private rows of every website ``user`` can reach."""
+        from apps.websites.services.website_service import WebsiteService
+
+        websites = WebsiteService.accessible_qs(user).values("id")
+        return self.filter(
+            models.Q(is_catalog=True)
+            | models.Q(owner_website_id__in=websites)
+            | models.Q(id__in=BrandPrompt.objects.filter(website_id__in=websites).values("prompt_id"))
+        )
+
+
 class Prompt(TimestampMixin):
     """A single demand-side prompt. ``text_hash`` is a sha256 of the
     normalised text so we can deduplicate exact matches cheaply at the
-    DB layer; near-duplicates are caught upstream by the dedup service."""
+    DB layer; near-duplicates are caught upstream by the dedup service.
+
+    Rows are shared by text, but only ``is_catalog`` rows are listed to
+    everyone. Tenant-authored rows are private: they are reached through
+    the tenant's own BrandPrompt links or ``owner_website``.
+    """
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     industry = models.ForeignKey(
@@ -66,8 +104,24 @@ class Prompt(TimestampMixin):
     source = models.CharField(max_length=20, choices=PromptSource.choices)
     source_url = models.URLField(blank=True, max_length=500)
     excerpt = models.TextField(blank=True)
+    # The library's ranking score (source type, recency, paraphrase count;
+    # see services/scoring_service.py). Not a demand measurement: the API
+    # exposes it as ``source_score``. The column keeps its original name.
     demand_score = models.FloatField(default=0.0, db_index=True)
     is_active = models.BooleanField(default=True)
+    # True only for the shared library (mined public sources, or staff
+    # synthesis). False rows never appear in catalog listings, samples or
+    # other tenants' suggestions.
+    is_catalog = models.BooleanField(default=False, db_index=True)
+    # The website a private row came from (Search Console feed, prompts a
+    # tenant typed or generated). Lets that website see it as a suggestion.
+    owner_website = models.ForeignKey(
+        "websites.Website",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+    )
     text_hash = models.CharField(max_length=64, db_index=True)
     # Templated body with {{ variable }} placeholders. When non-empty,
     # `text` is treated as a denormalised preview of the template.
@@ -102,6 +156,8 @@ class Prompt(TimestampMixin):
         default=0, help_text="Number of audit runs that used this prompt",
     )
     last_used_at = models.DateTimeField(null=True, blank=True)
+
+    objects = PromptQuerySet.as_manager()
 
     class Meta:
         db_table = "prompt_library_prompt"
@@ -197,6 +253,12 @@ class BrandPrompt(TimestampMixin):
     # shared catalog Prompt.is_active, which let one tenant's archive
     # affect every other tenant that saved the same prompt.
     is_archived = models.BooleanField(default=False, db_index=True)
+    # This website's own effectiveness for the prompt (0-1), from its own
+    # audit results only. The Prompt row is shared across tenants, so a
+    # score stored there would mix every tenant's brand.
+    effectiveness_score = models.FloatField(default=0.0)
+    effectiveness_components = models.JSONField(default=dict, blank=True)
+    runs_count = models.IntegerField(default=0)
 
     class Meta:
         db_table = "prompt_library_brandprompt"
@@ -226,7 +288,9 @@ class RejectedBrandPrompt(TimestampMixin):
     class Meta:
         db_table = "prompt_library_rejectedbrandprompt"
         unique_together = [("website", "prompt")]
-        indexes = [models.Index(fields=["website", "-created_at"])]
+        indexes = [
+            models.Index(fields=["website", "-created_at"], name="prompt_libr_website_3a8e91_idx"),
+        ]
         ordering = ["-created_at"]
 
 
@@ -259,12 +323,15 @@ class PromptFanout(TimestampMixin):
     text = models.TextField()
     provider = models.CharField(max_length=24, blank=True)
     source = models.CharField(max_length=16, choices=SOURCE_CHOICES, default=SOURCE_CRAWLER)
-    confidence = models.FloatField(default=0.5)
+    # NULL: nothing computes a confidence for a sub-query.
+    confidence = models.FloatField(null=True, blank=True)
 
     class Meta:
         db_table = "prompt_library_promptfanout"
         indexes = [
-            models.Index(fields=["website", "prompt", "-created_at"]),
+            models.Index(
+                fields=["website", "prompt", "-created_at"], name="prompt_libr_website_a4f2b1_idx",
+            ),
         ]
         ordering = ["-created_at"]
 
@@ -309,7 +376,9 @@ class PromptCrawlRun(TimestampMixin):
     class Meta:
         db_table = "prompt_library_promptcrawlrun"
         indexes = [
-            models.Index(fields=["website", "prompt", "-created_at"]),
+            models.Index(
+                fields=["website", "prompt", "-created_at"], name="prompt_libr_website_b9c4d2_idx",
+            ),
         ]
         ordering = ["-created_at"]
 
@@ -425,16 +494,9 @@ class PromptVariableSet(TimestampMixin):
 
 
 class TestEnvironment(TimestampMixin):
-    """A named bucket of saved BrandPrompts that can be loaded into the
-    Model Test page as a single batch.
-
-    Created either from the Model Test page ('Save current selection as env')
-    or from the Saved view bulk-action bar ('Add to env'). Visible on both
-    surfaces — the M2M is the single source of truth.
-
-    Soft-delete is not needed: removing an env is non-destructive because
-    the underlying BrandPrompt rows are unaffected. The env just stops
-    grouping them.
+    """A named bucket of saved BrandPrompts from the retired Model Test
+    page. No endpoint reads or writes it any more; the table is kept so
+    existing rows survive.
     """
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -459,7 +521,7 @@ class TestEnvironment(TimestampMixin):
     class Meta:
         db_table = "prompt_library_testenvironment"
         unique_together = [("website", "name")]
-        indexes = [models.Index(fields=["website", "-created_at"])]
+        indexes = [models.Index(fields=["website", "-created_at"], name="pl_testenv_w_ca_idx")]
         ordering = ["-created_at"]
 
     def __str__(self):

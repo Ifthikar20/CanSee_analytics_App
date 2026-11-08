@@ -25,9 +25,10 @@ from apps.rag.api.v1.serializers import (
     UploadTextSerializer,
 )
 from apps.rag.models import AgentCrawlConsent, KnowledgeChunk, KnowledgeSource
-from apps.rag.services.ingest_service import ingest_url
+from apps.rag.services.ingest_service import ingest_url, pending_chunks
 from apps.rag.services.retriever import retrieve
 from core.interceptors.pagination import StandardPagination
+from core.interceptors.response_envelope import PageResponse
 from core.resilience import TokenBucket
 from core.views.base import TenantScopedAPIView
 
@@ -87,7 +88,8 @@ class KnowledgeSourceListView(TenantScopedAPIView):
       page, page_size — standard DRF pagination (default page_size=25, max=100)
 
     A ``stats`` block is included so the UI can render status-count
-    badges without a second request.
+    badges without a second request. ``stats.chunks_pending`` counts
+    chunks stored without a vector, which search cannot reach yet.
     """
 
     def get(self, request, website_id):
@@ -97,6 +99,7 @@ class KnowledgeSourceListView(TenantScopedAPIView):
         # Stats reflect the whole website corpus, not the current
         # filter — badges are for navigation.
         stats = _source_stats(base_qs)
+        stats["chunks_pending"] = pending_chunks(website_id=website.id).count()
 
         qs = base_qs.order_by("-created_at")
 
@@ -138,7 +141,7 @@ class KnowledgeSourceListView(TenantScopedAPIView):
             resp.data["stats"] = stats
             return resp
 
-        return Response({"results": data, "stats": stats})
+        return PageResponse({"results": data, "stats": stats})
 
     def post(self, request, website_id):
         website = self.get_website(website_id)
@@ -320,6 +323,10 @@ class UploadTextView(TenantScopedAPIView):
                 "chunk_count": result.chunk_count,
                 "skipped_unchanged": result.skipped_unchanged,
                 "error": result.error,
+                # Stored without vectors: search cannot reach this text
+                # until embeddings work (reason e.g. "embeddings_not_configured").
+                "embeddings_pending": result.embeddings_pending,
+                "embedding_reason": result.embedding_reason,
             },
             status=(
                 status.HTTP_201_CREATED
@@ -403,6 +410,11 @@ class RetrieveView(TenantScopedAPIView):
     Accepts an optional ``source_id`` to constrain the search to one
     KnowledgeSource — the Brand Input detail drawer uses this so users
     can preview what a specific source would surface for a query.
+
+    ``reason`` is null after a normal search. When the search could not
+    run, ``hits`` is empty and ``reason`` says why:
+    ``embeddings_not_configured``, ``ai_allowance_exhausted``,
+    ``embeddings_failed`` or ``embeddings_pending``.
     """
 
     def post(self, request, website_id):
@@ -441,4 +453,5 @@ class RetrieveView(TenantScopedAPIView):
         return Response({
             "query": data["query"],
             "hits": HitSerializer(hits, many=True).data,
+            "reason": hits.reason,
         })

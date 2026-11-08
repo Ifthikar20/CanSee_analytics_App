@@ -219,7 +219,7 @@ def _sentiment_breakdown(audit_ids: list, flt: dict | None) -> dict:
         row = (
             qs.filter(sentiment=sentiment)
             .exclude(mention_context="")
-            .order_by("-confidence_score")
+            .order_by("-created_at")
             .values("sentiment", "provider", "mention_context")
             .first()
         )

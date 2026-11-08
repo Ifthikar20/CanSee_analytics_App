@@ -2,7 +2,7 @@
 
 ## Purpose
 
-The core data collection and analysis engine. Ingests behavioral data from the tracking pixel, tracks keyword rankings, monitors competitors, manages tracked links for campaign attribution, and surfaces AI-powered insights.
+The core data collection and analysis engine. Ingests behavioral data from the tracking pixel, tracks keyword rankings, monitors competitors, and surfaces AI-powered insights.
 
 ## Architecture
 
@@ -16,10 +16,6 @@ Website (with pixel installed)
   │     │
   │     ▼
   │   Visitor → Session → PageEvent (raw event storage)
-  │
-  ├── Tracked Links
-  │     GET /t/<tracking_key>/  → 302 redirect + record LinkClick
-  │     GET /api/v1/track/open/<tracking_id>/  → 1x1 pixel for email opens
   │
   ├── Keyword Tracking
   │     TrackedKeyword → KeywordRankHistory (daily snapshots)
@@ -75,9 +71,7 @@ Website (with pixel installed)
 - **Privacy-first tracking** — Visitor IPs are hashed (`ip_hash`), never stored raw. Fingerprinting uses a hash for deduplication without PII.
 - **High-throughput ingestion** — The pixel endpoint is separate from the main API (`/api/v1/track/`) for independent scaling.
 - **Pre-aggregation** — Hourly aggregation via Celery ensures the dashboard reads pre-computed data, not raw events.
-- **Email open tracking** — 1x1 transparent pixel (`EmailOpenPixelView`) tracks email opens via unique `tracking_id`.
-- **Link click attribution** — Tracked links connect clicks to campaign recipients for full-funnel attribution.
-- **WebSocket support** — `consumers.py` and `routing.py` indicate real-time analytics updates via Django Channels.
+- **No tracked-link redirect** — The `/t/<tracking_key>/` redirect was removed. The `TrackedLink` and `LinkClick` tables are kept for existing rows; only the admin and the retention purge still read them.
 
 ## Dependencies
 

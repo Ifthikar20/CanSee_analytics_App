@@ -4,8 +4,7 @@ Intelligence service: LLM brand/sentiment extraction and SERP relevance.
 Internal-only FastAPI app. Reached from web/celery at
 http://intelligence.ftb.internal:8000 on the compose network; never
 exposed through nginx or public DNS. Auth is a static bearer token
-(INTELLIGENCE_AUTH_TOKEN) shared with the Django callers via .env.prod,
-the same pattern as OPENCLAW_AUTH_TOKEN.
+(INTELLIGENCE_AUTH_TOKEN) shared with the Django callers via .env.prod.
 
 Stateless by design: quota, circuit breaking, and AITokenUsage cost
 recording stay in the Django facades. Endpoints return the logic

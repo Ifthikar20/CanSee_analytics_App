@@ -3,6 +3,7 @@ from django.conf import settings
 from rest_framework import status
 from rest_framework.response import Response
 
+from core.interceptors.response_envelope import PageResponse
 from core.views import TenantScopedAPIView
 
 
@@ -143,9 +144,9 @@ class VisitorListView(TenantScopedAPIView):
             .annotate(event_count=Count("events"))
             .order_by("-last_seen")[:100]
             .values(
-                "id", "fingerprint_hash", "company_name", "geo_country",
+                "id", "fingerprint_hash", "geo_country",
                 "geo_city", "device_type", "browser", "os",
-                "first_seen", "last_seen", "visit_count", "lead_score", "event_count",
+                "first_seen", "last_seen", "visit_count", "event_count",
             )
         )
         return Response(list(visitors))
@@ -236,6 +237,19 @@ class EventLogView(TenantScopedAPIView):
         "visitor__geo_city",
     ]
 
+    @staticmethod
+    def _wants_csv(request) -> bool:
+        return (request.query_params.get("format") or "").lower() == "csv"
+
+    def perform_content_negotiation(self, request, force=False):
+        # DRF reads ``?format=`` as a renderer override and answers 404 when
+        # no renderer has that format. The CSV export streams its own
+        # response, so negotiate JSON for it: errors keep the JSON envelope.
+        if self._wants_csv(request):
+            renderer = self.get_renderers()[0]
+            return renderer, renderer.media_type
+        return super().perform_content_negotiation(request, force)
+
     def get(self, request, website_id):
         import datetime as _dt
 
@@ -290,7 +304,7 @@ class EventLogView(TenantScopedAPIView):
 
         qs = qs.order_by("-timestamp")
 
-        if (request.query_params.get("format") or "").lower() == "csv":
+        if self._wants_csv(request):
             return self._stream_csv(qs)
 
         try:
@@ -307,7 +321,7 @@ class EventLogView(TenantScopedAPIView):
         offset = (page - 1) * page_size
         rows = list(qs.values(*self.EVENT_FIELDS)[offset:offset + page_size])
 
-        return Response({
+        return PageResponse({
             "results": rows,
             "page": page,
             "page_size": page_size,
@@ -391,7 +405,7 @@ class AnalyticsAccessLogView(TenantScopedAPIView):
                 "accessed_at",
             )[offset:offset + page_size]
         ]
-        return Response({
+        return PageResponse({
             "results": rows,
             "page": page,
             "page_size": page_size,

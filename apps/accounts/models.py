@@ -154,7 +154,8 @@ class OrganizationMember(TimestampMixin):
     invited_by = models.ForeignKey(
         User, null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
-    # How this membership came to exist: invite | domain_jit | founder.
+    # How this membership came to exist: invite | domain_jit | sso_jit |
+    # founder | admin (manage.py create_user --org).
     joined_via = models.CharField(max_length=20, default="invite")
 
     class Meta:
@@ -402,6 +403,7 @@ class AITokenUsage(TimestampMixin):
         ("source_sentiment", "Source Sentiment"),
         ("source_relevance", "Source Relevance"),
         ("brand_research", "Brand Research"),
+        ("agent", "Agent workspace"),
     ]
 
     PROVIDER_CHOICES = [

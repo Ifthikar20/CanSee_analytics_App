@@ -46,13 +46,16 @@ class LLMRankingAudit(TimestampMixin):
     # Extra URLs the user provided for context (blog posts, product pages, etc.)
     # Each entry: {"url": str, "title": str, "success": bool, "summary": str}
     context_urls = models.JSONField(default=list, blank=True)
-    # Aggregate scores
-    overall_score = models.IntegerField(default=0, db_index=True)  # 0-100
-    mention_rate = models.FloatField(default=0.0)   # % of queries where business was mentioned
+    # Aggregate scores. NULL until a run has at least one answered query;
+    # a run where every query failed keeps them NULL.
+    overall_score = models.IntegerField(null=True, blank=True, db_index=True)  # 0-100
+    mention_rate = models.FloatField(null=True, blank=True)  # % of answered queries that mention the business
     # Beta-Binomial posterior mean for mention rate (Beta(2,8) prior). Used
     # for scoring so 1/1 doesn't peg the score at 100% on tiny samples.
-    mention_rate_smoothed = models.FloatField(default=0.0)
-    avg_mention_rank = models.FloatField(default=0.0)  # avg position when mentioned (lower=better)
+    mention_rate_smoothed = models.FloatField(null=True, blank=True)
+    # Average position when mentioned (lower is better). NULL when no
+    # mention carried a rank.
+    avg_mention_rank = models.FloatField(null=True, blank=True)
     # Plackett-Luce strengths {brand: 0..1} fit across all rankings in this
     # audit. The target brand and every competitor that appeared with a
     # position contribute. Max strength is normalised to 1.0.
@@ -76,8 +79,8 @@ class LLMRankingAudit(TimestampMixin):
     # Statistics: number of replicates per (prompt, provider) — N=1 is the current default
     runs_per_query = models.IntegerField(default=1)
     # 95% Wilson CI on the overall mention_rate (percent 0-100)
-    mention_rate_ci_lower = models.FloatField(default=0.0)
-    mention_rate_ci_upper = models.FloatField(default=0.0)
+    mention_rate_ci_lower = models.FloatField(null=True, blank=True)
+    mention_rate_ci_upper = models.FloatField(null=True, blank=True)
     # Mean brand-alignment score (0-100) across scored results, set in
     # finalise. Best-effort snapshot: per-result alignment runs async, so
     # dashboards recompute from result rows rather than trusting this.
@@ -220,8 +223,9 @@ class LLMRankingResult(TimestampMixin):
     sentiment = models.CharField(
         max_length=20, choices=SENTIMENT_CHOICES, default=SENTIMENT_NOT_MENTIONED
     )
-    # 0-100 confidence score for the mention analysis
-    confidence_score = models.FloatField(default=0.0)
+    # 0-100 confidence for the mention analysis. NULL: no extractor in use
+    # computes one.
+    confidence_score = models.FloatField(null=True, blank=True)
     # Snippet of text around the first mention
     mention_context = models.TextField(blank=True)
     # Whether the LLM query succeeded (False = API error / rate limit)
@@ -269,6 +273,13 @@ class LLMRankingResult(TimestampMixin):
     # from this row's citations during aggregation; rolled up into the
     # audit-level ``citation_countries`` field for the dashboard.
     citation_countries = models.JSONField(default=dict, blank=True)
+    # Query fan-outs: the web search texts the engine reported running while
+    # it answered, and how many searches it ran (a search can come without
+    # its text). NULL: not recorded (an engine that does not report its
+    # searches, a failed cell, a row from before this was captured); [] and
+    # 0: the engine reports searches and ran none.
+    search_queries = models.JSONField(null=True, blank=True, default=None)
+    web_searches = models.PositiveSmallIntegerField(null=True, blank=True)
     # The intent type of the prompt (recommendation, comparison, persona, etc.)
     # NOTE: computed at runtime from prompt text — no database column needed.
     PROMPT_TYPE_CHOICES = [

@@ -24,8 +24,9 @@ Scope and limits, stated plainly:
   (a new service) or the pgvector column instead. This module exists to
   evaluate the retrieval quality and speed locally before that call.
 - Collections are keyed by embedding dimension, mirroring the dim-guard
-  in retriever.py, so 1536-dim OpenAI vectors and the 256-dim test/hash
-  fallback never mix in one index.
+  in retriever.py. Only model vectors are written now; the 256-dim
+  collections hold legacy word-hash vectors from older builds, which the
+  delete paths still clean up and queries never reach.
 - Deleting a KnowledgeSource through the API removes its vectors; bulk
   deletes that bypass the service layer (admin, shell) leave orphans in
   the index. Orphans are harmless at query time - hits are re-fetched
@@ -149,8 +150,8 @@ def get_backend():
     """Return the configured backend instance, or None for "python".
 
     Import failures (chromadb not installed where the flag is on) log
-    loudly and fall back to None rather than breaking retrieval - the
-    same degrade-don't-die posture as the embedder's hash fallback.
+    loudly and fall back to None rather than breaking retrieval: the
+    Python path over Postgres gives the same results, only slower.
     """
     global _instance
     name = getattr(settings, "RAG_VECTOR_BACKEND", "python")

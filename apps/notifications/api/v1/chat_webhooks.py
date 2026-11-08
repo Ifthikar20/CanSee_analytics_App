@@ -1,7 +1,7 @@
 """
 Inbound chat-platform webhooks: Discord interactions + Slack events/commands.
 
-Hardened the same way as the Stripe webhook (apps/billing/webhooks.py):
+Hardening:
     1. Raw-body signature verification before any parsing
        - Discord: Ed25519 over timestamp + body (X-Signature-Ed25519)
        - Slack:   HMAC-SHA256 over "v0:{ts}:{body}" (X-Slack-Signature)
@@ -9,6 +9,9 @@ Hardened the same way as the Stripe webhook (apps/billing/webhooks.py):
     3. All heavy work is deferred to the answer_chat_command Celery task;
        these views only verify, resolve the IntegrationConnection, and ack
        inside the platforms' 3-second response windows.
+    4. A workspace resolves to a connection only once it is verified:
+       ``/cansee link <code>`` binds the signed team or guild id to the
+       connection that created the code (services.chat_link).
 
 These are plain Django FBVs (csrf_exempt) - the platforms cannot send CSRF
 tokens or JWTs. Rate limiting comes from WebhookRateLimitMiddleware.
@@ -139,23 +142,30 @@ def _handle_discord_command(body: dict) -> JsonResponse:
     # /cansee <subcommand> [question]
     command = "help"
     text = ""
+    link_code = ""
     options = data.get("options") or []
     if options:
         command = options[0].get("name") or "help"
         for opt in options[0].get("options") or []:
             if opt.get("name") == "question":
                 text = str(opt.get("value") or "")
+            if opt.get("name") == "code":
+                link_code = str(opt.get("value") or "")
 
-    from apps.notifications.models import IntegrationConnection
+    from apps.notifications.services import chat_link
 
-    connection = IntegrationConnection.objects.filter(
-        platform="discord", is_active=True, external_team_id=guild_id,
-    ).first()
+    if command == "link":
+        # Ephemeral: the code and the outcome are only shown to the caller.
+        return _discord_ephemeral(
+            chat_link.link_workspace(platform="discord", team_id=guild_id, code=link_code)
+        )
+
+    connection = chat_link.resolve_connection(platform="discord", team_id=guild_id)
     if connection is None:
         return _discord_ephemeral(
-            "This Discord server is not linked to Cansee yet. Open Cansee "
-            "Integrations settings, edit your Discord connection, and paste "
-            f"this server id: {guild_id}"
+            "This Discord server is not linked to Cansee yet. In Cansee "
+            "Integrations settings, create a link code for your Discord "
+            "connection, then run /cansee link with that code here."
         )
 
     member_user = (body.get("member") or {}).get("user") or body.get("user") or {}
@@ -226,16 +236,9 @@ def _slack_signature_failure(reason: str):
 
 
 def _resolve_slack_connection(team_id: str):
-    from apps.notifications.models import IntegrationConnection
+    from apps.notifications.services.chat_link import resolve_connection
 
-    team_id = str(team_id or "").strip()
-    if not team_id:
-        # Webhook-only connections have a blank external_team_id; an empty
-        # lookup key must never resolve to one of them.
-        return None
-    return IntegrationConnection.objects.filter(
-        platform="slack", is_active=True, external_team_id=team_id,
-    ).first()
+    return resolve_connection(platform="slack", team_id=team_id)
 
 
 def _split_command(text: str) -> tuple[str, str]:
@@ -319,14 +322,22 @@ def slack_commands(request):
     response_url = form.get("response_url", "")
     command, arg_text = _split_command(form.get("text", ""))
 
+    if command == "link":
+        from apps.notifications.services.chat_link import link_workspace
+
+        return JsonResponse({
+            "response_type": "ephemeral",
+            "text": link_workspace(platform="slack", team_id=team_id, code=arg_text),
+        })
+
     connection = _resolve_slack_connection(team_id)
     if connection is None:
         return JsonResponse({
             "response_type": "ephemeral",
             "text": (
-                "This Slack workspace is not linked to Cansee yet. Open "
-                "Cansee Integrations settings, edit your Slack connection, "
-                f"and paste this team id: {team_id}"
+                "This Slack workspace is not linked to Cansee yet. In Cansee "
+                "Integrations settings, create a link code for your Slack "
+                "connection, then run /cansee link with that code here."
             ),
         })
 

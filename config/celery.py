@@ -13,7 +13,8 @@ app.autodiscover_tasks()
 # ── Queue topology ──
 # Slow third-party API calls must not block pixel/analytics aggregation.
 #   default      — analytics, pixel, accounts (fast, in-process work)
-#   integrations — HubSpot, Semrush, Google Ads, OAuth token refresh
+#   integrations — third-party HTTP (OAuth token refresh, Search Console,
+#                  SerpAPI, Polar, report digests) and long batch deletes
 #   webhooks     — outbound webhook delivery (user-controlled URLs, slow, isolated)
 #   ai           — LLM ranking
 app.conf.task_default_queue = "default"
@@ -34,7 +35,6 @@ app.conf.task_routes = {
     # belongs with the other digest senders. The exact-name route wins over
     # the brand_vault glob above.
     "apps.brand_vault.tasks.run_brand_pulse": {"queue": "integrations"},
-    "apps.content_studio.tasks.*": {"queue": "ai"},
     # notifications: chat commands may call an LLM; report digests hit
     # third-party webhooks
     "apps.notifications.tasks.answer_chat_command": {"queue": "ai"},
@@ -47,10 +47,20 @@ app.conf.task_routes = {
     "apps.metering.tasks.prune_ai_usage_ledger": {"queue": "integrations"},
     "apps.metering.tasks.prune_polar_outbox": {"queue": "integrations"},
     "apps.metering.tasks.notify_cap_threshold": {"queue": "default"},
+    "apps.metering.tasks.release_stale_prompt_runs": {"queue": "default"},
     # Long-running batch deletes: keep them off the default queue so they
     # cannot delay request-path work.
     "apps.analytics.tasks.prune_analytics_events": {"queue": "integrations"},
     "apps.analytics.tasks.prune_llm_results": {"queue": "integrations"},
+    "apps.agent.tasks.purge_expired_agent_chats": {"queue": "integrations"},
+    # Autopilot: the plan and the engines are LLM work; Google and the text
+    # are third-party HTTP; the dispatcher and finalize are quick DB work.
+    # The exact names win over the glob.
+    "apps.autopilot.tasks.*": {"queue": "ai"},
+    "apps.autopilot.tasks.dispatch_autopilot": {"queue": "default"},
+    "apps.autopilot.tasks.finalize_run": {"queue": "default"},
+    "apps.autopilot.tasks.run_google": {"queue": "integrations"},
+    "apps.autopilot.tasks.deliver_text": {"queue": "integrations"},
 }
 
 app.conf.beat_schedule = {
@@ -66,6 +76,12 @@ app.conf.beat_schedule = {
         "task": "apps.accounts.tasks.reverify_org_domains",
         "schedule": crontab(minute=20, hour=6),
     },
+    # Agent chats idle past AGENT_CHAT_RETENTION_DAYS (0, the default,
+    # keeps every chat and makes this a no-op).
+    "purge-expired-agent-chats": {
+        "task": "apps.agent.tasks.purge_expired_agent_chats",
+        "schedule": crontab(minute=40, hour=3),
+    },
     # ── Weekly ──
     "weekly-reports": {
         "task": "apps.notifications.tasks.send_weekly_reports",
@@ -76,9 +92,30 @@ app.conf.beat_schedule = {
         "task": "apps.analytics.tasks.aggregate_hourly_metrics",
         "schedule": crontab(minute=5),
     },
+    # ── Every minute ──
+    # Agent runs whose process stopped heartbeating (deploy, crash) end as
+    # interrupted. Default queue; a cheap no-op when nothing is running.
+    "sweep-stale-agent-runs": {
+        "task": "apps.agent.tasks.sweep_stale_agent_runs",
+        "schedule": crontab(minute="*"),
+    },
+    # ── Every 5 minutes ──
+    # Autopilot: starts each project's daily run once its local run time has
+    # passed, releases runs whose analysis ended, resumes silent stages and
+    # sends texts that waited for quiet hours. A cheap no-op when idle.
+    "autopilot-dispatch": {
+        "task": "apps.autopilot.tasks.dispatch_autopilot",
+        "schedule": crontab(minute="*/5"),
+    },
     # ── Every 15 minutes ──
     "refresh-expiring-oauth-tokens": {
         "task": "apps.websites.tasks.refresh_expiring_tokens",
+        "schedule": crontab(minute="*/15"),
+    },
+    # Prompt runs a worker reserved and never settled (it died mid-call)
+    # are given back to the free plan's monthly count.
+    "release-stale-prompt-runs": {
+        "task": "apps.metering.tasks.release_stale_prompt_runs",
         "schedule": crontab(minute="*/15"),
     },
     # ── Monthly ──
@@ -143,11 +180,6 @@ app.conf.beat_schedule = {
     "brand-pulse-digest": {
         "task": "apps.brand_vault.tasks.run_brand_pulse",
         "schedule": crontab(minute=20, hour=9),
-    },
-    # ── Content Studio ──
-    "generate-briefs-daily": {
-        "task": "apps.content_studio.tasks.generate_briefs_daily",
-        "schedule": crontab(minute=15, hour=6),
     },
     # ── Search Console ──
     # Runs before compute-demand-scores (05:00) so fresh GSC_AGGREGATE

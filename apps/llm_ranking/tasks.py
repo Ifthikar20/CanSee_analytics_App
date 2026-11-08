@@ -20,6 +20,8 @@ def run_llm_ranking_audit(self, *, audit_id: str) -> None:
     The aggregator task is the chord callback — it computes scores once
     every cell has either committed a row or hit max retries.
     """
+    from django.db.models import F
+
     from apps.llm_ranking.models import LLMRankingAudit
     from apps.llm_ranking.services.ranking_service import LLMRankingService
 
@@ -28,7 +30,9 @@ def run_llm_ranking_audit(self, *, audit_id: str) -> None:
         # Fast (a few HTTP calls); doing it inside the chord adds no value.
         plan = LLMRankingService.prepare_audit(audit_id=audit_id)
         if not plan:
-            return  # already terminal or non-existent
+            # Missing, not runnable (marked failed), or already prepared by
+            # another delivery of this task.
+            return
 
         cells = [
             query_provider_prompt_task.s(
@@ -40,16 +44,24 @@ def run_llm_ranking_audit(self, *, audit_id: str) -> None:
             for provider in plan["providers"]
         ]
         if not cells:
-            # No work to do — flip to completed with an empty score.
+            # No work to do: finalise records the run as failed.
             aggregate_audit_results_task.delay([], audit_id=audit_id)
             return
 
         chord(cells)(aggregate_audit_results_task.s(audit_id=audit_id))
     except Exception as exc:
         logger.error("LLM ranking audit %s failed: %s", audit_id, exc)
+        retrying = self.request.retries < self.max_retries
         try:
+            # A retry prepares the run again, so it releases the claim
+            # (started_at) and leaves the audit pending; the last attempt
+            # marks it failed.
             LLMRankingAudit.objects.filter(id=audit_id).update(
-                status=LLMRankingAudit.STATUS_FAILED,
+                status=(
+                    LLMRankingAudit.STATUS_PENDING if retrying
+                    else LLMRankingAudit.STATUS_FAILED
+                ),
+                started_at=None if retrying else F("started_at"),
                 error_message=str(exc)[:500],
             )
         except Exception:
@@ -143,6 +155,17 @@ def dispatch_scheduled_audits() -> None:
             # owner carries the schedule from then on.
             cap_user = schedule.created_by or schedule.website.user
 
+            # ── 0. Autopilot asks the engines for this website today ──
+            from apps.autopilot.services.settings import covers
+
+            if "engines" in covers(schedule.website):
+                logger.info(
+                    "Skipping scheduled audit for %s: Autopilot covers it.",
+                    schedule.website.name,
+                )
+                _bump_next_run(schedule, now)
+                continue
+
             # ── 1. Skip if previous run still in flight ──────────────
             prev = schedule.last_audit
             if prev and prev.status in (
@@ -207,16 +230,37 @@ def dispatch_scheduled_audits() -> None:
                 )
                 _bump_next_run(schedule, now)
                 continue
+            # No prompt run left on the owner's account: skip the same way.
+            # (With some left the audit runs; cells past the last run are
+            # not asked and end failed.)
+            from apps.metering.services import prompt_runs
 
-            from django.conf import settings as _settings
+            runs_ok, _runs_left = prompt_runs.available(cap_user, schedule.website, 1)
+            if not runs_ok:
+                logger.warning(
+                    "Skipping scheduled audit for %s: no prompt runs left.",
+                    schedule.website.name,
+                )
+                _bump_next_run(schedule, now)
+                continue
 
-            from apps.llm_ranking.providers import PROVIDERS
-            requested = schedule.providers or list(PROVIDERS.keys())
-            selected_providers = [
-                key for key in requested
-                if key in PROVIDERS
-                and getattr(_settings, PROVIDERS[key].api_key_setting, "")
-            ] or ["claude"]
+            # ── 3c. At least one AI engine must have a key ────────────
+            # Missing keys are deployment state, not a schedule failure:
+            # skip and re-schedule without counting toward auto-pause.
+            from apps.llm_ranking.services.audit_factory import (
+                configured_providers,
+                missing_provider_keys,
+            )
+            selected_providers = configured_providers(schedule.providers or None)
+            if not selected_providers:
+                logger.warning(
+                    "Skipping scheduled audit for %s: no AI engine configured "
+                    "(missing %s).",
+                    schedule.website.name,
+                    ", ".join(missing_provider_keys(schedule.providers or None)),
+                )
+                _bump_next_run(schedule, now)
+                continue
 
             audit = LLMRankingAudit.objects.create(
                 website=schedule.website,
@@ -290,8 +334,3 @@ def _record_failure(schedule, now) -> None:
             schedule.id, schedule.consecutive_failures,
         )
     schedule.save(update_fields=update_fields)
-
-
-
-# Model Test + GEO helpers removed 2026-07; the multi-provider probe
-# use case moves to the Prompts page auto-measurement flow.

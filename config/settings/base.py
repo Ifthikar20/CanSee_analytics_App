@@ -37,7 +37,6 @@ THIRD_PARTY_APPS = [
     "django_filters",
     "django_celery_beat",
     "django_celery_results",
-    "channels",
     "drf_spectacular",
     "django_structlog",
     "axes",
@@ -66,7 +65,12 @@ LOCAL_APPS = [
     "apps.search_console",
     "apps.search_gap",
     "apps.assistant",
+    "apps.agent",
     "apps.web_analytics",
+    "apps.insights",
+    "apps.boards",
+    "apps.prompt_box",
+    "apps.autopilot",
     # Stub app — kept only to satisfy historical lazy FK references
     # from analytics migrations. All tables are managed=False.
     "apps.leads",
@@ -82,9 +86,6 @@ CITATION_EXTRACTION_ENABLED = True
 # the auto-extraction dispatched after Brand Input ingests.
 CLAIM_VERIFICATION_ENABLED = True
 BRAND_VAULT_EXTRACTION_ENABLED = True
-
-# Phase 4: Content Studio. Brief generation runs after each audit by default.
-CONTENT_STUDIO_BRIEF_GENERATION_ENABLED = True
 
 # Brand Security: deployment-wide kill switch for the LLM judge step on
 # nuanced detectors. Per-website opt-out lives on BrandSecurityConfig.
@@ -192,7 +193,6 @@ MIDDLEWARE = [
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
     "axes.middleware.AxesMiddleware",
-    "core.middleware.correlation.CorrelationMiddleware",
     "django_structlog.middlewares.RequestMiddleware",
 ]
 
@@ -201,7 +201,7 @@ ROOT_URLCONF = "config.urls"
 TEMPLATES = [
     {
         "BACKEND": "django.template.backends.django.DjangoTemplates",
-        "DIRS": [BASE_DIR / "templates"],
+        "DIRS": [],
         "APP_DIRS": True,
         "OPTIONS": {
             "context_processors": [
@@ -215,7 +215,6 @@ TEMPLATES = [
 ]
 
 WSGI_APPLICATION = "config.wsgi.application"
-ASGI_APPLICATION = "config.asgi.application"
 
 # ── DATABASE ──
 DATABASES = {
@@ -245,16 +244,6 @@ CACHES = {
         "KEY_PREFIX": "gp",
         "TIMEOUT": 300,
     }
-}
-
-# ── CHANNELS ──
-CHANNEL_LAYERS = {
-    "default": {
-        "BACKEND": "channels_redis.core.RedisChannelLayer",
-        "CONFIG": {
-            "hosts": [env("REDIS_URL", default="redis://localhost:6379/0")],
-        },
-    },
 }
 
 # ── CELERY ──
@@ -352,6 +341,10 @@ CORS_ALLOW_HEADERS = [
     "x-request-id",
     "x-client-id",
     "x-csrftoken",
+    # Agent workspace: message POSTs dedupe on Idempotency-Key, and the
+    # event stream resumes from Last-Event-ID.
+    "idempotency-key",
+    "last-event-id",
 ]
 
 # ── STATIC & MEDIA ──
@@ -401,6 +394,8 @@ PROMPT_SYNTHESIS_PROVIDER = env(
     "PROMPT_SYNTHESIS_PROVIDER",
     default=("deepseek" if env("DEEPSEEK_API_KEY", default="") else "anthropic"),
 )
+# Google Programmable Search (Custom Search JSON API): competitor discovery
+# and run enrichment in apps.llm_ranking.
 GOOGLE_SEARCH_API_KEY = env("GOOGLE_SEARCH_API_KEY", default="")
 GOOGLE_SEARCH_ENGINE_ID = env("GOOGLE_SEARCH_ENGINE_ID", default="")
 # Master paywall switch. When False, authenticated users are never
@@ -410,11 +405,7 @@ GOOGLE_SEARCH_ENGINE_ID = env("GOOGLE_SEARCH_ENGINE_ID", default="")
 # on; no code change needed.
 PAYWALL_ENABLED = env.bool("PAYWALL_ENABLED", default=False)
 
-# ── Polar.sh usage metering (apps.metering) ──
-# Metering-first integration: every recorded AI call is mirrored to Polar
-# as an immutable `llm_usage` event via a transactional outbox. Billing
-# (checkout/subscriptions) stays on the existing Stripe code until the
-# Phase 2 cutover.
+# ── Internal admin ops API ──
 # Shared secret for the ftb-min admin server's internal ops API
 # (/api/v1/internal/admin/). Empty = the surface is disabled (all 404s).
 # Only the admin server may hold this; it must never reach a browser.
@@ -424,9 +415,12 @@ ADMIN_OPS_KEY = env("ADMIN_OPS_KEY", default="")
 # Production: exactly the admin server's address, e.g. ["10.0.1.7/32"].
 ADMIN_OPS_ALLOWED_CIDRS = env.list("ADMIN_OPS_ALLOWED_CIDRS", default=[])
 
+# ── Polar.sh billing and usage metering (apps.billing, apps.metering) ──
+# Every recorded AI call is mirrored to Polar as an immutable `llm_usage`
+# event via a transactional outbox; checkout and subscriptions run on
+# Polar too.
 POLAR_ACCESS_TOKEN = env("POLAR_ACCESS_TOKEN", default="")
 POLAR_ENVIRONMENT = env("POLAR_ENVIRONMENT", default="sandbox")  # sandbox | production
-POLAR_ORGANIZATION_ID = env("POLAR_ORGANIZATION_ID", default="")
 # Meter ids from the Polar dashboard (or `manage.py polar_bootstrap`).
 POLAR_METER_TOKENS_ID = env("POLAR_METER_TOKENS_ID", default="")
 POLAR_METER_SPEND_ID = env("POLAR_METER_SPEND_ID", default="")
@@ -448,6 +442,12 @@ POLAR_READS_ENABLED = env.bool("POLAR_READS_ENABLED", default=False)
 # hard 503s — the endpoint refuses to process unsigned payloads).
 POLAR_PRODUCT_PRO_MONTHLY_ID = env("POLAR_PRODUCT_PRO_MONTHLY_ID", default="")
 POLAR_PRODUCT_PRO_ANNUAL_ID = env("POLAR_PRODUCT_PRO_ANNUAL_ID", default="")
+# The two self-serve plans (100 and 200 tracked prompts, billed monthly, no
+# trial): product ids the owner creates in Polar. Checkout and plan changes
+# stay off until both are set. Keep the Pro ids above while any Pro
+# subscription exists: a product no setting names syncs as cancelled.
+POLAR_PRODUCT_PROMPTS_100_ID = env("POLAR_PRODUCT_PROMPTS_100_ID", default="")
+POLAR_PRODUCT_PROMPTS_200_ID = env("POLAR_PRODUCT_PROMPTS_200_ID", default="")
 POLAR_WEBHOOK_SECRET = env("POLAR_WEBHOOK_SECRET", default="")
 # Canonical event name meters filter on. Never change once events flow.
 POLAR_EVENT_NAME = "llm_usage"
@@ -491,6 +491,111 @@ ASSISTANT_MAINTENANCE_MESSAGE = env(
     "ASSISTANT_MAINTENANCE_MESSAGE",
     default="Ask Cansee is temporarily unavailable.",
 )
+# Ingest each completed prompt run into the assistant's knowledge base
+# (apps.assistant.tasks.ingest_audit_knowledge).
+ASSISTANT_KNOWLEDGE_INGEST_ENABLED = env.bool("ASSISTANT_KNOWLEDGE_INGEST_ENABLED", default=True)
+
+# ── Agent workspace (apps.agent) ──
+# The Claude chat agent for SEO and GEO research. Fails closed: nothing
+# runs until AGENT_ENABLED is set. Runs execute only in the agent ASGI
+# process (AGENT_PROCESS); gunicorn workers answer the live endpoints with
+# 503 agent_unavailable.
+AGENT_ENABLED = env.bool("AGENT_ENABLED", default=False)
+AGENT_PROCESS = env.bool("AGENT_PROCESS", default=False)
+# "thread": a process-wide executor runs each turn. "inline": the request
+# runs it to completion (tests).
+AGENT_RUN_MODE = env("AGENT_RUN_MODE", default="thread")
+AGENT_MODEL = env("AGENT_MODEL", default="claude-opus-5-5")
+AGENT_EFFORT = env("AGENT_EFFORT", default="medium")
+AGENT_SUBAGENT_EFFORT = env("AGENT_SUBAGENT_EFFORT", default="medium")
+AGENT_TITLE_EFFORT = env("AGENT_TITLE_EFFORT", default="low")
+# max_tokens per request: the orchestrator, then each sub-agent.
+AGENT_MAX_TOKENS = env.int("AGENT_MAX_TOKENS", default=32000)
+AGENT_LANDING_MAX_TOKENS = env.int("AGENT_LANDING_MAX_TOKENS", default=64000)
+AGENT_ARTICLE_MAX_TOKENS = env.int("AGENT_ARTICLE_MAX_TOKENS", default=32000)
+AGENT_SHEET_MAX_TOKENS = env.int("AGENT_SHEET_MAX_TOKENS", default=16000)
+# Per-run ceilings: API requests, wall clock, model cost.
+AGENT_MAX_REQUESTS_PER_RUN = env.int("AGENT_MAX_REQUESTS_PER_RUN", default=24)
+AGENT_RUN_MAX_SECONDS = env.int("AGENT_RUN_MAX_SECONDS", default=1200)
+AGENT_RUN_MAX_COST_USD = env.float("AGENT_RUN_MAX_COST_USD", default=3.0)
+# Replies the agent process runs at once (its run threads), and replies one
+# user may have running at once across their chats (one per chat always).
+# A reply sent while every run thread is busy waits for one; its run reports
+# its place in line (run.queued, and "queue" on the run). Each run thread
+# can hold a research for up to AGENT_SWARM_MAX_SECONDS and a reply for up to
+# AGENT_RUN_MAX_SECONDS. More parallel replies per user spend the monthly AI
+# allowance faster; the allowance and the per-reply cost cap still apply.
+AGENT_MAX_CONCURRENT_RUNS = env.int("AGENT_MAX_CONCURRENT_RUNS", default=6)
+AGENT_USER_ACTIVE_RUNS = env.int("AGENT_USER_ACTIVE_RUNS", default=2)
+# Prompt-cache TTL ("5m" or "1h") for the system prompt and the history.
+AGENT_CACHE_TTL = env("AGENT_CACHE_TTL", default="1h")
+# Server-side refusal fallback (beta server-side-fallback-2026-07-01).
+AGENT_FALLBACKS_ENABLED = env.bool("AGENT_FALLBACKS_ENABLED", default=True)
+# Anthropic's server-side web_search / web_fetch tools.
+AGENT_WEB_TOOLS_ENABLED = env.bool("AGENT_WEB_TOOLS_ENABLED", default=True)
+AGENT_WEB_SEARCH_MAX_USES = env.int("AGENT_WEB_SEARCH_MAX_USES", default=5)
+AGENT_WEB_FETCH_MAX_USES = env.int("AGENT_WEB_FETCH_MAX_USES", default=5)
+# Google results pages captured per query (SerpAPI bills per page).
+AGENT_SERP_MAX_PAGES = env.int("AGENT_SERP_MAX_PAGES", default=5)
+# Page fetches per user per day through the browse endpoint.
+AGENT_BROWSE_DAILY_LIMIT = env.int("AGENT_BROWSE_DAILY_LIMIT", default=300)
+# An event stream closes after AGENT_STREAM_MAX_SECONDS (the client
+# reconnects). Runs heartbeat every AGENT_HEARTBEAT_SECONDS and are marked
+# interrupted after AGENT_STALE_SECONDS without one.
+AGENT_STREAM_MAX_SECONDS = env.int("AGENT_STREAM_MAX_SECONDS", default=300)
+AGENT_HEARTBEAT_SECONDS = env.int("AGENT_HEARTBEAT_SECONDS", default=10)
+AGENT_STALE_SECONDS = env.int("AGENT_STALE_SECONDS", default=90)
+# Days a chat is kept after its last message; 0 keeps chats.
+AGENT_CHAT_RETENTION_DAYS = env.int("AGENT_CHAT_RETENTION_DAYS", default=0)
+# The research agents (research_swarm): one tool call runs up to
+# AGENT_SWARM_MAX_TASKS tasks, AGENT_SWARM_WORKERS at a time in one swarm
+# and AGENT_SWARM_PROCESS_WORKERS across the agent process, with limits per
+# provider on Google results, page fetches, engine requests (per engine)
+# and analysis requests. A swarm stops after AGENT_SWARM_MAX_SECONDS.
+# AGENT_SWARM_MAX_TASKS is the one ceiling: the tool refuses larger plans and
+# the orchestrator's prompt and tool description state it (a new value
+# reaches new chats; older chats keep the text they started with). 50 fits
+# 5 prompts with every engine, one Google and one competitor page, content
+# gaps and citations: about $0.89 of AI allowance at most (report included),
+# plus 5 Google results pages (up to 10 with two pages a prompt) the platform
+# pays for and no allowance counts (SERPAPI_COST_PER_SEARCH_USD each).
+# Raising the worker counts without the per-provider limits below only
+# queues tasks; raise those only within the SerpAPI or ScraperAPI plan's
+# concurrency and each engine's rate limits, or tasks fail with 429s.
+AGENT_SWARM_ENABLED = env.bool("AGENT_SWARM_ENABLED", default=True)
+AGENT_SWARM_MAX_TASKS = env.int("AGENT_SWARM_MAX_TASKS", default=50)
+AGENT_SWARM_WORKERS = env.int("AGENT_SWARM_WORKERS", default=8)
+AGENT_SWARM_PROCESS_WORKERS = env.int("AGENT_SWARM_PROCESS_WORKERS", default=16)
+AGENT_SWARM_SERP_CONCURRENCY = env.int("AGENT_SWARM_SERP_CONCURRENCY", default=5)
+AGENT_SWARM_BROWSE_CONCURRENCY = env.int("AGENT_SWARM_BROWSE_CONCURRENCY", default=6)
+AGENT_SWARM_ENGINE_CONCURRENCY = env.int("AGENT_SWARM_ENGINE_CONCURRENCY", default=3)
+AGENT_SWARM_HAIKU_CONCURRENCY = env.int("AGENT_SWARM_HAIKU_CONCURRENCY", default=8)
+AGENT_SWARM_MAX_SECONDS = env.int("AGENT_SWARM_MAX_SECONDS", default=420)
+# The research agents' analysis model: structured output with thinking
+# off, which the model accepts at effort low, medium or high.
+AGENT_WORKER_MODEL = env("AGENT_WORKER_MODEL", default="claude-haiku-5-5")
+AGENT_WORKER_EFFORT = env("AGENT_WORKER_EFFORT", default="low")
+AGENT_WORKER_MAX_TOKENS = env.int("AGENT_WORKER_MAX_TOKENS", default=2048)
+# max_tokens per request of the six writing agents.
+AGENT_OPTIMIZER_MAX_TOKENS = env.int("AGENT_OPTIMIZER_MAX_TOKENS", default=24000)
+AGENT_COMPARISON_MAX_TOKENS = env.int("AGENT_COMPARISON_MAX_TOKENS", default=24000)
+AGENT_SOCIAL_MAX_TOKENS = env.int("AGENT_SOCIAL_MAX_TOKENS", default=8000)
+AGENT_PR_MAX_TOKENS = env.int("AGENT_PR_MAX_TOKENS", default=16000)
+AGENT_LLMS_TXT_MAX_TOKENS = env.int("AGENT_LLMS_TXT_MAX_TOKENS", default=8000)
+AGENT_MESSAGING_MAX_TOKENS = env.int("AGENT_MESSAGING_MAX_TOKENS", default=16000)
+# Pages a writer reads, and third-party pages a correction request reads.
+AGENT_WRITER_MAX_PAGES = env.int("AGENT_WRITER_MAX_PAGES", default=5)
+AGENT_CORRECTION_MAX_PAGES = env.int("AGENT_CORRECTION_MAX_PAGES", default=5)
+# Emails for review requests and decisions.
+AGENT_REVIEW_EMAILS = env.bool("AGENT_REVIEW_EMAILS", default=True)
+# Build from my site (run kind context_build): pages read, cited pages
+# re-checked, builds per website per UTC day, the estimate bound per request
+# and the output cap per request.
+CONTEXT_BUILD_MAX_PAGES = env.int("CONTEXT_BUILD_MAX_PAGES", default=8)
+CONTEXT_CHECK_MAX_PAGES = env.int("CONTEXT_CHECK_MAX_PAGES", default=20)
+CONTEXT_BUILD_DAILY_RUNS = env.int("CONTEXT_BUILD_DAILY_RUNS", default=5)
+CONTEXT_BUILD_USD_PER_REQUEST = env("CONTEXT_BUILD_USD_PER_REQUEST", default="0.0100")
+CONTEXT_BUILD_MAX_TOKENS = env.int("CONTEXT_BUILD_MAX_TOKENS", default=4000)
 
 # ── RAG vector index (optional) ──
 # "python" (default): retriever.py scores every (user, website) chunk in
@@ -521,7 +626,6 @@ INTELLIGENCE_AUTH_TOKEN = env("INTELLIGENCE_AUTH_TOKEN", default="")
 SOURCES_SERVICE_URL = env("SOURCES_SERVICE_URL", default="")
 SOURCES_AUTH_TOKEN = env("SOURCES_AUTH_TOKEN", default="")
 
-SENDGRID_API_KEY = env("SENDGRID_API_KEY", default="")
 GOOGLE_OAUTH_CLIENT_ID = env("GOOGLE_OAUTH_CLIENT_ID", default="")
 GOOGLE_OAUTH_CLIENT_SECRET = env("GOOGLE_OAUTH_CLIENT_SECRET", default="")
 MICROSOFT_OAUTH_CLIENT_ID = env("MICROSOFT_OAUTH_CLIENT_ID", default="")
@@ -554,23 +658,149 @@ WORKOS_CLIENT_ID = env("WORKOS_CLIENT_ID", default="")
 # which is the SPA's origin.
 BACKEND_PUBLIC_URL = env("BACKEND_PUBLIC_URL", default="http://localhost:8000")
 SENTRY_DSN = env("SENTRY_DSN", default="")
-DATAFORSEO_LOGIN = env("DATAFORSEO_LOGIN", default="")
-DATAFORSEO_PASSWORD = env("DATAFORSEO_PASSWORD", default="")
-X_BEARER_TOKEN = env("X_BEARER_TOKEN", default="")  # X (Twitter) API for trending topics
-# Brand Security uses X_BEARER_TOKEN via TWITTER_BEARER_TOKEN alias so the
-# security clients read a single well-known env var. Feature-flagged so the
-# UI can render the X source toggle as "not configured" when disabled.
-TWITTER_BEARER_TOKEN = env("TWITTER_BEARER_TOKEN", default=X_BEARER_TOKEN)
-FEATURE_X_SCANNER = env.bool("FEATURE_X_SCANNER", default=False)
 SERPAPI_KEY = env("SERPAPI_KEY", default="")
+# ScraperAPI's structured Google search: the other Google results provider.
+# With both keys set SerpAPI is used, unless SERP_PROVIDER ("serpapi" or
+# "scraperapi") pins one.
+SCRAPERAPI_KEY = env("SCRAPERAPI_KEY", default="")
+SERP_PROVIDER = env("SERP_PROVIDER", default="")
 
 # ── Search vs AI gap (apps.search_gap) ─────────────────────────────────
 # Google rank per tracked prompt, via SerpAPI. A check pages 10 results at
 # a time and stops at the site, so MAX_DEPTH=100 costs at most 10 calls.
 SEARCH_GAP_MAX_DEPTH = env.int("SEARCH_GAP_MAX_DEPTH", default=100)
 SEARCH_GAP_RECHECK_HOURS = env.int("SEARCH_GAP_RECHECK_HOURS", default=24)
-SEARCH_GAP_DAILY_CHECKS_PER_WEBSITE = env.int("SEARCH_GAP_DAILY_CHECKS_PER_WEBSITE", default=100)
+# Manual rechecks per website in a rolling 24 hours: room for the user's own
+# checks after a 200-prompt Autopilot run (which uses its own quotas).
+SEARCH_GAP_DAILY_CHECKS_PER_WEBSITE = env.int("SEARCH_GAP_DAILY_CHECKS_PER_WEBSITE", default=250)
 SERPAPI_COST_PER_SEARCH_USD = env.float("SERPAPI_COST_PER_SEARCH_USD", default=0.015)
+# ScraperAPI bills credits from a monthly allowance: set your plan's dollar
+# cost per Google search to record it (0 records nothing, as on the free plan).
+SCRAPERAPI_COST_PER_SEARCH_USD = env.float("SCRAPERAPI_COST_PER_SEARCH_USD", default=0.0)
+# Countries the ScraperAPI plan can search from: ISO codes ("us", the
+# default, works on every plan) or "all" on plans with country targeting.
+# Other countries search from the US with Google's country setting.
+SCRAPERAPI_GEO_COUNTRIES = env("SCRAPERAPI_GEO_COUNTRIES", default="us")
+# API credits per structured Google request (ScraperAPI docs).
+SCRAPERAPI_CREDITS_PER_SEARCH = env.int("SCRAPERAPI_CREDITS_PER_SEARCH", default=25)
+# Onboarding scan: Google searches for competitors and buyer questions. The
+# scan is synchronous, so each search gets a short timeout (ScraperAPI's own
+# default is 70s) and the scan carries on without Google when it runs out.
+ONBOARDING_SERP_TIMEOUT = env.float("ONBOARDING_SERP_TIMEOUT", default=20.0)
+# Google searches per user per UTC day across onboarding scans (up to 3 a
+# scan), on top of the scan endpoint's own rate limit.
+ONBOARDING_SERP_DAILY_SEARCHES = env.int("ONBOARDING_SERP_DAILY_SEARCHES", default=15)
+
+# Country checks: Google and the AI engines for tracked prompts in several
+# countries, run on demand after the user confirms the estimate.
+COUNTRY_CHECKS_ENABLED = env.bool("COUNTRY_CHECKS_ENABLED", default=True)
+COUNTRY_CHECK_MAX_COUNTRIES = env.int("COUNTRY_CHECK_MAX_COUNTRIES", default=5)
+COUNTRY_CHECK_MAX_PROMPTS = env.int("COUNTRY_CHECK_MAX_PROMPTS", default=10)
+# Google results pages per prompt and country.
+COUNTRY_CHECK_MAX_PAGES = env.int("COUNTRY_CHECK_MAX_PAGES", default=2)
+COUNTRY_CHECK_MAX_GOOGLE_PAGES = env.int("COUNTRY_CHECK_MAX_GOOGLE_PAGES", default=50)
+COUNTRY_CHECK_MAX_ENGINE_ANSWERS = env.int("COUNTRY_CHECK_MAX_ENGINE_ANSWERS", default=100)
+# Google pages per website per UTC day.
+COUNTRY_CHECK_DAILY_GOOGLE_PAGES = env.int("COUNTRY_CHECK_DAILY_GOOGLE_PAGES", default=100)
+COUNTRY_CHECK_SERP_CONCURRENCY = env.int("COUNTRY_CHECK_SERP_CONCURRENCY", default=2)
+COUNTRY_CHECK_ENGINE_CONCURRENCY = env.int("COUNTRY_CHECK_ENGINE_CONCURRENCY", default=3)
+# auto | celery | thread | inline. auto runs one Celery task per country on
+# the integrations queue, or a background thread when Celery runs eagerly.
+COUNTRY_CHECK_RUN_MODE = env("COUNTRY_CHECK_RUN_MODE", default="auto")
+# A queued or running check with no heartbeat for this long is interrupted.
+COUNTRY_CHECK_STALE_MINUTES = env.int("COUNTRY_CHECK_STALE_MINUTES", default=20)
+
+# ── Insights (apps.insights) ───────────────────────────────────────────
+# Answer analysis, crawler audits, prompt research, fan-out Google checks
+# and shopping checks. Every paid run is estimated and confirmed first.
+INSIGHTS_ENABLED = env.bool("INSIGHTS_ENABLED", default=True)
+# auto | celery | thread | inline. auto runs a Celery task on the kind's
+# queue, or a background thread when Celery runs eagerly.
+INSIGHTS_RUN_MODE = env("INSIGHTS_RUN_MODE", default="auto")
+# A queued or running run with no heartbeat for this long is interrupted.
+INSIGHTS_RUN_STALE_MINUTES = env.int("INSIGHTS_RUN_STALE_MINUTES", default=20)
+# Google pages per website per UTC day, all insights kinds together.
+INSIGHTS_DAILY_GOOGLE_PAGES = env.int("INSIGHTS_DAILY_GOOGLE_PAGES", default=60)
+# Answers per analysis run, the estimate bound per answer (two Claude Haiku
+# 5.5 requests; typical about $0.002), answers analyzed at once and the
+# output cap per analysis request.
+INSIGHTS_ANALYSIS_MAX_ANSWERS = env.int("INSIGHTS_ANALYSIS_MAX_ANSWERS", default=60)
+INSIGHTS_ANALYSIS_USD_PER_ANSWER = env("INSIGHTS_ANALYSIS_USD_PER_ANSWER", default="0.0060")
+INSIGHTS_ANALYSIS_CONCURRENCY = env.int("INSIGHTS_ANALYSIS_CONCURRENCY", default=3)
+INSIGHTS_ANALYSIS_MAX_TOKENS = env.int("INSIGHTS_ANALYSIS_MAX_TOKENS", default=3000)
+# Own pages read as evidence for claim checks, and how long a read is reused.
+INSIGHTS_EVIDENCE_PAGES = env.int("INSIGHTS_EVIDENCE_PAGES", default=5)
+INSIGHTS_EVIDENCE_TTL_HOURS = env.int("INSIGHTS_EVIDENCE_TTL_HOURS", default=24)
+# Google reads per research run, and the estimate bound of one suggestion request.
+INSIGHTS_RESEARCH_MAX_GOOGLE_PROMPTS = env.int("INSIGHTS_RESEARCH_MAX_GOOGLE_PROMPTS", default=5)
+INSIGHTS_SUGGESTIONS_USD = env("INSIGHTS_SUGGESTIONS_USD", default="0.0100")
+# Searches per fan-out Google check.
+INSIGHTS_FANOUT_MAX_QUERIES = env.int("INSIGHTS_FANOUT_MAX_QUERIES", default=10)
+# Crawler audit: own pages per audit, the text_without_js threshold, the
+# pause between audits, audits per website per UTC day and fetches at once
+# (the browse parser reads 2 pages at a time per process).
+SITE_AUDIT_MAX_PAGES = env.int("SITE_AUDIT_MAX_PAGES", default=20)
+SITE_AUDIT_MIN_WORDS = env.int("SITE_AUDIT_MIN_WORDS", default=150)
+SITE_AUDIT_COOLDOWN_MINUTES = env.int("SITE_AUDIT_COOLDOWN_MINUTES", default=10)
+SITE_AUDIT_DAILY_RUNS = env.int("SITE_AUDIT_DAILY_RUNS", default=10)
+SITE_AUDIT_CONCURRENCY = env.int("SITE_AUDIT_CONCURRENCY", default=2)
+# Products: active tracked products per website, products per shopping check
+# and engine answers per shopping check.
+SHOPPING_MAX_PRODUCTS = env.int("SHOPPING_MAX_PRODUCTS", default=10)
+SHOPPING_MAX_PRODUCTS_PER_RUN = env.int("SHOPPING_MAX_PRODUCTS_PER_RUN", default=5)
+SHOPPING_MAX_ENGINE_ANSWERS = env.int("SHOPPING_MAX_ENGINE_ANSWERS", default=30)
+# ScraperAPI credits per Google Shopping page (its Google-domain rate; confirm
+# against the account balance before and after one check).
+SCRAPERAPI_SHOPPING_CREDITS = env.int("SCRAPERAPI_SHOPPING_CREDITS", default=25)
+
+# ── Ask AI (apps.prompt_box) ───────────────────────────────────────────
+# One buyer question asked several times per engine. Answers per engine per
+# question, answers per project per UTC day, answers asked at once in one
+# run, how runs execute (auto | celery | thread | inline, as
+# INSIGHTS_RUN_MODE) and how long a run may go without a heartbeat before
+# it is interrupted.
+PROMPT_BOX_MAX_SAMPLES = env.int("PROMPT_BOX_MAX_SAMPLES", default=10)
+PROMPT_BOX_DAILY_ANSWERS = env.int("PROMPT_BOX_DAILY_ANSWERS", default=100)
+PROMPT_BOX_CONCURRENCY = env.int("PROMPT_BOX_CONCURRENCY", default=3)
+PROMPT_BOX_RUN_MODE = env("PROMPT_BOX_RUN_MODE", default="auto")
+PROMPT_BOX_STALE_MINUTES = env.int("PROMPT_BOX_STALE_MINUTES", default=10)
+
+# ── Autopilot (apps.autopilot) ─────────────────────────────────────────
+# Once a day per project: every tracked prompt within the plan is asked to
+# each configured engine, Google page one is read, new answers that name the
+# brand are analyzed, then one text is sent. AUTOPILOT_ENABLED is the
+# deployment switch (off: the dispatcher starts nothing). Run modes as
+# above; the management command always runs inline.
+AUTOPILOT_ENABLED = env.bool("AUTOPILOT_ENABLED", default=True)
+AUTOPILOT_RUN_MODE = env("AUTOPILOT_RUN_MODE", default="auto")
+# Runs in progress at once across every project (manual runs included), and
+# prompts asked at once in one run.
+AUTOPILOT_MAX_ACTIVE_RUNS = env.int("AUTOPILOT_MAX_ACTIVE_RUNS", default=2)
+AUTOPILOT_PROMPT_CONCURRENCY = env.int("AUTOPILOT_PROMPT_CONCURRENCY", default=3)
+# The engines and Google steps stop claiming prompts after this many seconds
+# and hand over to a continuation (their soft time limit is this plus 360 s,
+# room for the prompts in flight). A run with no heartbeat this long is
+# interrupted.
+AUTOPILOT_STEP_SECONDS = env.int("AUTOPILOT_STEP_SECONDS", default=1200)
+AUTOPILOT_STALE_MINUTES = env.int("AUTOPILOT_STALE_MINUTES", default=30)
+# Share of the owner's monthly AI allowance Autopilot never spends: it is
+# kept for the user's own questions.
+AUTOPILOT_RESERVE_PCT = env.int("AUTOPILOT_RESERVE_PCT", default=10)
+# Google page one. The cadence a project's Autopilot starts with ("daily" or
+# "weekly"; weekly is the cheap default until the owner decides), how old a
+# successful check may be and still be reused on a daily and on a weekly
+# cadence, pages per project and per deployment per UTC day (25 ScraperAPI
+# credits a page) and requests at once in one run.
+AUTOPILOT_GOOGLE_CADENCE = env("AUTOPILOT_GOOGLE_CADENCE", default="weekly")
+AUTOPILOT_GOOGLE_REUSE_HOURS = env.int("AUTOPILOT_GOOGLE_REUSE_HOURS", default=20)
+AUTOPILOT_GOOGLE_WEEKLY_REUSE_HOURS = env.int("AUTOPILOT_GOOGLE_WEEKLY_REUSE_HOURS", default=164)
+AUTOPILOT_GOOGLE_PAGES_PER_PROJECT = env.int("AUTOPILOT_GOOGLE_PAGES_PER_PROJECT", default=200)
+AUTOPILOT_GOOGLE_PAGES_PER_DAY = env.int("AUTOPILOT_GOOGLE_PAGES_PER_DAY", default=1000)
+AUTOPILOT_GOOGLE_CONCURRENCY = env.int("AUTOPILOT_GOOGLE_CONCURRENCY", default=2)
+# How long the text waits for the analysis run, and the answers a prompt
+# needs in 7 days before it is ranked.
+AUTOPILOT_ANALYSIS_WAIT_MINUTES = env.int("AUTOPILOT_ANALYSIS_WAIT_MINUTES", default=15)
+AUTOPILOT_MIN_RANK_ANSWERS = env.int("AUTOPILOT_MIN_RANK_ANSWERS", default=4)
 
 # ── SMS (Twilio) ───────────────────────────────────────────────────────
 # The most intrusive channel in the product, so it is off by default and
@@ -596,17 +826,7 @@ BRAND_RESEARCH_COMMUNITY_ENABLED = env.bool("BRAND_RESEARCH_COMMUNITY_ENABLED", 
 # turn off under cost pressure. Off means the lane reports as skipped.
 BRAND_RESEARCH_ENGINES_ENABLED = env.bool("BRAND_RESEARCH_ENGINES_ENABLED", default=True)
 
-# ── OpenClaw AI Agent ──
-OPENCLAW_GATEWAY_URL = env("OPENCLAW_GATEWAY_URL", default="")
-OPENCLAW_AUTH_TOKEN = env("OPENCLAW_AUTH_TOKEN", default="")
-
-# ── INTEGRATION CREDENTIALS ──
-# Managed centrally via core.integrations.registry — setting names referenced there.
-HUBSPOT_CLIENT_ID = env("HUBSPOT_CLIENT_ID", default="")
-HUBSPOT_CLIENT_SECRET = env("HUBSPOT_CLIENT_SECRET", default="")
-SEMRUSH_API_KEY = env("SEMRUSH_API_KEY", default="")
-SLACK_CLIENT_ID = env("SLACK_CLIENT_ID", default="")
-SLACK_CLIENT_SECRET = env("SLACK_CLIENT_SECRET", default="")
+# ── Chat bots ──
 # Slack app (events + slash commands + chat.postMessage replies)
 SLACK_SIGNING_SECRET = env("SLACK_SIGNING_SECRET", default="")
 SLACK_BOT_TOKEN = env("SLACK_BOT_TOKEN", default="")
@@ -614,9 +834,8 @@ SLACK_BOT_TOKEN = env("SLACK_BOT_TOKEN", default="")
 DISCORD_PUBLIC_KEY = env("DISCORD_PUBLIC_KEY", default="")
 DISCORD_APPLICATION_ID = env("DISCORD_APPLICATION_ID", default="")
 DISCORD_BOT_TOKEN = env("DISCORD_BOT_TOKEN", default="")
-MAILCHIMP_API_KEY = env("MAILCHIMP_API_KEY", default="")
-CANVA_CLIENT_ID = env("CANVA_CLIENT_ID", default="")
-CANVA_CLIENT_SECRET = env("CANVA_CLIENT_SECRET", default="")
+
+# ── AI engines (besides OPENAI_API_KEY / ANTHROPIC_API_KEY above) ──
 GEMINI_API_KEY = env("GEMINI_API_KEY", default="")
 PERPLEXITY_API_KEY = env("PERPLEXITY_API_KEY", default="")
 XAI_API_KEY = env("XAI_API_KEY", default="")
@@ -627,38 +846,28 @@ XAI_API_KEY = env("XAI_API_KEY", default="")
 # Off by default because web-grounded calls cost more and are slower.
 LLM_WEBSEARCH_ENABLED = env.bool("LLM_WEBSEARCH_ENABLED", default=False)
 
-# Google Programmable Search (Custom Search JSON API). Used by the
-# Model Test pipeline to fetch real publisher URLs for the citations
-# UI — see apps/llm_ranking/services/google_search.py.
-# Google Programmable Search (Custom Search JSON API).
-#
-# Historically configured as GOOGLE_SEARCH_API_KEY + GOOGLE_SEARCH_ENGINE_ID
-# in some deployments; current code reads GOOGLE_API_KEY + GOOGLE_CSE_ID.
-# Fall back to the legacy names so an existing .env doesn't break, but
-# prefer the new names if both are set.
-GOOGLE_API_KEY = env("GOOGLE_API_KEY", default="") \
-    or env("GOOGLE_SEARCH_API_KEY", default="")
-GOOGLE_CSE_ID = env("GOOGLE_CSE_ID", default="") \
-    or env("GOOGLE_SEARCH_ENGINE_ID", default="")
-# Per-user daily cap on Google Custom Search calls. Same flat number
-# for every user (free + paid). Resets at UTC midnight.
-GOOGLE_CSE_DAILY_LIMIT_PER_USER = env.int("GOOGLE_CSE_DAILY_LIMIT_PER_USER", default=100)
-# Per-user daily cap on G-Eval judge calls (subjective_impression.py).
-# One call scores all 7 sub-metrics for one citation in one shot.
-CLAUDE_JUDGE_DAILY_LIMIT_PER_USER = env.int("CLAUDE_JUDGE_DAILY_LIMIT_PER_USER", default=200)
-# Per-user daily cap on GEO content rewrites (geo_rewrite.py). Lower
-# because rewrites pull a whole document through the model.
-CLAUDE_REWRITE_DAILY_LIMIT_PER_USER = env.int("CLAUDE_REWRITE_DAILY_LIMIT_PER_USER", default=30)
+# Claude-clustered sentiment themes in apps.llm_ranking.services.geo_deep_dive.
+GEO_SENTIMENT_THEMES_ENABLED = env.bool("GEO_SENTIMENT_THEMES_ENABLED", default=True)
+
 # Finite monthly AI-spend safety ceiling (USD) for enterprise / custom-priced
 # accounts, which have no price to derive a cap from. Prevents the
 # ENTERPRISE-default Organization plan from leaving org users effectively
 # uncapped (core.ai_tracking.effective_ai_cap). A per-account
 # monthly_ai_cost_cap_usd overrides this; set to 0 for truly unlimited.
 AI_ENTERPRISE_MONTHLY_CAP_USD = env.float("AI_ENTERPRISE_MONTHLY_CAP_USD", default=500.0)
-# Monthly AI allowance for accounts WITHOUT an active/trialing
-# subscription (the Free plan). A small customer-acquisition budget —
-# enough to run onboarding and a few scans, not enough to burn margin.
-AI_FREE_MONTHLY_CAP_USD = env.float("AI_FREE_MONTHLY_CAP_USD", default=1.0)
+# Hidden monthly AI spend backstop for accounts WITHOUT an active/trialing
+# subscription (the Free plan). Free accounts are metered in prompt runs
+# (FREE_MONTHLY_PROMPT_RUNS); this bounds the Claude-only work around them
+# (the agent, extraction, reports, onboarding). It is never shown to free
+# accounts in dollars.
+AI_FREE_MONTHLY_CAP_USD = env.float("AI_FREE_MONTHLY_CAP_USD", default=3.0)
+# Prompt runs the Free plan gets each billing period: one prompt answered by
+# one AI engine is one run, shared by every project and engine of the
+# account (apps.metering.services.prompt_runs). Paid plans are unlimited.
+FREE_MONTHLY_PROMPT_RUNS = env.int("FREE_MONTHLY_PROMPT_RUNS", default=20)
+# A prompt run still reserved this many minutes after it was taken (its
+# worker died mid-call) is given back by metering.release_stale_prompt_runs.
+PROMPT_RUN_STALE_MINUTES = env.int("PROMPT_RUN_STALE_MINUTES", default=30)
 
 # ── Google Search Console (apps.search_console) ──
 # OAuth reuses GOOGLE_OAUTH_CLIENT_ID/SECRET via the integrations
@@ -714,14 +923,6 @@ GA4_HOSTED_PROPERTY_ID = env("GA4_HOSTED_PROPERTY_ID", default="")
 CLOUDFLARE_SNAPSHOT_TTL_SECONDS = env.int("CLOUDFLARE_SNAPSHOT_TTL_SECONDS", default=120)
 CLOUDFLARE_FETCH_TIMEOUT_SECONDS = env.float("CLOUDFLARE_FETCH_TIMEOUT_SECONDS", default=10.0)
 
-# ── Social Leads (Facebook, LinkedIn, X) ──
-FACEBOOK_APP_ID = env("FACEBOOK_APP_ID", default="")
-FACEBOOK_APP_SECRET = env("FACEBOOK_APP_SECRET", default="")
-LINKEDIN_CLIENT_ID = env("LINKEDIN_CLIENT_ID", default="")
-LINKEDIN_CLIENT_SECRET = env("LINKEDIN_CLIENT_SECRET", default="")
-TIKTOK_APP_ID = env("TIKTOK_APP_ID", default="")
-TIKTOK_APP_SECRET = env("TIKTOK_APP_SECRET", default="")
-
 # Beta gate — set SIGNUPS_ENABLED=true in env to re-enable public registration.
 SIGNUPS_ENABLED = env.bool("SIGNUPS_ENABLED", default=False)
 
@@ -770,7 +971,7 @@ LOGGING = {
         "apps": {"handlers": ["console"], "level": "INFO", "propagate": False},
         "audit": {"handlers": ["console"], "level": "INFO", "propagate": False},
         "security": {"handlers": ["console"], "level": "INFO", "propagate": False},
-        # Covers getLogger("billing") across apps/billing (Stripe events
+        # Covers getLogger("billing") across apps/billing (Polar events
         # log at INFO; without this entry they were dropped).
         "billing": {"handlers": ["console"], "level": "INFO", "propagate": False},
         # Covers core.resilience (circuit-breaker state changes),

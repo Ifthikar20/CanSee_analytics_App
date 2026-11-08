@@ -3,7 +3,7 @@
 Each task is a one-line wrapper so the adapter stays synchronously
 callable from tests and the backfill command (no Celery worker runs in
 local dev). Every task is best-effort: a failure must never break the
-audit or agent flow that dispatched it.
+audit flow that dispatched it.
 """
 from __future__ import annotations
 
@@ -31,20 +31,3 @@ def ingest_audit_knowledge(audit_id: str) -> int:
     except Exception as exc:
         logger.warning("assistant audit ingest failed for %s: %s", audit_id, exc)
         return 0
-
-
-@shared_task(name="apps.assistant.tasks.sweep_security_alerts")
-def sweep_security_alerts() -> int:
-    """Periodic sweep: mirror open security findings for active websites."""
-    from apps.assistant.services import producers
-    from apps.websites.models import Website
-
-    total = 0
-    for website_id in (
-        Website.objects.filter(is_active=True).values_list("id", flat=True)
-    ):
-        try:
-            total += producers.ingest_security_alerts(website_id)
-        except Exception as exc:
-            logger.warning("alert ingest failed for website %s: %s", website_id, exc)
-    return total

@@ -56,15 +56,18 @@ def supersede_fact(
         audience=old.audience,
     )
 
-    # Embed the new triple.
-    try:
-        from apps.brand_vault.services.embeddings import embed_text
-        new_fact.embedding = embed_text(
-            f"{new_subject} {new_predicate} {new_object}",
-        )
+    # Embed the new triple. No vector when embeddings are unavailable;
+    # refresh_fact_embeddings fills it in later.
+    from apps.brand_vault.services.embeddings import embed_text
+
+    vector, _model = embed_text(
+        f"{new_subject} {new_predicate} {new_object}",
+        user=actor_user or getattr(old.website, "user", None),
+        website=old.website,
+    )
+    if vector:
+        new_fact.embedding = vector
         new_fact.save(update_fields=["embedding", "updated_at"])
-    except Exception:
-        pass
 
     old.version_to = now
     old.superseded_by = new_fact

@@ -20,11 +20,12 @@ from collections import defaultdict
 from django.core.management.base import BaseCommand, CommandError
 
 from apps.rag.models import KnowledgeChunk
+from apps.rag.services.embedder import UNEMBEDDED_MODEL_NAMES
 from apps.rag.services.vector_backends import get_backend
 
 
 class Command(BaseCommand):
-    help = "Mirror every KnowledgeChunk embedding into the vector index."
+    help = "Mirror every model-embedded KnowledgeChunk into the vector index."
 
     def add_arguments(self, parser):
         parser.add_argument(
@@ -43,7 +44,9 @@ class Command(BaseCommand):
                 "(and RAG_CHROMA_URL for server mode) before reindexing."
             )
 
-        qs = KnowledgeChunk.objects.all()
+        # Only model vectors are indexed: pending chunks have none, and
+        # legacy word-hash vectors are not semantic.
+        qs = KnowledgeChunk.objects.exclude(embedding_model__in=UNEMBEDDED_MODEL_NAMES)
         if opts["website"]:
             qs = qs.filter(website_id=opts["website"])
 

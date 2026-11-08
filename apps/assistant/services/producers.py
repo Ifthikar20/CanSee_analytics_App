@@ -12,7 +12,7 @@ TENANT-ISOLATION RULE (non-negotiable):
     here would put one tenant's answers in another tenant's corpus.
 
 Each adapter uses a STABLE synthetic URL as its dedupe key, so re-running
-updates in place ((user, website, url) is unique) and the content-hash
+updates in place ((website, url) is unique) and the content-hash
 short-circuit in ingest_url skips unchanged text.
 
 All adapters are plain functions: callable synchronously from tests, the
@@ -72,10 +72,11 @@ def ingest_audit_responses(audit_id) -> int:
         return 0
     from apps.llm_ranking.models import LLMRankingAudit, LLMRankingResult
 
+    # A failed run's answers are not knowledge: only completed audits.
     audit = (
         LLMRankingAudit.objects
         .select_related("website", "created_by")
-        .filter(id=audit_id)
+        .filter(id=audit_id, status=LLMRankingAudit.STATUS_COMPLETED)
         .first()
     )
     if audit is None or audit.website_id is None:
@@ -88,7 +89,7 @@ def ingest_audit_responses(audit_id) -> int:
 
     rows = (
         LLMRankingResult.objects
-        .filter(audit=audit)
+        .filter(audit=audit, query_succeeded=True)
         .order_by("-created_at")[:MAX_LLM_RESPONSES]
     )
     written = 0
