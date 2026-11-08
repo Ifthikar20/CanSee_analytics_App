@@ -23,6 +23,7 @@
 #   ./run.sh user         Create a login (email, name, password)
 #   ./run.sh stop         Stop the servers and the Docker database/Redis
 #   ./run.sh status       Show what is running
+#   ./run.sh reset-db     Delete the local database and start it fresh
 #   ./run.sh logs         Follow the server logs
 #   ./run.sh help         Show this help
 #
@@ -296,7 +297,18 @@ setup_backend() {
 
   echo "  applying database migrations"
   manage migrate --noinput >"$LOG_DIR/migrate.log" 2>&1 ||
-    { tail -n 30 "$LOG_DIR/migrate.log"; die "Migrations failed. Full log: $LOG_DIR/migrate.log"; }
+    {
+      tail -n 30 "$LOG_DIR/migrate.log"
+      if grep -q "already exists" "$LOG_DIR/migrate.log"; then
+        echo
+        echo "  The local database already has tables or indexes from an earlier"
+        echo "  migration history (for example another branch or a local"
+        echo "  makemigrations). If you do not need the local data, run:"
+        echo "    ./run.sh reset-db"
+        echo "  and then ./run.sh again."
+      fi
+      die "Migrations failed. Full log: $LOG_DIR/migrate.log"
+    }
   ok "database up to date"
 
   manage seed_prompts >"$LOG_DIR/seed.log" 2>&1 ||
@@ -584,6 +596,21 @@ cmd_user() {
   create_user
 }
 
+cmd_reset_db() {
+  step "Reset the local database"
+  [ -d "$BACKEND_DIR" ] || die "Backend not found at $BACKEND_DIR."
+  docker info >/dev/null 2>&1 || die "Docker is not running. Start Docker Desktop."
+  echo "  This permanently deletes the local development database (logins,"
+  echo "  projects, audits). Your code, .env and production are not touched."
+  local answer
+  read -r -p "  Type 'reset' to continue: " answer
+  [ "$answer" = "reset" ] || { echo "  Cancelled."; return 0; }
+  stop_one frontend
+  stop_one backend
+  compose down -v >/dev/null 2>&1 || die "Could not remove the database container and volume."
+  ok "Local database deleted. Run ./run.sh to recreate it and create a login."
+}
+
 cmd_stop() {
   step "Stopping Cansee"
   stop_one frontend
@@ -623,7 +650,7 @@ main() {
       --no-pull) SKIP_PULL=1 ;;
       --no-browser) NO_BROWSER=1 ;;
       -h | --help | help) usage; exit 0 ;;
-      start | setup | user | stop | status | logs) cmd="$1" ;;
+      start | setup | user | stop | status | logs | reset-db) cmd="$1" ;;
       *) usage; die "Unknown command or option: $1" ;;
     esac
     shift
@@ -634,6 +661,7 @@ main() {
     setup) cmd_setup ;;
     user) cmd_user ;;
     stop) cmd_stop ;;
+    reset-db) cmd_reset_db ;;
     status) cmd_status ;;
     logs) cmd_logs ;;
   esac
