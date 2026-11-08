@@ -163,7 +163,11 @@ _HEURISTIC_RULES = (
     ("history",        re.compile(r"\b(history|historical|founded|origin|18\d{2}|19\d{2}|20\d{2}|when did)", re.I)),
     ("debate",         re.compile(r"\b(vs\.?|versus|better than|alternative|or\s+\w+\?|debate|pros and cons)", re.I)),
     ("opinion",        re.compile(r"\b(best|worst|should|recommend|review|opinion|favourite|favorite)", re.I)),
-    ("people_society", re.compile(r"\b(culture|society|people|community|generation|demographic)", re.I)),
+    # "generation" alone is too broad (lead generation, retrieval augmented
+    # generation, power generation): only the demographic senses count.
+    ("people_society", re.compile(
+        r"\b(culture|society|people|community|demographic|generational"
+        r"|generations?\s+(?:z|x|y|alpha)\b|gen\s?z\b|millennials?|boomers?)", re.I)),
     ("explanation",    re.compile(r"\b(how (do|does|to)|why|what is|explain|guide|tutorial)", re.I)),
 )
 
