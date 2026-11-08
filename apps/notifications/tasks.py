@@ -854,14 +854,36 @@ def _growth_command_text(user) -> str:
     return "\n\n".join(blocks)
 
 
-def _resolve_website(user):
+# Reply when every project the user created is one their current org role
+# can only view: chat must refuse what the app refuses with a 403.
+VIEW_ONLY_COMMAND_REPLY = (
+    "Your organization role can view this project but not change it, so "
+    "Cansee can't run scans or answer questions for it from chat. Ask an "
+    "organization admin for member access."
+)
+
+
+def _resolve_website(user, *, min_role: str | None = None):
+    """The user's first active created website they can still reach.
+
+    With ``min_role``, only a website where their current role meets it
+    (scan and ask create audits and spend engine runs, so they need
+    "member", as in the app); the read-only digests pass none.
+    """
     from apps.websites.services.website_service import WebsiteService
 
-    return (
-        WebsiteService.created_by_qs(user).filter(is_active=True)
-        .order_by("created_at")
-        .first()
+    qs = (
+        WebsiteService.created_by_qs_with_role(user, min_role)
+        if min_role else WebsiteService.created_by_qs(user)
     )
+    return qs.filter(is_active=True).order_by("created_at").first()
+
+
+def _no_writable_website_reply(user) -> str:
+    """Why a write command found no project: none at all, or view-only."""
+    if _resolve_website(user) is not None:
+        return VIEW_ONLY_COMMAND_REPLY
+    return "No active website found on your account. Add a website in Cansee first."
 
 
 # ── Live fact pack for the ask command ────────────────────────────────────────
@@ -1169,9 +1191,9 @@ def _answer_question(connection, question: str, thread_ref: str = "") -> str:
     if not question:
         return "Ask a question after the command, e.g.: ask How is my AI visibility trending?"
 
-    website = _resolve_website(user)
+    website = _resolve_website(user, min_role="member")
     if website is None:
-        return "No active website found on your account. Add a website in Cansee first."
+        return _no_writable_website_reply(user)
 
     # The answer is grounded in a deterministic fact pack so questions
     # about live metrics and account content reflect real rows.
@@ -1231,9 +1253,9 @@ def _answer_question(connection, question: str, thread_ref: str = "") -> str:
 
 def _queue_scan_command(user) -> str:
     """Queue an AI visibility audit over the user's saved prompts."""
-    website = _resolve_website(user)
+    website = _resolve_website(user, min_role="member")
     if website is None:
-        return "No active website found on your account. Add a website in Cansee first."
+        return _no_writable_website_reply(user)
 
     from apps.llm_ranking.services.audit_factory import create_audit
     from apps.llm_ranking.services.audit_runner import (

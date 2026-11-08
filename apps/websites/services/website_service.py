@@ -55,6 +55,31 @@ class WebsiteService:
         return WebsiteService.accessible_qs(user).filter(user=user)
 
     @staticmethod
+    def created_by_qs_with_role(user, min_role: str):
+        """created_by_qs narrowed to websites where the user's CURRENT role
+        meets ``min_role``.
+
+        For per-user surfaces outside the request cycle (chat commands, SMS)
+        that change data or spend engine runs: an org project its creator
+        was downgraded on drops out, the same as get_for_user refusing it.
+        Personal websites always stay (their creator is their owner). The
+        org comes from the user's membership (_org_id_for), so its role is
+        that membership row's role, as in role_for.
+        """
+        qs = WebsiteService.created_by_qs(user)
+        org_id = _org_id_for(user)
+        if org_id is None:
+            return qs
+        role = (
+            user.org_memberships.filter(organization_id=org_id)
+            .values_list("role", flat=True)
+            .first()
+        )
+        if role and role_at_least(role, min_role):
+            return qs
+        return qs.filter(organization__isnull=True)
+
+    @staticmethod
     def role_for(user, website) -> str | None:
         """The user's current role on ``website``, re-read on every call.
 

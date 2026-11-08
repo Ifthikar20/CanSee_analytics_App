@@ -47,6 +47,10 @@ REPLIES_OFF = (
     "Reply STOP to unsubscribe."
 )
 AI_UNAVAILABLE = "Cansee couldn't answer right now: AI isn't available."
+VIEW_ONLY = (
+    "Your organization role can view this project but not ask questions "
+    "about it by text. Ask an organization admin for member access."
+)
 
 
 def _xml(body: str) -> HttpResponse:
@@ -82,15 +86,21 @@ def _answer_for(subscription, question: str) -> str:
     from apps.assistant.services.orchestrator import AssistantUnavailable, answer
     from apps.websites.services.website_service import WebsiteService
 
+    user = subscription.user
+    # Answering spends engine runs, which the app allows members and above
+    # (a viewer gets a 403 there), so the role is re-read here too.
     website = (
-        WebsiteService.created_by_qs(subscription.user).order_by("created_at").first()
+        WebsiteService.created_by_qs_with_role(user, "member")
+        .order_by("created_at").first()
     )
     if website is None:
+        if WebsiteService.created_by_qs(user).exists():
+            return VIEW_ONLY
         return NO_WEBSITE
 
     try:
         result = answer(
-            user=subscription.user,
+            user=user,
             website=website,
             question=(
                 f"{question}\n\n"
