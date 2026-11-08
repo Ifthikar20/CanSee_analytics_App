@@ -5,7 +5,8 @@ user's monthly AI allowance, the per-run cost ceiling and the per-run
 request cap. A failed check ends the run; nothing is sent. The deadline
 and the cost ceiling are also checked between the AI engine calls and
 research agents a tool runs (``budget_stop``), whose cost counts toward
-the run's.
+the run's. Accounts on the free plan never see dollar amounts, so their
+cost-ceiling message names none.
 """
 from __future__ import annotations
 
@@ -39,8 +40,10 @@ def _timeout_stop(conf, started_monotonic: float) -> GateStop | None:
     return None
 
 
-def _cost_stop(conf, cost_usd: Decimal) -> GateStop | None:
+def _cost_stop(conf, cost_usd: Decimal, run=None) -> GateStop | None:
     if cost_usd >= Decimal(str(conf.run_max_cost_usd)):
+        if _hides_usd(run):
+            return GateStop("run_cost_limit", "This reply reached the cost limit for one reply.")
         return GateStop(
             "run_cost_limit",
             f"This reply reached the ${conf.run_max_cost_usd:.2f} cost limit for one reply.",
@@ -48,12 +51,22 @@ def _cost_stop(conf, cost_usd: Decimal) -> GateStop | None:
     return None
 
 
-def budget_stop(*, started_monotonic: float, cost_usd: Decimal) -> GateStop | None:
+def _hides_usd(run) -> bool:
+    """True when the run's account is on the free plan (no dollar amounts)."""
+    if run is None or getattr(run, "user", None) is None:
+        return False
+    from apps.metering.services import prompt_runs
+
+    return prompt_runs.is_limited(run.user, getattr(run, "website", None))
+
+
+def budget_stop(*, started_monotonic: float, cost_usd: Decimal, run=None) -> GateStop | None:
     """The run's deadline and cost ceiling alone, for the work a tool does
     between model requests (asking AI engines, running research agents):
-    the GateStop that ends the run, or None while both hold."""
+    the GateStop that ends the run, or None while both hold. ``run``
+    words the cost message for its account."""
     conf = agent_conf()
-    return _timeout_stop(conf, started_monotonic) or _cost_stop(conf, cost_usd)
+    return _timeout_stop(conf, started_monotonic) or _cost_stop(conf, cost_usd, run)
 
 
 def before_request(run, *, started_monotonic: float, requests: int, cost_usd: Decimal,
@@ -71,7 +84,7 @@ def before_request(run, *, started_monotonic: float, requests: int, cost_usd: De
         raise GateStop(
             "allowance_exceeded", "You have used your monthly AI allowance.",
         )
-    stop = _cost_stop(conf, cost_usd)
+    stop = _cost_stop(conf, cost_usd, run)
     if stop is not None:
         raise stop
     if requests >= conf.max_requests_per_run:
