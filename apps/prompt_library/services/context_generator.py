@@ -128,16 +128,29 @@ def _extract_json_array(text: str) -> list[Any]:
         return data if isinstance(data, list) else []
     except Exception:
         pass
-    # Repair attempt: trim to last complete object and close the array.
-    last_brace = candidate.rfind("}")
-    if last_brace == -1:
-        return []
-    repaired = candidate[: last_brace + 1] + "]"
-    try:
-        data = json.loads(repaired)
-        return data if isinstance(data, list) else []
-    except Exception:
-        return []
+    # Repair attempt for a response cut off mid-array: keep every element
+    # that decodes completely and drop the truncated tail. Cutting at the
+    # last "}" is not enough, because "}" also appears inside strings (the
+    # {{ variable }} placeholders), so the cut could land mid-string.
+    return _complete_elements(candidate)
+
+
+def _complete_elements(candidate: str) -> list[Any]:
+    """The elements of a JSON array that decode in full, in order, up to
+    the first one that does not (``candidate`` starts with ``[``)."""
+    decoder = json.JSONDecoder()
+    items: list[Any] = []
+    pos, size = 1, len(candidate)
+    while True:
+        while pos < size and candidate[pos] in " \t\r\n,":
+            pos += 1
+        if pos >= size or candidate[pos] == "]":
+            return items
+        try:
+            item, pos = decoder.raw_decode(candidate, pos)
+        except ValueError:
+            return items
+        items.append(item)
 
 
 def _normalise_item(raw: Any) -> dict | None:
