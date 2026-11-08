@@ -71,6 +71,25 @@ UI_URL="http://localhost:$UI_PORT"
 export DJANGO_SETTINGS_MODULE="config.settings.dev"
 export PYTHONUNBUFFERED=1
 
+# Django runs natively here, not inside the compose network, so it must
+# reach Postgres/Redis through the ports Docker publishes on 127.0.0.1.
+# These match the db/redis services in docker/docker-compose.dev.yml.
+# Exported variables take precedence over the backend .env (django-environ
+# only fills in values that are not already set), so a .env written for
+# Docker (DB_HOST=db, redis://redis:...) still works. 127.0.0.1 is used
+# instead of "localhost", which can resolve to IPv6 on Windows.
+export DB_HOST=127.0.0.1
+export DB_PORT=5432
+export DB_NAME=cansee
+export DB_USER=postgres
+export DB_PASSWORD=postgres
+export REDIS_URL=redis://127.0.0.1:6379/0
+export CELERY_BROKER_URL=redis://127.0.0.1:6379/1
+# The optional intelligence/sources containers are not started; empty
+# URLs make the backend run that logic in-process.
+export INTELLIGENCE_SERVICE_URL=""
+export SOURCES_SERVICE_URL=""
+
 SKIP_PULL="${SKIP_PULL:-0}"
 NO_BROWSER="${NO_BROWSER:-0}"
 
