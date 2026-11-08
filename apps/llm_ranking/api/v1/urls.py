@@ -38,4 +38,9 @@ urlpatterns = [
         dashboard_views.VisibilityDashboardView.as_view(),
         name="llm-ranking-visibility-dashboard",
     ),
+    path(
+        "<uuid:website_id>/highlight-changes/",
+        views.HighlightChangesView.as_view(),
+        name="llm-ranking-highlight-changes",
+    ),
 ]

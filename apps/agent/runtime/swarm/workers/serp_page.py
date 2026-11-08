@@ -76,6 +76,18 @@ def _search(query: str, page: int, gl: str, hl: str) -> dict:
         return {"error": "network"}
 
 
+def _prompt_stamp(key: str, prompt: dict) -> dict:
+    """The plan prompt a Google page was searched for: its key in this swarm
+    and the tracked prompt ids the pane joins pages on (the same ids as the
+    search-gap overview's prompts[]). prompt_key only means something within
+    one swarm; prompt_id and brand_prompt_id hold across swarms."""
+    return {
+        "prompt_key": key,
+        "prompt_id": prompt.get("prompt_id") or None,
+        "brand_prompt_id": prompt.get("brand_prompt_id") or None,
+    }
+
+
 def _overview(capture: dict) -> dict | None:
     overview = capture.get("ai_overview")
     if not overview:
@@ -165,6 +177,16 @@ def run(job: TaskJob) -> WorkerOutput:
     if swarm_run.version.version == 1:
         earlier = _recent_captures(swarm_run.tool_ctx(), query, location).get(page)
         if earlier is not None:
+            stamp = _prompt_stamp(key, prompt)
+            # Stamp a copy: the stored earlier capture stays as it was. Only
+            # the same tracked prompt shows its page again under the same id.
+            # Any other page (an ad-hoc search, or another prompt that makes
+            # the same search) is recorded as a capture of its own, so no two
+            # prompts share an id and none loses its page to the other's
+            # stamp, whatever order concurrent tasks record in.
+            if not stamp["prompt_id"] or earlier.get("prompt_id") != stamp["prompt_id"]:
+                earlier = {**earlier, "capture_id": _capture_id()}
+            earlier = {**earlier, **stamp}
             seconds = _age_seconds(earlier.get("captured_at"))
             job.reporter.step(f"Using the page captured {age_text(seconds)} ago")
             job.release_primary()
@@ -204,6 +226,7 @@ def run(job: TaskJob) -> WorkerOutput:
     capture = build_serp_capture(payload, website=swarm_run.website, query=query, page=page,
                                  location=location, capture_id=capture_id)
     capture["cost_usd"] = float(serp_google.cost_per_search_usd())
+    capture.update(_prompt_stamp(key, prompt))
     job.reporter.record_capture("serp", capture_id, capture)
     swarm_run.set_capture(key, page, capture)
     return output(capture, reused_seconds=None)

@@ -1742,3 +1742,20 @@ class VisibilityOverviewView(TenantScopedAPIView):
         )
         website = self.get_website(website_id)
         return Response(build_overview_for_website(request.user, website))
+
+
+class HighlightChangesView(TenantScopedAPIView):
+    """What changed per tracked prompt and engine over the last ``days`` (1 to
+    90, default 90): each prompt and engine's newest answer against the one
+    before it. Rows key on ``prompt_id`` (the library prompt id) like the
+    search-gap overview's prompts[], and also carry ``brand_prompt_id``.
+    For the browser pane's Keywords tab; it carries no weekly series."""
+
+    def get(self, request, website_id):
+        from apps.llm_ranking.services.visibility_history import (
+            build_visibility_history,
+            parse_days,
+        )
+        website = self.get_website(website_id)
+        days = parse_days(request.query_params.get("days"))
+        return Response(build_visibility_history(website, days=days, weekly=False))

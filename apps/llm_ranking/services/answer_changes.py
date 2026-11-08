@@ -76,6 +76,7 @@ def answer_changes(website, *, days: int = WINDOW_DAYS, now=None) -> dict:
         bp = by_id[bp_id]
         rows.append({
             "prompt_id": str(bp.prompt_id),
+            "brand_prompt_id": str(bp.id),
             "prompt": bp.prompt.text,
             "engine": model_key(provider),
             "label": MODEL_LABELS.get(provider, provider),

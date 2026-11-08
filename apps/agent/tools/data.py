@@ -363,39 +363,19 @@ def get_brand_perception(ctx: ToolContext, args) -> ToolResult:
 def get_visibility_history(ctx: ToolContext, args) -> ToolResult:
     """Weekly AI visibility over the last 90 days, and what changed since
     each tracked prompt's previous engine check."""
-    from apps.llm_ranking.services.answer_changes import WINDOW_DAYS, answer_changes
-    from apps.llm_ranking.services.visibility_dashboard import build_dashboard
+    from apps.llm_ranking.services.answer_changes import WINDOW_DAYS
+    from apps.llm_ranking.services.visibility_history import build_visibility_history
 
-    board = build_dashboard(ctx.website, period="90d", interval="week")
-    changes = answer_changes(ctx.website, days=WINDOW_DAYS)
-    visibility = board["visibility"]
-    rows = changes["rows"]
-    result = {
-        "window_days": WINDOW_DAYS,
-        "weekly": {
-            "weeks": board["window"]["buckets"],
-            "visibility_pct": visibility["all"]["visibility_pct"],
-            "answers": visibility["all"]["answers"],
-            "by_engine": [{"engine": e["key"], "visibility_pct": e["visibility_pct"]}
-                          for e in visibility["by_engine"]],
-        },
-        "engines": board["engines"],
-        "counts": changes["counts"],
-        "latest_check_at": changes["latest_check_at"],
-        "previous_check_at": changes["previous_check_at"],
-        "changes": rows[:HISTORY_CHANGES],
-        "changes_total": len(rows),
-    }
-    if not rows:
-        result["note"] = ("No engine has answered a tracked prompt in the last 90 days, so "
-                          "nothing can be compared.")
+    history = build_visibility_history(ctx.website, days=WINDOW_DAYS)
+    rows = history["changes"]
+    result = {**history, "changes": rows[:HISTORY_CHANGES]}
     ctx.emitter.record_research("history", "visibility", {
         "window_days": WINDOW_DAYS,
-        "latest_check_at": changes["latest_check_at"],
-        "previous_check_at": changes["previous_check_at"],
-        "counts": changes["counts"],
+        "latest_check_at": history["latest_check_at"],
+        "previous_check_at": history["previous_check_at"],
+        "counts": history["counts"],
     })
-    moved = sum(changes["counts"][k] for k in ("named_now", "rank_up", "dropped", "rank_down"))
+    moved = sum(history["counts"][k] for k in ("named_now", "rank_up", "dropped", "rank_down"))
     return ToolResult.ok(result, summary=f"{moved} of {len(rows)} results changed")
 
 
