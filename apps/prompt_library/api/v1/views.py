@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import random
 
+from django.db import IntegrityError, transaction
 from django.shortcuts import get_object_or_404
 from rest_framework import status
 from rest_framework.generics import ListAPIView
@@ -415,6 +416,31 @@ class WebsiteSamplePromptsView(TenantScopedAPIView):
         )
 
 
+def _prompt_for_hash(website, digest: str, *, defaults: dict) -> Prompt:
+    """The Prompt with text hash ``digest``, created from ``defaults`` when
+    none exists.
+
+    Prompts are unique per (industry, text_hash), so the same text can have
+    a row in several industries (the miner and the Search Console feed
+    file per industry). ``get_or_create(text_hash=...)`` raised
+    MultipleObjectsReturned, a 500, for such text. Prefer the row the
+    website already tracks, so re-adding does not track the text twice,
+    then the oldest row.
+    """
+    matches = Prompt.objects.filter(text_hash=digest).order_by("created_at", "id")
+    existing = (
+        matches.filter(brand_prompts__website=website).first() or matches.first()
+    )
+    if existing is not None:
+        return existing
+    try:
+        with transaction.atomic():
+            return Prompt.objects.create(text_hash=digest, **defaults)
+    except IntegrityError:
+        # A concurrent request created the same (industry, text_hash) row.
+        return matches.first()
+
+
 class WebsitePromptCreateView(TenantScopedAPIView):
     """Create a manual templated prompt for a website.
 
@@ -486,8 +512,8 @@ class WebsitePromptCreateView(TenantScopedAPIView):
         brand_prompt_ids = []
         for template_text, body_for_text, canonical_hash in planned:
             variables = extract_variables(template_text)
-            prompt, _ = Prompt.objects.get_or_create(
-                text_hash=canonical_hash,
+            prompt = _prompt_for_hash(
+                website, canonical_hash,
                 defaults=dict(
                     industry=industry,
                     text=body_for_text,
