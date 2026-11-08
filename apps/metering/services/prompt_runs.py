@@ -20,7 +20,8 @@ Every place that asks an engine goes through ``guard`` (or ``reserve`` and
     and the stale-reservation sweep can never both give a unit back.
 
 The account is the project owner's (``website.user``), or the
-organization's while organization features are on. The plan comes from
+organization's while organization features are on: the project's own
+organization for an organization project, else the owner's. The plan comes from
 core.ai_tracking.ai_allowance_plan, the resolver of the AI spend wall, so
 PAYWALL_ENABLED does not lift the limit.
 """
@@ -106,10 +107,22 @@ def owner_for(user, website=None):
     return owner if owner is not None else user
 
 
+def _project_org(website):
+    """The organization a project belongs to, while organization features
+    are on; None for a personal project."""
+    from core.permissions.org import org_features_enabled
+
+    if website is None or not getattr(website, "organization_id", None):
+        return None
+    if not org_features_enabled():
+        return None
+    return website.organization
+
+
 def account_for(user, website=None) -> Account | None:
     """The account an answer for ``user`` on ``website`` counts on, or None
     for an unattributed call (no user)."""
-    from apps.billing.services.plan_limits import org_plan_for
+    from apps.billing.services.plan_limits import org_plan_for, plan_for_org
     from apps.metering.services.periods import billing_period_for, month_bounds
     from core.ai_tracking import ai_allowance_plan
     from core.utils.constants import PLAN_LIMITS, Plan
@@ -117,10 +130,17 @@ def account_for(user, website=None) -> Account | None:
     owner = owner_for(user, website)
     if owner is None or not getattr(owner, "pk", None):
         return None
-    plan = str(ai_allowance_plan(owner))
+    org = _project_org(website)
+    if org is not None:
+        # An organization's project counts on that organization, also after
+        # its creator left it or when the creator's first one is another.
+        plan = plan_for_org(org)
+        plan = plan if plan in PLAN_LIMITS else Plan.FREE
+    else:
+        plan = str(ai_allowance_plan(owner))
+        org = getattr(owner, "_org_cache", None) if org_plan_for(owner) is not None else None
     raw = PLAN_LIMITS.get(plan, PLAN_LIMITS[Plan.FREE]).get("monthly_prompt_runs", -1)
     limit = free_limit() if plan == Plan.FREE else (int(raw) if isinstance(raw, int) else -1)
-    org = getattr(owner, "_org_cache", None) if org_plan_for(owner) is not None else None
     if org is not None:
         # An organization shares one count; members' own subscriptions do
         # not move its window, so it is the calendar month.
