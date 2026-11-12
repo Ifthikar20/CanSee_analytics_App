@@ -942,13 +942,17 @@ def apply_previous(table: dict, previous: dict | None) -> list[dict]:
     cell (``previous``) and list those changes, the most significant first:
     on the prompts sheet the measured columns (rank, status and gap class)
     and any change of state, then its text cells, then the other sheets; at
-    most MAX_CHANGES."""
+    most MAX_CHANGES. A row the previous table did not have is marked
+    ``added`` instead: its cells have nothing to compare with, so it is not
+    listed."""
     if not isinstance(previous, dict):
         return []
     before_version = previous.get("version")
     before = {}
+    before_rows = set()
     for sheet in previous.get("sheets") or []:
         for row in sheet.get("rows") or []:
+            before_rows.add((sheet.get("key"), row.get("key")))
             for column, cell in (row.get("cells") or {}).items():
                 before[(sheet.get("key"), row.get("key"), column)] = cell
     found = []
@@ -956,6 +960,9 @@ def apply_previous(table: dict, previous: dict | None) -> list[dict]:
     for sheet in table["sheets"]:
         columns = {c["key"]: c for c in sheet["columns"]}
         for row in sheet["rows"]:
+            if (sheet["key"], row["key"]) not in before_rows:
+                row["added"] = True
+                continue
             for column, cell in row["cells"].items():
                 old = before.get((sheet["key"], row["key"], column))
                 if not isinstance(old, dict) or old.get("text") == cell.get("text"):
