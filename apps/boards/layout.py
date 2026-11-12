@@ -20,9 +20,15 @@ if TYPE_CHECKING:
 
 SIZES = ("third", "half", "full")
 
-# Every widget key and its default size, in catalog order (contract 3; Ask AI
-# and Prompt ranking first, wave 4 contract 6).
+# Every block key and its default size, in catalog order: the four blocks
+# that open a new board, then contract 3's widgets (Ask AI and Prompt ranking
+# first, wave 4 contract 6), then the account and project blocks. The order
+# numbers the blocks on the board (CNS_01 to CNS_28), so new keys go last.
 WIDGETS = {
+    "watch": "third",
+    "asked-answered": "third",
+    "answer-rank": "third",
+    "visibility-score": "third",
     "prompt-box": "full",
     "ranking": "full",
     "summary": "full",
@@ -44,12 +50,21 @@ WIDGETS = {
     "prompt-research": "half",
     "competitors": "half",
     "products": "half",
+    "prompt-runs": "third",
+    "next-steps": "third",
+    "latest-report": "half",
 }
 
-# Served while nothing is saved, and what Reset board restores: Ask AI and
-# Prompt ranking (wave 4 contract 6). Saved layouts are not migrated. Callers
-# take copies (default_widgets), never these dicts.
+# Served while nothing is saved, and what Reset board restores: a row of
+# four small blocks (the watch, the latest question, who AI names, the
+# visibility score), then Ask AI and Prompt ranking (wave 4 contract 6).
+# Saved layouts are not migrated. Callers take copies (default_widgets),
+# never these dicts.
 DEFAULT_LAYOUT = (
+    {"key": "watch", "size": "third"},
+    {"key": "asked-answered", "size": "third"},
+    {"key": "answer-rank", "size": "third"},
+    {"key": "visibility-score", "size": "third"},
     {"key": "prompt-box", "size": "full"},
     {"key": "ranking", "size": "full"},
 )
